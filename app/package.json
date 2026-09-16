@@ -1,0 +1,14 @@
+{
+  "name": "mackit",
+  "private": true,
+  "version": "1.0.0",
+  "description": "MacKit — macOS 自用运维工具箱（零依赖本地 Web GUI）",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}

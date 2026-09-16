@@ -1,0 +1,569 @@
+/**
+ * MacKit · HTTP 边界
+ *
+ * 依据《MacKit-架构设计.md》§3.12 / §3.13 / §3.14：
+ *   - 仅监听 127.0.0.1；端口从 18080 起，EADDRINUSE 则 +1 顺延
+ *   - 静态托管 web/（Cache-Control: no-store，零外部资源）
+ *   - REST 路由（统一包裹 { ok, data } / { ok, error }）
+ *   - SSE 挂载（hello 快照 + Last-Event-ID 补齐 + 15s 心跳）
+ *   - confirm 二次确认基座（destructive 动作强制 confirm:true）
+ *   - /api/ 来源校验：Host 必须是回环主机名、Origin（若有）必须与 Host 同源 —— 防 CSRF / DNS rebinding
+ *   - /api/shutdown 优雅退出（取消运行中任务 → 关 SSE → 关服务 → 退出 → 删 runtime.json）
+ *
+ * 本文件不做业务逻辑；功能模块（T03）通过「动态导入 + 注册表」接入：
+ *   - 每个模块默认导出 ModuleDefinition：{ id, actions, queries? }
+ *   - actions[action] = { title, destructive?, steps(params, ctx), finalize? }
+ *   - queries[queryName] = (params) => Promise<data>（本文件约定的只读查询扩展点）
+ *   模块文件缺失时该模块相关接口返回 501，不影响服务启动。
+ */
+
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+
+import * as paths from './lib/paths.js';
+import * as store from './lib/store.js';
+import * as runner from './lib/runner.js';
+import * as env from './lib/env.js';
+import { AppError, ERR, toErrObj } from './lib/exec.js';
+import { DAV_ERR } from './lib/webdav.js';
+import { parseReqUrl } from './lib/requrl.js';
+
+/** 版本号（读取 package.json，失败回落）。 */
+function readVersion() {
+  try {
+    const obj = JSON.parse(fs.readFileSync(path.join(paths.APP_DIR, 'package.json'), 'utf8'));
+    return typeof obj.version === 'string' ? obj.version : '1.0.0';
+  } catch { return '1.0.0'; }
+}
+const VERSION = readVersion();
+
+function log(...args) { console.log('[MacKit]', ...args); } // 被启动器重定向到 ~/.mackit/server.out
+
+// ------------------------------ 功能模块注册表（T03 动态接入） ------------------------------
+const MODULE_FILES = Object.freeze({ brew: 'brew.js', sysinit: 'sysinit.js', rime: 'rime.js', unseal: 'unseal.js', backup: 'backup.js' });
+const registry = new Map();
+
+async function loadModules() {
+  for (const [id, file] of Object.entries(MODULE_FILES)) {
+    try {
+      const mod = await import(new URL(`./lib/${file}`, import.meta.url));
+      const def = mod && mod.default;
+      if (def && def.actions && typeof def.actions === 'object') { registry.set(id, def); log(`已加载模块：${id}`); }
+      else log(`模块 ${id} 缺少 actions，跳过`);
+    } catch (err) {
+      log(`模块 ${id} 未加载（${err && err.message}）`);
+    }
+  }
+}
+
+/** 调用模块的只读查询。 */
+async function queryModule(moduleId, queryName, params) {
+  const def = registry.get(moduleId);
+  if (!def) throw new AppError(ERR.NOT_FOUND, `模块「${moduleId}」尚未实现`);
+  const q = def.queries && def.queries[queryName];
+  if (typeof q !== 'function') throw new AppError(ERR.NOT_FOUND, `模块「${moduleId}」未提供查询「${queryName}」`);
+  return await q(params || {});
+}
+
+// ------------------------------ 响应工具 ------------------------------
+/** HTTP 状态码映射（body 结构不变，仅状态码便于排查）。 */
+function statusForCode(code) {
+  switch (code) {
+    case ERR.CONFIRM_REQUIRED: return 400;
+    case ERR.CMD_NOT_ALLOWED: return 400;
+    case ERR.PARSE_FAILED: return 422;
+    case ERR.NOT_FOUND: return 404;
+    case ERR.ENV_MISSING: return 409;
+    case ERR.CANCELLED: return 409;
+    case ERR.AUTH_CANCELLED: return 409;
+    case ERR.TIMEOUT: return 504;
+    case ERR.NET_UNREACHABLE: return 503;
+    case ERR.CMD_FAILED: return 502;
+    case ERR.FORBIDDEN: return 403;
+    case ERR.IO_ERROR: return 500;
+    // WebDAV 备份错误码（见 lib/webdav.js DAV_ERR）
+    case DAV_ERR.CONFIG: return 400;
+    case DAV_ERR.AUTH: return 401;
+    case DAV_ERR.FORBIDDEN: return 403;
+    case DAV_ERR.NOT_FOUND: return 404;
+    case DAV_ERR.UNSUPPORTED: return 405;
+    case DAV_ERR.CONFLICT: return 409;
+    case DAV_ERR.NO_SPACE: return 507;
+    case DAV_ERR.TLS: return 502;
+    case DAV_ERR.PARSE: return 502;
+    case DAV_ERR.NAME: return 422;
+    default: return 500;
+  }
+}
+
+function sendJson(res, status, body) {
+  const data = JSON.stringify(body);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(data) });
+  res.end(data);
+}
+function ok(res, data) { sendJson(res, 200, { ok: true, data }); }
+function sendError(res, err) { const obj = toErrObj(err); sendJson(res, statusForCode(obj.code), { ok: false, error: obj }); }
+
+// ------------------------------ 请求体 ------------------------------
+const MAX_BODY = 1_000_000;
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY) { reject(new AppError(ERR.PARSE_FAILED, '请求体过大（>1MB）')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (chunks.length === 0) return resolve({});
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw.trim()) return resolve({});
+      try {
+        const obj = JSON.parse(raw);
+        resolve(obj && typeof obj === 'object' ? obj : {});
+      } catch { reject(new AppError(ERR.PARSE_FAILED, '请求体不是合法 JSON')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+// ------------------------------ 静态文件 ------------------------------
+const MIME = Object.freeze({
+  '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8', '.map': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.woff2': 'font/woff2',
+});
+
+function serveStatic(res, pathname) {
+  let rel = pathname.replace(/^\/web\//, '').replace(/^\//, '');
+  if (rel === '') rel = 'index.html';
+  const target = path.resolve(paths.WEB_DIR, rel);
+  if (target !== paths.WEB_DIR && !target.startsWith(paths.WEB_DIR + path.sep)) { // 目录穿越防护
+    sendJson(res, 403, { ok: false, error: { code: ERR.NOT_FOUND, message: '禁止访问' } });
+    return;
+  }
+  fs.readFile(target, (err, data) => {
+    if (err) { sendJson(res, 404, { ok: false, error: { code: ERR.NOT_FOUND, message: '资源不存在' } }); return; }
+    const ext = path.extname(target).toLowerCase();
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Cache-Control': 'no-store', 'Content-Length': data.length });
+    res.end(data);
+  });
+}
+
+// ------------------------------ SSE ------------------------------
+const sseClients = new Set();
+const HEARTBEAT_MS = 15_000;
+
+function sseFrame(evt, id) {
+  let s = '';
+  if (id !== undefined && id !== null) s += `id: ${id}\n`;
+  return s + `data: ${JSON.stringify(evt)}\n\n`;
+}
+
+function handleSse(req, res, taskId, url) {
+  const snap = runner.getSnapshot(taskId);
+  if (!snap) { sendJson(res, 404, { ok: false, error: { code: ERR.NOT_FOUND, message: '任务不存在' } }); return; }
+
+  const headerId = req.headers['last-event-id'];
+  const queryId = url.searchParams.get('lastEventId');
+  const lastEventId = Number.parseInt(String(headerId || queryId || '0'), 10) || 0;
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write(': connected\n\n');
+
+  const backlog = (snap.logs || []).filter((l) => l.seq > lastEventId);
+  const lastSeq = backlog.length > 0 ? backlog[backlog.length - 1].seq : lastEventId;
+  res.write(sseFrame({ type: 'hello', taskId, backlog, task: snap.task }, lastSeq));
+  sseClients.add(res);
+
+  const heartbeat = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* ignore */ } }, HEARTBEAT_MS);
+  if (heartbeat.unref) heartbeat.unref();
+
+  let closed = false;
+  let unsubscribe = () => {};
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+    try { unsubscribe(); } catch { /* ignore */ }
+  };
+
+  // 任务已终态：发完 hello 直接收尾
+  if (runner.isFinished(taskId)) {
+    try { res.write(sseFrame({ type: 'done', taskId, task: snap.task }, lastSeq)); } catch { /* ignore */ }
+    cleanup();
+    try { res.end(); } catch { /* ignore */ }
+    return;
+  }
+
+  unsubscribe = runner.subscribe(taskId, (evt) => {
+    if (closed) return;
+    try {
+      const id = evt.type === 'log' && evt.line ? evt.line.seq : undefined;
+      res.write(sseFrame(evt, id));
+      if (evt.type === 'done') { cleanup(); res.end(); }
+    } catch {
+      cleanup();
+      try { res.end(); } catch { /* ignore */ }
+    }
+  });
+  res.on('close', cleanup);
+  req.on('close', cleanup);
+}
+
+// ------------------------------ 路由 ------------------------------
+
+/**
+ * 任务 id 白名单，与 runner.newTaskId() 的产物一一对应：`t_<毫秒时间戳>_<6 位小写 hex>`。
+ *
+ * 为什么必须校验：这些 id 来自 URL，会被 decodeURIComponent 还原，而下游
+ * store.readHistory / store.readLog 用 `path.join(目录, `${id}.json`)` 拼路径。
+ * 若不校验，`GET /api/history/..%2Fwebdav` 中的 `%2F` 解码后变成 `/`，即可穿越读取
+ * ~/.mackit 之外的任意 *.json / *.log（实测能读出 webdav.json 里的明文密码）。
+ */
+const TASK_ID_RE = /^t_\d+_[0-9a-f]{6}$/;
+
+/** 校验并返回任务 id；不合法一律按「不存在」处理，不泄露路径信息。 */
+function requireTaskId(raw) {
+  const id = decodeURIComponent(raw);
+  if (!TASK_ID_RE.test(id)) throw new AppError(ERR.NOT_FOUND, '未找到该任务');
+  return id;
+}
+
+async function handleApi(req, res, url) {
+  const { pathname } = url;
+  const method = req.method || 'GET';
+
+  if (method === 'GET' && pathname === '/api/health') {
+    ok(res, { ok: true, port: currentPort, pid: process.pid, version: VERSION });
+    return;
+  }
+
+  if (method === 'GET' && pathname === '/api/env') {
+    ok(res, await env.snapshot({ force: url.searchParams.get('force') === '1' }));
+    return;
+  }
+
+  if (pathname === '/api/config' && method === 'GET') { ok(res, { brewgo: store.readBrewgo(), mackit: store.readMackit() }); return; }
+  if (pathname === '/api/config' && method === 'PUT') {
+    const body = await readBody(req);
+    if (body.proxy || body.mirror !== undefined) {
+      const cur = store.readBrewgo();
+      store.writeBrewgo({
+        httpPort: body.proxy && Number.isInteger(body.proxy.httpPort) ? body.proxy.httpPort : cur.httpPort,
+        socksPort: body.proxy && Number.isInteger(body.proxy.socksPort) ? body.proxy.socksPort : cur.socksPort,
+        mirror: typeof body.mirror === 'string' ? body.mirror : cur.mirror,
+      });
+    }
+    if (body.defaultChannel !== undefined || body.autoFallback !== undefined || body.autoCleanup !== undefined || body.lastCheckedAt !== undefined) {
+      store.writeMackit({ defaultChannel: body.defaultChannel, autoFallback: body.autoFallback, autoCleanup: body.autoCleanup, lastCheckedAt: body.lastCheckedAt });
+    }
+    env.invalidate();
+    ok(res, { brewgo: store.readBrewgo(), mackit: store.readMackit() });
+    return;
+  }
+
+  // Homebrew 只读查询
+  if (method === 'GET' && pathname === '/api/brew/outdated') { ok(res, await queryModule('brew', 'outdated', {})); return; }
+  if (method === 'GET' && pathname === '/api/brew/installed') { ok(res, await queryModule('brew', 'installed', {})); return; }
+  if (method === 'GET' && pathname === '/api/brew/info') {
+    ok(res, await queryModule('brew', 'info', { kind: url.searchParams.get('kind') || 'cask', name: url.searchParams.get('name') || '' }));
+    return;
+  }
+
+  if (method === 'GET' && pathname === '/api/brew/cask-search') {
+    ok(res, await queryModule('brew', 'caskSearch', { q: url.searchParams.get('q') || '' }));
+    return;
+  }
+
+  // Rime
+  if (method === 'GET' && pathname === '/api/rime/status') {
+    const r = (await env.snapshot()).rime || {};
+    let skinSource = null;
+    try { skinSource = (await queryModule('rime', 'skins', {})).source; } catch { skinSource = null; }
+    ok(res, {
+      status: r.status || null,
+      rimeDir: r.dir || null,
+      dirExists: !!r.dirExists,
+      plumExists: !!r.plumExists,
+      mainSchemaExists: !!r.mainSchemaExists,
+      squirrelDeployable: !!r.squirrelDeployable,
+      squirrelBin: r.squirrelPath || null,
+      currentSkin: r.currentSkin || null,
+      currentLayout: r.currentLayout || null,
+      currentOrientation: r.currentOrientation || null,
+      skinSource,
+    });
+    return;
+  }
+  if (method === 'GET' && pathname === '/api/rime/skins') { ok(res, await queryModule('rime', 'skins', {})); return; }
+  if (method === 'GET' && pathname === '/api/rime/appearance') { ok(res, await queryModule('rime', 'appearance', {})); return; }
+  if (method === 'GET' && pathname === '/api/rime/upstream') { ok(res, await queryModule('rime', 'upstream', {})); return; }
+
+  // 系统初始化
+  if (method === 'GET' && pathname === '/api/sysinit/state') { ok(res, await queryModule('sysinit', 'state', {})); return; }
+  if (method === 'POST' && pathname === '/api/sysinit/alias/preview') {
+    const body = await readBody(req);
+    ok(res, await queryModule('sysinit', 'aliasPreview', { mode: body.mode || 'keep' }));
+    return;
+  }
+
+  // 解隔离预检
+  if (method === 'GET' && pathname === '/api/unseal/precheck') {
+    const raw = url.searchParams.get('paths') || '';
+    ok(res, await queryModule('unseal', 'precheck', { paths: raw ? raw.split('|').filter((s) => s.length > 0) : [] }));
+    return;
+  }
+
+  // 备份中心（2026-09-17 起只剩 WebDAV 一条链路；手动导出 / 导入已移除）
+  // WebDAV 备份（配置 / 列表走同步接口；上传 / 恢复 / 删除走任务流 POST /api/tasks）
+  if (method === 'GET' && pathname === '/api/webdav/config') {
+    const c = store.publicWebdav();
+    ok(res, { ...c, configured: !!c.url });
+    return;
+  }
+  if (method === 'PUT' && pathname === '/api/webdav/config') {
+    const body = await readBody(req);
+    // password 缺省（未传）→ 保持原密码；显式传 '' → 清空（见 store.writeWebdav）
+    store.writeWebdav({
+      url: body.url,
+      username: body.username,
+      password: body.password,
+      allowInsecureTLS: body.allowInsecureTLS,
+    });
+    const c = store.publicWebdav();
+    ok(res, { ...c, configured: !!c.url });
+    return;
+  }
+  if (method === 'GET' && pathname === '/api/webdav/backups') { ok(res, await queryModule('backup', 'webdavList', {})); return; }
+
+  // 历史
+  if (method === 'GET' && pathname === '/api/history') { ok(res, store.listHistory()); return; }
+  const histMatch = /^\/api\/history\/([^/]+)$/.exec(pathname);
+  if (method === 'GET' && histMatch) {
+    const id = requireTaskId(histMatch[1]);
+    const task = runner.getTask(id) || store.readHistory(id);
+    if (!task) throw new AppError(ERR.NOT_FOUND, '未找到该任务');
+    ok(res, { task, log: store.readLog(id) });
+    return;
+  }
+
+  // 任务
+  if (method === 'POST' && pathname === '/api/tasks') {
+    const body = await readBody(req);
+    const moduleId = String(body.module || '');
+    const action = String(body.action || '');
+    const def = registry.get(moduleId);
+    if (!def) throw new AppError(ERR.NOT_FOUND, `模块「${moduleId}」尚未实现`);
+    const actionDef = def.actions && def.actions[action];
+    if (!actionDef || typeof actionDef.steps !== 'function') throw new AppError(ERR.NOT_FOUND, `未知动作：${moduleId}.${action}`);
+    if (actionDef.destructive === true && body.confirm !== true) {
+      throw new AppError(ERR.CONFIRM_REQUIRED, '该操作为危险操作，缺少二次确认（confirm:true）');
+    }
+    const task = runner.submit({ module: moduleId, action, params: body.params && typeof body.params === 'object' ? body.params : {}, actionDef });
+    ok(res, { taskId: task.id, task });
+    return;
+  }
+  if (method === 'GET' && pathname === '/api/tasks') { ok(res, runner.listTasks()); return; }
+
+  const logMatch = /^\/api\/tasks\/([^/]+)\/log$/.exec(pathname);
+  if (method === 'GET' && logMatch) { handleSse(req, res, requireTaskId(logMatch[1]), url); return; }
+
+  const cancelMatch = /^\/api\/tasks\/([^/]+)\/cancel$/.exec(pathname);
+  if (method === 'POST' && cancelMatch) {
+    const id = requireTaskId(cancelMatch[1]);
+    if (!runner.cancel(id)) throw new AppError(ERR.NOT_FOUND, '任务不存在或已结束');
+    ok(res, { taskId: id, status: 'cancelled' });
+    return;
+  }
+
+  const taskMatch = /^\/api\/tasks\/([^/]+)$/.exec(pathname);
+  if (method === 'GET' && taskMatch) {
+    const id = requireTaskId(taskMatch[1]);
+    const task = runner.getTask(id);
+    if (!task) throw new AppError(ERR.NOT_FOUND, '任务不存在');
+    ok(res, task);
+    return;
+  }
+
+  if (method === 'POST' && pathname === '/api/shutdown') {
+    ok(res, { ok: true });
+    log('收到关闭请求，正在优雅退出…');
+    setTimeout(() => { gracefulShutdown('api'); }, 100);
+    return;
+  }
+
+  throw new AppError(ERR.NOT_FOUND, `未知接口：${method} ${pathname}`);
+}
+
+/**
+ * 本机来源校验（防 CSRF / DNS rebinding）。
+ *
+ * 服务只绑回环地址，但**浏览器里任意网页都能向 http://127.0.0.1:18080 发请求**：
+ * 简单请求不触发 CORS 预检，请求会真的送达并被处理（只是响应体读不到）。所以必须自己看两个头：
+ *   · Host   —— 必须是回环主机名。挡 DNS rebinding：evil.com 解析到 127.0.0.1 时
+ *               Host 仍是 evil.com，浏览器就认为同源、连响应体也能读走。
+ *   · Origin —— 若存在，必须与 Host **同源（含端口）**。挡跨站 fetch / 表单 POST。
+ *
+ * 刻意宽松之处：**缺 Origin 头一律放行**。curl、HTTP/1.0 客户端、同源顶层导航都不发它，
+ * 而这些场景本就没有「被第三方网页利用」的风险。
+ *
+ * 只校验 `/api/`：静态资源是本地代码、不含任何密钥，没必要让浏览器中途吃 403。
+ */
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+function checkApiOrigin(req) {
+  const host = String(req.headers.host || '');
+  const hostname = host.replace(/:\d+$/, '').toLowerCase();
+  if (hostname && !LOOPBACK_HOSTS.has(hostname)) {
+    throw new AppError(ERR.FORBIDDEN, '仅允许从本机访问');
+  }
+  const origin = req.headers.origin;
+  if (origin === undefined) return;
+  if (origin === 'null') throw new AppError(ERR.FORBIDDEN, '来源不被允许');
+  let o;
+  try { o = new URL(origin); } catch { throw new AppError(ERR.FORBIDDEN, '来源不被允许'); }
+  if (o.host.toLowerCase() !== host.toLowerCase()) throw new AppError(ERR.FORBIDDEN, '来源不被允许');
+}
+
+async function handler(req, res) {
+  try {
+    // 解析必须放在 try 内：`new URL('//', base)` 会抛 Invalid URL（`//` 被当作
+    // protocol-relative 的权威段）。若在 try 外解析，畸形路径（GET //、///…）会让异常
+    // 逃出 catch → 连接永不返回（挂死）+ stderr 打印未处理的 Promise 拒绝。
+    // parseReqUrl 会先把开头的连续斜杠折叠为单个 '/' 再解析，兜住这类畸形输入。
+    const url = parseReqUrl(req.url, `http://${paths.LOOPBACK}`);
+    if (url.pathname.startsWith('/api/')) { checkApiOrigin(req); await handleApi(req, res, url); }
+    else serveStatic(res, url.pathname);
+  } catch (err) {
+    if (!res.headersSent) sendError(res, err);
+    else { try { res.end(); } catch { /* ignore */ } }
+  }
+}
+
+// ------------------------------ 运行态与生命周期 ------------------------------
+let currentPort = 0;
+let server = null;
+
+function writeRuntime(port) {
+  try {
+    paths.ensureDirs();
+    fs.writeFileSync(paths.RUNTIME_JSON, JSON.stringify({ port, pid: process.pid, startedAt: Date.now() }, null, 2), 'utf8');
+  } catch (err) { log('写入 runtime.json 失败：', err && err.message); }
+}
+function removeRuntime() { try { fs.rmSync(paths.RUNTIME_JSON, { force: true }); } catch { /* ignore */ } }
+
+function waitForIdle(timeoutMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => { if (!runner.isBusy() || Date.now() - start > timeoutMs) resolve(); else setTimeout(tick, 150); };
+    tick();
+  });
+}
+
+/** 优雅关闭时等待「当前任务自然结束」的上限（ms）。 */
+const GRACEFUL_WAIT_MS = 6_000;
+
+let shuttingDown = false;
+/**
+ * 优雅关闭：取消运行中任务 → 关 SSE → 关服务 → 退出 → 删 runtime.json。
+ * @param {string} reason 触发原因（写日志用）
+ * @param {number} [exitCode=0] 退出码（异常路径如未捕获异常传 1）
+ */
+async function gracefulShutdown(reason, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(`开始优雅关闭（${reason}）…`);
+  try {
+    const cur = runner.currentTaskId();
+    if (cur) {
+      runner.cancel(cur);
+      await waitForIdle(GRACEFUL_WAIT_MS);
+      // 等满上限仍未空闲 → 显式整组 SIGKILL 补一刀再退出。
+      // 不能只依赖 exec 内部那个「SIGTERM→3s→SIGKILL」兜底定时器：它带 unref，
+      // 而 process.exit 会直接把它连同其它未触发的定时器一起丢掉，忽略 SIGTERM
+      // 的子进程就变成孤儿（常驻服务里会持续累积）。
+      if (runner.isBusy()) {
+        const n = runner.forceKill();
+        log(`等待 ${GRACEFUL_WAIT_MS}ms 仍未结束，已强杀 ${n} 个子进程`);
+      }
+    }
+  } catch (err) { log('关闭前回收任务失败（继续退出）：', err && err.message); }
+  for (const res of sseClients) { try { res.end(); } catch { /* ignore */ } }
+  sseClients.clear();
+
+  let exited = false;
+  let fallback = null;
+  const done = () => {
+    if (exited) return; // server.close 回调与兜底定时器都可能触发，只允许退出一次
+    exited = true;
+    if (fallback) clearTimeout(fallback);
+    removeRuntime();
+    process.exit(exitCode);
+  };
+  if (server) {
+    server.close(() => done());
+    // 兜底定时器刻意**不 unref**：unref 过的定时器在事件循环空转时不会触发，
+    // 进程会以默认码 0 自然退出，退出码就丢了（uncaughtException 想报 1）。
+    // 它由 done() 清理，最长只多等 1.5s。
+    fallback = setTimeout(done, 1500);
+  } else done();
+}
+
+// ------------------------------ 启动 ------------------------------
+async function main() {
+  paths.ensureDirs();
+  removeRuntime(); // 清理上一次可能残留的运行态
+  await loadModules();
+  server = http.createServer(handler);
+
+  let port = paths.DEFAULT_PORT;
+  const maxPort = paths.DEFAULT_PORT + 50;
+
+  server.on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE' && port < maxPort) {
+      port += 1;
+      log(`端口被占用，顺延到 ${port}`);
+      setTimeout(() => server.listen(port, paths.LOOPBACK), 50);
+      return;
+    }
+    log('服务错误：', err && err.message);
+    process.exit(1);
+  });
+
+  server.on('listening', () => {
+    const addr = server.address();
+    currentPort = typeof addr === 'object' && addr ? addr.port : port;
+    writeRuntime(currentPort);
+    log(`已在 http://${paths.LOOPBACK}:${currentPort} 启动（pid ${process.pid}）`
+      + (currentPort !== paths.DEFAULT_PORT ? `  ⚠ ${paths.DEFAULT_PORT} 被占用，已顺延` : ''));
+  });
+
+  server.listen(port, paths.LOOPBACK);
+}
+
+process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });
+process.on('SIGTERM', () => { gracefulShutdown('SIGTERM'); });
+process.on('exit', () => { removeRuntime(); });
+// 未捕获异常后进程状态已不可信（可能已丢状态、句柄泄漏、半截写盘）。
+// 只记日志继续跑 = 让服务带病运行，用户看到的是「时好时坏」而不是明确失败。
+// 按 Node 官方建议收敛为「记录 + 回收子进程 + 以非 0 码退出」。
+process.on('uncaughtException', (err) => {
+  log('未捕获异常，服务即将退出：', err && err.stack ? err.stack : err);
+  gracefulShutdown('uncaughtException', 1);
+});
+// 未处理的 Promise 拒绝仍只记日志：它不影响同步主流程，一个被遗忘的 promise
+// 不该让正在跑的任务（可能已执行到第 8 步）半途而废。此处保留原语义，但显式写明。
+process.on('unhandledRejection', (err) => { log('未处理的 Promise 拒绝：', err && err.stack ? err.stack : err); });
+
+main().catch((err) => { log('启动失败：', err && err.stack ? err.stack : err); process.exit(1); });
