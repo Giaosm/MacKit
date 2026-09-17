@@ -11,7 +11,7 @@ macOS 日常维护工具箱 —— 把零碎的维护操作收拢到一个本地
 | 模块 | 用途 |
 | --- | --- |
 | **总览** | 一键体检：Homebrew / Git / Rime / 代理等环境状态一览 |
-| **Homebrew 管家** | 列出可升级的软件包并逐项选择「代理 / 直连」升级；搜索并安装 Cask 应用；卸载 formula / cask / tap；本机没装 Homebrew 时可一键安装 |
+| **Homebrew 管家** | 列出可升级的软件包并逐项选择「代理 / 直连」升级；搜索并安装 Formula（命令行工具 / 库）与 Cask 应用；卸载 formula / cask / tap；本机没装 Homebrew 时可一键安装 |
 | **系统初始化** | 把代理别名写进 shell 配置、设置 Git 全局项、把 GitHub Token 存进 macOS 钥匙串、配置代理端口 |
 | **Rime 输入法** | 安装 / 更新 rime-ice 词库，切换皮肤与布局，启用万象语法模型，写入配置 |
 | **应用解隔离** | 批量去掉 App 上的 quarantine 属性（解决"打不开 / 已损坏"） |

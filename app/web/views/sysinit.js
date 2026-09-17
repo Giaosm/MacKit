@@ -1,16 +1,15 @@
 /**
- * MacKit · M3 系统初始化（视图）
+ * MacKit · 系统初始化（视图）
  *
- * 依据《MacKit-架构设计.md》§8.6 + 《MacKit-PRD.md》§6.4 / §3 M3 表 / §7.1，
  * 语义移植自原 `shell/proxy.sh`（参考脚本已于 2026-09-16 从仓库移除）。
  *
  * 设计要点：
  *   - 单一数据源：GET /api/sysinit/state（shell / alias / git / gitForm / tokenExists / proxyPorts）
  *   - ① 代理别名：现有 vs 将写入 逐行 diff（POST /api/sysinit/alias/preview）→ 二次确认 → apply_alias
- *     A2 明示：「移除」只删 alias proxy/unproxy 定义块，注释行保留；多行自定义版给黄灯提示。
+ *     「移除」只删 alias proxy/unproxy 定义块，注释行保留；多行自定义版给黄灯提示。
  *   - ② Git 全局配置：默认值取自 state.gitForm（后端生成，前端不写死任何个人信息）；只提交变更项。
  *   - ③ GitHub 凭据：Token 输入 type=password，提交后立即清空；绝不回显 / 不写浏览器本地存储 / 不进日志。
- *   - ④ 代理端口：1–65535 校验（非法值不生效）；Q3：保存后仅展示提示，绝不自动改 Git 代理。
+ *   - ④ 代理端口：1–65535 校验（非法值不生效）；保存后仅展示提示，绝不自动改 Git 代理。
  */
 
 /** 别名三选（与后端 apply_alias 的 mode 逐字一致） */
@@ -66,7 +65,7 @@ export default {
           ]));
         }
       }
-      nodes.push(el('div', { class: 'muted section', text: '写入前自动备份；「移除」仅删除 alias proxy= / alias unproxy= 两个定义块，注释行不会被删除（A2）。' }));
+      nodes.push(el('div', { class: 'muted section', text: '本应用不做自动备份，如需留存请先自行备份该文件；「移除」仅删除 alias proxy= / alias unproxy= 两个定义块，注释行不会被删除。' }));
       const btns = el('div', { class: 'row' });
       for (const [m, label] of ALIAS_MODES) {
         btns.append(el('button', { class: `btn${m === 'keep' ? '' : m === 'replace' ? ' btn--primary' : ' btn--danger'}`, type: 'button', text: label, on: { click: () => onAlias(m) } }));
@@ -200,7 +199,7 @@ export default {
             if (bad) ui.toast('warn', '非法端口输入已忽略并保持原值（需 1–65535 的整数）');
             st.portHint = '';
             await ctx.runTask('sysinit', 'set_proxy_ports', { httpPort: h, socksPort: s });
-            // Q3：保存后仅展示提示，绝不自动调用 apply_git_config
+            // 保存后仅展示提示，绝不自动调用 apply_git_config
             try {
               const e = await ctx.refreshEnv(true);
               const gp = e.git && e.git.httpProxy;
@@ -215,7 +214,7 @@ export default {
       return ui.card('④ 代理端口', el('div', {}, [
         el('div', { class: 'field__row' }, [el('span', { class: 'muted', style: 'width:120px', text: 'HTTP 端口' }), httpI]),
         el('div', { class: 'field__row section' }, [el('span', { class: 'muted', style: 'width:120px', text: 'SOCKS5 端口' }), socksI]),
-        el('div', { class: 'muted', text: '非纯数字或超出 1–65535 的输入将被忽略并保持原值（对齐原脚本语义）。' }),
+        el('div', { class: 'muted', text: '非纯数字或超出 1–65535 的输入将被忽略并保持原值。' }),
         el('div', { class: 'row section' }, [btn]),
         st.portHint ? el('div', { class: 'warn-box section', text: st.portHint }) : null,
       ]));

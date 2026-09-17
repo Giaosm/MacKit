@@ -26,38 +26,23 @@
 import fs from 'node:fs';
 import * as paths from './paths.js';
 import * as store from './store.js';
-import * as env from './env.js';
 import * as exec from './exec.js';
+import * as git from './git.js';
 import * as webdav from './webdav.js';
 
 const { ERR, AppError } = exec;
 const { DAV_ERR } = webdav;
 
-/** 与 sysinit.js 的 Git 键白名单一致 */
-const GIT_KEYS = Object.freeze(['user.name', 'user.email', 'safe.directory', 'http.proxy', 'https.proxy', 'credential.helper']);
+/** Git 键白名单唯一事实源见 lib/git.js（2026-09-18 前是与 sysinit.js 各写一份） */
+const GIT_KEYS = git.GIT_KEYS;
 
 // ------------------------------ 工具 ------------------------------
 // 统一实现见 lib/paths.js（2026-09-16 收敛 6 份重复）
 const readTextSafe = paths.readTextSafe;
 
-async function runGit(args, opts = {}) {
-  try {
-    return await exec.run('git', args, { timeoutMs: 30_000, ...opts });
-  } catch (err) {
-    return { code: (err && err.code) || -1, stdout: '', stderr: (err && err.message) || String(err) };
-  }
-}
-
-/** 解析 `git credential-osxkeychain get` 的输出。 */
-export function parseCredentialOutput(stdout) {
-  const get = (k) => {
-    const m = new RegExp(`^${k}=(.*)$`, 'm').exec(String(stdout || ''));
-    return m ? m[1] : null;
-  };
-  const username = get('username');
-  const password = get('password');
-  return username && password ? { username, token: password } : null;
-}
+// Git 执行与钥匙串凭据读写统一在 lib/git.js
+// （2026-09-18 收敛：本文件原先的 runGit / readGithubCredential 与 sysinit、env 是同一批逻辑）
+const runGit = git.run;
 
 // ------------------------------ 导出（收集） ------------------------------
 /** Rime 目录下需要备份的配置文件清单（*.custom.yaml 原文）。 */
@@ -85,42 +70,35 @@ function collectGrammarModels() {
   return out;
 }
 
-/** 读取钥匙串 GitHub 凭据（失败/不存在 → null；绝不抛错、绝不写日志）。 */
-async function readGithubCredential() {
-  const res = await runGit(['credential-osxkeychain', 'get'], {
-    stdin: 'protocol=https\nhost=github.com\n\n', timeoutMs: 10_000,
-  });
-  if (res.code !== 0) return null;
-  return parseCredentialOutput(res.stdout);
-}
-
 /**
- * 收集备份数据（payload 本体，不含信封）。includeSecret=false 时不读钥匙串（单测用）。
+ * 收集备份数据（payload 本体，不含信封）。
+ * 含钥匙串里的 GitHub 凭据（明文 Token）—— 只在 webdav_backup 的「收集」步调用，
+ * 结果只进上传信封，绝不写日志 / 落盘。
  * @returns {Promise<object>}
  */
-export async function collectData(includeSecret = true) {
+async function collectData() {
   const mackit = store.readMackit();
   const brewgo = store.readBrewgo();
-  const git = {};
+  const gitCfg = {};
   for (const key of GIT_KEYS) {
-    const v = await env.gitConfig(key);
-    if (v !== null && v !== '') git[key] = v;
+    const v = await git.config(key);
+    if (v !== null && v !== '') gitCfg[key] = v;
   }
   return {
     mackit: { defaultChannel: mackit.defaultChannel, autoFallback: mackit.autoFallback, autoCleanup: mackit.autoCleanup },
     brewgo: { httpPort: brewgo.httpPort, socksPort: brewgo.socksPort, mirror: brewgo.mirror },
-    git,
-    github: includeSecret ? (await readGithubCredential()) : null,
+    git: gitCfg,
+    github: await git.readCredential(),
     rime: { files: collectRimeFiles(), grammarModels: collectGrammarModels() },
   };
 }
 
 // -------------------- 信封校验 + 应用（WebDAV 恢复复用） --------------------
 /**
- * 校验并归一化备份 payload（纯函数，可单测）。不合法抛 PARSE_FAILED。
+ * 校验并归一化备份 payload（纯函数）。不合法抛 PARSE_FAILED。
  * @returns {{createdAt:number, data:object}}
  */
-export function validatePayload(payload) {
+function validatePayload(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new AppError(ERR.PARSE_FAILED, '备份文件格式不正确：应为 JSON 对象');
   }
@@ -137,7 +115,7 @@ export function validatePayload(payload) {
   return { createdAt: typeof payload.createdAt === 'number' ? payload.createdAt : null, data };
 }
 
-/** 应用 Rime 配置文件清单（纯文件写入，可单测）。 */
+/** 应用 Rime 配置文件清单（纯文件写入）。 */
 function applyRimeFiles(ctx, files) {
   if (!Array.isArray(files) || files.length === 0) { ctx.log('info', '备份中无 Rime 配置文件，跳过'); return; }
   if (!paths.exists(paths.RIME_DIR)) fs.mkdirSync(paths.RIME_DIR, { recursive: true });
@@ -154,14 +132,13 @@ function applyRimeFiles(ctx, files) {
 
 /**
  * 共享步骤生成器：把备份信封「应用到本机」的 7 步（validate / mackit / brewgo /
- * git / github / rime / deploy）。只被 `webdav_restore` 使用，也是这条链路的唯一实现。
- * 导出是为了单测能直接驱动这 7 步（恢复链路需要真实 WebDAV 服务器，无法离线端到端）。
+ * git / github / rime / deploy）。只被 `webdav_restore` 使用，是这条链路的唯一实现。
  *
  * @param {() => object} getPayload 惰性取信封（restore 场景下信封在「下载」步才就绪）
  * @param {{deploy?:boolean}} params 动作参数（deploy!==false 时重新部署输入法）
  * @returns {Array<{id:string,title:string,run:(ctx:object)=>Promise<void>}>}
  */
-export function applyPayloadSteps(getPayload, params) {
+function applyPayloadSteps(getPayload, params) {
   return [
     {
       id: 'validate', title: '校验备份文件',
@@ -214,8 +191,7 @@ export function applyPayloadSteps(getPayload, params) {
         const { data } = validatePayload(getPayload());
         const gh = data.github;
         if (!gh || typeof gh !== 'object' || !gh.username || !gh.token) { ctx.log('info', '备份中无 GitHub 凭据，跳过'); return; }
-        const stdin = `protocol=https\nhost=github.com\nusername=${String(gh.username)}\npassword=${String(gh.token)}\n\n`;
-        const res = await runGit(['credential-osxkeychain', 'store'], { stdin });
+        const res = await git.storeCredential(gh.username, gh.token);
         if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, '写入钥匙串失败', res.stderr.trim());
         ctx.log('ok', `GitHub 凭据已写入钥匙串（用户名 ${String(gh.username)}，Token 不记录）`);
       },
@@ -286,7 +262,7 @@ const actions = {
         {
           id: 'collect', title: '收集本机设置',
           run: async (ctx) => {
-            payloadRef = { app: 'MacKit', version: 1, createdAt: Date.now(), data: await collectData(true) };
+            payloadRef = { app: 'MacKit', version: 1, createdAt: Date.now(), data: await collectData() };
             ctx.log('ok', '已收集本机设置（含钥匙串凭据，绝不写日志）');
           },
         },

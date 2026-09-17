@@ -1,7 +1,6 @@
 /**
- * MacKit · M4 Rime 输入法（视图）
+ * MacKit · Rime 输入法（视图）
  *
- * 依据《MacKit-架构设计.md》§8.6 / §3.9 / §7 T05 + 《MacKit-PRD.md》§6.5 / §3 M4，
  * 语义移植自原 `shell/rime_ice.sh`（参考脚本已于 2026-09-16 从仓库移除）。
  *
  * 契约：
@@ -13,12 +12,12 @@
  *                                 grammarApplied:[schemaId…] }
  *   - 语法模型三动作分离：install_grammar（仅下载模型） / apply_grammar / remove_grammar（写/删 ${schema}.custom.yaml，destructive 需确认）
  *   - GET /api/rime/upstream    → { localVersion, localSyncedAt, upstreamLatest:{date,title}, upToDate, remoteError, checkedAt }
- *   - 8.1：色值一律用服务端归一化的 {hex, alpha}；前端**只做 rgba() 合成**，不重复解析 AARRGGBB。
- *   - A3：hasColors=false（native）→ colors=null → 中性色兜底，不报错、不丢卡。
+ *   - 色值一律用服务端归一化的 {hex, alpha}；前端**只做 rgba() 合成**，不重复解析 AARRGGBB。
+ *   - hasColors=false（native）→ colors=null → 中性色兜底，不报错、不丢卡。
  *   - 输入方案无切换入口（2026-09-16 删除，F4 选单由 Rime 记住选择）；当前方案在状态卡只读展示。联网固定代理优先。
  */
 
-/** 联网策略固定为「代理优先」：后端 netPolicy 缺省 proxy_first，失败自动降级直连，前端不再提供通道选择。 */
+// 联网策略固定为「代理优先」：后端 netPolicy 缺省 proxy_first，失败自动降级直连，前端不再提供通道选择。
 /** Squirrel 皮肤来源标签 */
 const SOURCE_LABEL = { squirrel: 'squirrel.yaml', build: 'build/squirrel.yaml', degraded: '降级（仅名称）' };
 
@@ -186,7 +185,7 @@ export default {
         title: '应用万象语法模型', confirmLabel: '确认应用',
         body: el('div', {}, [
           el('p', { class: 'muted', text: `将为「${name}」启用万象语法模型：写入 ${S.grammarScheme}.custom.yaml 并重新部署。` }),
-          el('p', { class: 'muted section', text: '已有配置会先原地备份（保留最近 5 份）并同步集中备份。' }),
+          el('p', { class: 'muted section', text: `只写 ${S.grammarScheme}.custom.yaml，其他方案配置不受影响。本应用不做自动备份，如需留存请先用「备份中心」备份。` }),
         ]),
       });
       if (!ok) return;
@@ -200,7 +199,7 @@ export default {
         title: '移除万象语法模型', confirmLabel: '确认移除', danger: true,
         body: el('div', {}, [
           el('p', { class: 'muted', text: `将从「${name}」移除万象语法模型：删除 ${S.grammarScheme}.custom.yaml 并重新部署。` }),
-          el('p', { class: 'muted section', text: '模型文件本身不会被删除，其他方案不受影响；删前自动备份。' }),
+          el('p', { class: 'muted section', text: `仅删除 ${S.grammarScheme}.custom.yaml；模型文件本身与其他方案都不受影响。本应用不做自动备份，如需留存请先用「备份中心」备份。` }),
         ]),
       });
       if (!ok) return;
@@ -290,7 +289,7 @@ export default {
       const ok = await ui.confirmDialog({
         title: '确认写入 squirrel.custom.yaml', confirmLabel: '确认写入',
         body: el('div', {}, [
-          el('p', { class: 'muted', text: '写入前将原地备份（保留最近 5 份）并同步一份到集中备份目录。' }),
+          el('p', { class: 'muted', text: '将写入 Rime 目录下的 squirrel.custom.yaml。本应用不做自动备份，如需留存请先用「备份中心」备份。' }),
           el('div', { class: 'muted section', text: '将写入的 patch（依据 patch_yaml 语义生成）：' }),
           ui.diffView(buildPreview(skin, layoutDef)),
         ]),
@@ -298,7 +297,7 @@ export default {
       if (ok) await ctx.runTask('rime', 'apply_appearance', { skin, layout: S.layoutIdx }, { confirm: true });
     }
 
-    /** 由「确定性 patch 语义 + 当前值」构造 diff 预览（§3.12 无独立 preview 端点）。 */
+    /** 由「确定性 patch 语义 + 当前值」构造 diff 预览（无独立 preview 端点）。 */
     function buildPreview(skin, layoutDef) {
       const cur = (S.appearance && S.appearance.current) || {};
       const lines = [{ type: 'same', text: 'patch:' }];
@@ -314,7 +313,7 @@ export default {
     }
 
     // ============================ 工具 ============================
-    /** {hex,alpha} → rgba()（前端只做合成，不解析 AARRGGBB；§8.1）。 */
+    /** {hex,alpha} → rgba()（前端只做合成，不解析 AARRGGBB）。 */
     function cssColor(c) {
       if (!c || typeof c.hex !== 'string' || !c.valid) return null;
       const h = c.hex.replace('#', '');

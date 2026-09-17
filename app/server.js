@@ -1,7 +1,6 @@
 /**
  * MacKit · HTTP 边界
  *
- * 依据《MacKit-架构设计.md》§3.12 / §3.13 / §3.14：
  *   - 仅监听 127.0.0.1；端口从 18080 起，EADDRINUSE 则 +1 顺延
  *   - 静态托管 web/（Cache-Control: no-store，零外部资源）
  *   - REST 路由（统一包裹 { ok, data } / { ok, error }）
@@ -10,7 +9,7 @@
  *   - /api/ 来源校验：Host 必须是回环主机名、Origin（若有）必须与 Host 同源 —— 防 CSRF / DNS rebinding
  *   - /api/shutdown 优雅退出（取消运行中任务 → 关 SSE → 关服务 → 退出 → 删 runtime.json）
  *
- * 本文件不做业务逻辑；功能模块（T03）通过「动态导入 + 注册表」接入：
+ * 本文件不做业务逻辑；功能模块通过「动态导入 + 注册表」接入：
  *   - 每个模块默认导出 ModuleDefinition：{ id, actions, queries? }
  *   - actions[action] = { title, destructive?, steps(params, ctx), finalize? }
  *   - queries[queryName] = (params) => Promise<data>（本文件约定的只读查询扩展点）
@@ -40,7 +39,7 @@ const VERSION = readVersion();
 
 function log(...args) { console.log('[MacKit]', ...args); } // 被启动器重定向到 ~/.mackit/server.out
 
-// ------------------------------ 功能模块注册表（T03 动态接入） ------------------------------
+// ------------------------------ 功能模块注册表（动态接入） ------------------------------
 const MODULE_FILES = Object.freeze({ brew: 'brew.js', sysinit: 'sysinit.js', rime: 'rime.js', unseal: 'unseal.js', backup: 'backup.js' });
 const registry = new Map();
 
@@ -281,8 +280,12 @@ async function handleApi(req, res, url) {
     return;
   }
 
-  if (method === 'GET' && pathname === '/api/brew/cask-search') {
-    ok(res, await queryModule('brew', 'caskSearch', { q: url.searchParams.get('q') || '' }));
+  // 软件包搜索：kind=cask|formula（缺省 cask），q 为关键词
+  if (method === 'GET' && pathname === '/api/brew/package-search') {
+    ok(res, await queryModule('brew', 'packageSearch', {
+      kind: url.searchParams.get('kind') || 'cask',
+      q: url.searchParams.get('q') || '',
+    }));
     return;
   }
 

@@ -1,13 +1,12 @@
 /**
- * MacKit · M3 系统初始化（后端模块）
+ * MacKit · 系统初始化（后端模块）
  *
- * 依据《MacKit-架构设计.md》§3.7 / §3.12 与《MacKit-PRD.md》§3 M3 表，
  * 语义移植自原 `shell/proxy.sh`（参考脚本已于 2026-09-16 从仓库移除，本文件为该功能的唯一事实源）。
  *
  * 关键约束：
- *   - A2：移除别名只删除 alias 定义块，绝不删除注释行（用 env.computeAliasRemovalRange）
- *   - A5：源码不得出现任何个人信息字面量；建议值一律运行时生成
- *   - Q3：改代理端口不自动改 Git 代理，仅返回提示
+ *   - 移除别名只删除 alias 定义块，绝不删除注释行（用 env.computeAliasRemovalRange）
+ *   - 源码不得出现任何个人信息字面量；建议值一律运行时生成
+ *   - 改代理端口不自动改 Git 代理，仅返回提示
  *   - Token 只写钥匙串，绝不落盘、绝不进日志
  */
 
@@ -17,18 +16,26 @@ import * as paths from './paths.js';
 import * as store from './store.js';
 import * as env from './env.js';
 import * as exec from './exec.js';
+import * as git from './git.js';
 
 const { ERR, AppError } = exec;
 
-/** 允许写入的 Git 全局配置键（白名单，防止任意键注入） */
-const GIT_KEYS = Object.freeze(['user.name', 'user.email', 'safe.directory', 'http.proxy', 'https.proxy', 'credential.helper']);
+/** 允许写入的 Git 全局配置键（白名单，防止任意键注入；唯一事实源见 lib/git.js） */
+const GIT_KEYS = git.GIT_KEYS;
 
 // ------------------------------ 工具 ------------------------------
 // 统一实现见 lib/paths.js（2026-09-16 收敛 6 份重复）
 const readText = paths.readTextSafe;
-function writeText(p, text) { fs.writeFileSync(p, text, 'utf8'); }
+/**
+ * 写文本文件。★ 必须把失败包成带 code 的 AppError：裸 fs 错误没有 code，
+ * 会一路落到 server.statusForCode 的 default 分支，把「磁盘写失败」报成 502 命令失败。
+ */
+function writeText(p, text) {
+  try { fs.writeFileSync(p, text, 'utf8'); }
+  catch (err) { throw new AppError(ERR.IO_ERROR, `写入失败：${p}`, String(err && err.message)); }
+}
 
-/** 生成首次运行的占位建议值：一律不含任何姓氏/邮箱/GitHub ID 字面量（A5）。 */
+/** 生成首次运行的占位建议值：一律不含任何姓氏/邮箱/GitHub ID 字面量。 */
 function suggestions(port) {
   let userName = '';
   try { userName = os.userInfo().username || ''; } catch { userName = ''; }
@@ -59,7 +66,7 @@ function removeAliasBlocks(text, names) {
   return cur;
 }
 
-/** 覆盖模式：先移除旧块，再追加期望的单行别名（复刻 proxy.sh 的 append 语义）。 */
+/** 覆盖模式：先移除旧块，再追加期望的单行别名。 */
 function buildAliasReplaced(text, port) {
   const cleaned = removeAliasBlocks(text, ['proxy', 'unproxy']).replace(/\s+$/, '');
   return `${cleaned}\n\n${env.expectedAliasLines(port).join('\n')}\n`;
@@ -103,26 +110,26 @@ async function queryState() {
   const text = rcFile ? readText(rcFile) : null;
   const analysis = env.analyzeRc(text, cfg.httpPort);
 
-  const git = {
+  const gitInfo = {
     installed: false, // 由下方 dirExistsIsGit() 覆盖
-    userName: await env.gitConfig('user.name'),
-    userEmail: await env.gitConfig('user.email'),
-    safeDirectory: await env.gitConfig('safe.directory'),
-    httpProxy: await env.gitConfig('http.proxy'),
-    httpsProxy: await env.gitConfig('https.proxy'),
-    credentialHelper: await env.gitConfig('credential.helper'),
+    userName: await git.config('user.name'),
+    userEmail: await git.config('user.email'),
+    safeDirectory: await git.config('safe.directory'),
+    httpProxy: await git.config('http.proxy'),
+    httpsProxy: await git.config('https.proxy'),
+    credentialHelper: await git.config('credential.helper'),
   };
   const gitInstalled = await dirExistsIsGit();
-  git.installed = gitInstalled;
+  gitInfo.installed = gitInstalled;
 
   const sug = suggestions(cfg.httpPort);
   const gitForm = GIT_KEYS.map((key) => ({
     key, label: key,
-    current: git[keyToField(key)],
+    current: gitInfo[keyToField(key)],
     placeholder: sug[key],
   }));
 
-  const tokenExistsFlag = gitInstalled ? await env.tokenExists() : false;
+  const tokenExistsFlag = gitInstalled ? await git.credentialExists() : false;
 
   return {
     shell: { kind, rcFile },
@@ -134,7 +141,7 @@ async function queryState() {
       multiline: analysis.multiline,
       present: analysis.present,
     },
-    git,
+    git: gitInfo,
     gitForm,
     tokenExists: tokenExistsFlag,
     proxyPorts: { http: cfg.httpPort, socks5: cfg.socksPort },
@@ -181,17 +188,12 @@ async function queryAliasPreview(params) {
 }
 
 // ------------------------------ Git 执行 ------------------------------
-async function safeGit(args, opts = {}) {
-  try {
-    return await exec.run('git', args, { timeoutMs: 30_000, ...opts });
-  } catch (err) {
-    return { code: (err && err.code) || -1, stdout: '', stderr: (err && err.message) || String(err) };
-  }
-}
+// 统一实现在 lib/git.js（2026-09-18 收敛：与 backup.runGit / env 的 git 分支是同一段兜底）
+const safeGit = git.run;
 
 // ------------------------------ 动作定义 ------------------------------
 const actions = {
-  /** 写入 / 覆盖 / 移除代理别名（覆盖与移除为危险操作，复刻 MK-M3-02） */
+  /** 写入 / 覆盖 / 移除代理别名（覆盖与移除为危险操作） */
   apply_alias: {
     title: '应用代理别名',
     destructive: true,
@@ -233,7 +235,7 @@ const actions = {
     },
   },
 
-  /** 应用 Git 全局配置变更（只应用发生变化的项，复刻 MK-M3-03/04） */
+  /** 应用 Git 全局配置变更（只应用发生变化的项） */
   apply_git_config: {
     title: '应用 Git 全局配置变更',
     destructive: true,
@@ -248,7 +250,7 @@ const actions = {
         if (changes.length === 0) { ctx.log('warn', '没有需要应用的变更项'); return; }
         let applied = 0;
         for (const { key, value } of changes) {
-          const cur = await env.gitConfig(key);
+          const cur = await git.config(key);
           if ((cur === null && value === '') || cur === value) {
             ctx.log('info', `跳过未变更项：${key}`);
             continue;
@@ -263,7 +265,7 @@ const actions = {
     }],
   },
 
-  /** 写入 GitHub Token 到钥匙串（不落盘；复刻 proxy.sh setup_git_token） */
+  /** 写入 GitHub Token 到钥匙串（不落盘） */
   store_token: {
     title: '写入 GitHub Token',
     destructive: true,
@@ -275,20 +277,19 @@ const actions = {
         if (!username) throw new AppError(ERR.PARSE_FAILED, '未提供用户名');
         if (!token) throw new AppError(ERR.PARSE_FAILED, '未提供 Token');
 
-        const exists = await env.tokenExists();
+        const exists = await git.credentialExists();
         ctx.log('info', exists ? '检测到已有 GitHub 凭据，将覆盖' : '未检测到凭据，将新建');
         ctx.log('info', `目标用户名：${username}（Token 不回显、不记录）`);
 
-        // 复刻原脚本：git credential-osxkeychain store（stdin 传入，Token 绝不写入日志/文件）
-        const stdin = `protocol=https\nhost=github.com\nusername=${username}\npassword=${token}\n\n`;
-        const res = await safeGit(['credential-osxkeychain', 'store'], { stdin });
+        // git credential-osxkeychain store：Token 经 stdin 传入，绝不写入日志/文件
+        const res = await git.storeCredential(username, token);
         if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, '写入钥匙串失败', res.stderr.trim());
         ctx.log('ok', 'GitHub Token 已写入 macOS 钥匙串（仅钥匙串，无任何落盘）');
       },
     }],
   },
 
-  /** 保存代理端口（非危险；Q3：不自动改 Git 代理，只回提示） */
+  /** 保存代理端口（非危险；不自动改 Git 代理，只回提示） */
   set_proxy_ports: {
     title: '保存代理端口',
     destructive: false,
@@ -296,13 +297,13 @@ const actions = {
       id: 'save_ports', title: '保存代理端口',
       run: async (ctx) => {
         const cur = store.readBrewgo();
-        // 非纯数字输入一律忽略、保持原值（对齐 brewgo.sh:96-97）
+        // 非纯数字输入一律忽略、保持原值
         const httpPort = /^[0-9]+$/.test(String(params.httpPort)) ? Number(params.httpPort) : cur.httpPort;
         const socks5Port = /^[0-9]+$/.test(String(params.socksPort)) ? Number(params.socksPort) : cur.socksPort;
         store.writeBrewgo({ httpPort, socksPort: socks5Port, mirror: cur.mirror });
         ctx.log('ok', `已保存到 ~/.brewgo_config：HTTP=${httpPort}, SOCKS5=${socks5Port}`);
-        // Q3：不自动改 Git 代理，仅提示
-        const gp = await env.gitConfig('http.proxy');
+        // 不自动改 Git 代理，仅提示
+        const gp = await git.config('http.proxy');
         const want = `http://127.0.0.1:${httpPort}`;
         if (gp && gp !== want) {
           ctx.log('warn', `Git 全局代理仍为 ${gp}，如需同步请在「系统初始化 → Git 全局配置」中修改`);

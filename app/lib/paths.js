@@ -1,7 +1,7 @@
 /**
  * MacKit · 路径常量唯一来源
  *
- * 依据《MacKit-架构设计.md》§8.5：全项目的文件/可执行文件路径必须在此定义并导出，
+ * 全项目的文件/可执行文件路径必须在此定义，
  * 任何其他文件不得自行拼接这些路径。
  *
  * 纪律：本文件只使用 node:fs / node:path / node:os，不引入 child_process
@@ -21,12 +21,8 @@ const __dirname = path.dirname(__filename);
 
 /** app/ 根目录 */
 export const APP_DIR = path.resolve(__dirname, '..');
-/** app/lib/ */
-export const LIB_DIR = path.join(APP_DIR, 'lib');
 /** app/web/ */
 export const WEB_DIR = path.join(APP_DIR, 'web');
-/** app/MacKit.command */
-export const LAUNCHER = path.join(APP_DIR, 'MacKit.command');
 
 // ---------------------------------------------------------------------------
 // 用户家目录与 ~/.mackit 数据目录
@@ -34,7 +30,7 @@ export const LAUNCHER = path.join(APP_DIR, 'MacKit.command');
 /** 用户家目录 */
 export const HOME = os.homedir();
 /** ~/.mackit */
-export const MACKIT_DIR = path.join(HOME, '.mackit');
+const MACKIT_DIR = path.join(HOME, '.mackit');
 /** ~/.mackit/config.json（MacKit 专属配置） */
 export const CONFIG_JSON = path.join(MACKIT_DIR, 'config.json');
 /** ~/.mackit/runtime.json（运行态：port/pid/startedAt） */
@@ -49,7 +45,7 @@ export const CACHE_DIR = path.join(MACKIT_DIR, 'cache');
 export const WEBDAV_JSON = path.join(MACKIT_DIR, 'webdav.json');
 
 // ---------------------------------------------------------------------------
-// 配置事实源（原脚本共用，格式不变）
+// 配置事实源（格式不变）
 // ---------------------------------------------------------------------------
 /** ~/.brewgo_config ← 代理端口 / 镜像源唯一事实源 */
 export const BREWGO_CONFIG = path.join(HOME, '.brewgo_config');
@@ -69,6 +65,12 @@ export const RC_BASH_PROFILE = path.join(HOME, '.bash_profile');
 export const SHELL_KIND = String(process.env.SHELL || '').includes('bash') ? 'bash' : 'zsh';
 /** 与 SHELL_KIND 对应的登录 rc 文件（zsh → ~/.zprofile，bash → ~/.bash_profile） */
 export const SHELL_RC = SHELL_KIND === 'bash' ? RC_BASH_PROFILE : RC_ZPROFILE;
+/**
+ * 判定一段 rc 文本是否已写入 brew 环境变量。
+ * env.js（环境体检：查 zprofile / bash_profile 两份）与 brew.js（幂等写入：只查将要写的那份）
+ * 共用同一标记，避免两处正则各自漂移。
+ */
+export const SHELLENV_RE = /brew\s+shellenv/;
 
 // ---------------------------------------------------------------------------
 // Rime 输入法
@@ -130,6 +132,18 @@ export function readTextSafe(p) {
 }
 
 /**
+ * 按行拆分，去掉空行与每行首尾空白（全项目唯一实现）。
+ *
+ * 原先 brew.js 的 `lineList()` 与 env.js 的 `nonEmptyLines()` 各写了一份逐字相同的实现，
+ * 2026-09-18 收敛到这里（与 readTextSafe 同类：都是无副作用的文本辅助）。
+ * @param {string} text
+ * @returns {string[]}
+ */
+export function lines(text) {
+  return String(text || '').split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/**
  * 从候选列表里挑第一个存在的路径，都不存在则返回 fallback。
  * @param {string[]} candidates
  * @param {string} fallback
@@ -159,8 +173,6 @@ export const SECURITY_BIN = firstExisting(['/usr/bin/security'], '/usr/bin/secur
 export const OSASCRIPT_BIN = firstExisting(['/usr/bin/osascript'], '/usr/bin/osascript');
 /** curl 可执行文件 */
 export const CURL_BIN = firstExisting(['/usr/bin/curl'], '/usr/bin/curl');
-/** open 可执行文件 */
-export const OPEN_BIN = firstExisting(['/usr/bin/open'], '/usr/bin/open');
 /**
  * bash 可执行文件：仅用于执行 Homebrew 官方安装脚本（install.sh 需要 bash 解释器）。
  * 以绝对路径形式登记在 exec.js 的 ABSOLUTE_ALLOWED 中，不允许其他用途。
@@ -177,7 +189,7 @@ export const NODE_BIN = firstExisting(
 
 /**
  * PATH 前置段（子进程注入用）。
- * 复刻原脚本"brew 在 /opt/homebrew/bin"的现实；exec.js 会把它拼到 PATH 最前。
+ * 现实是 brew 在 /opt/homebrew/bin；exec.js 会把它拼到 PATH 最前。
  */
 export const PATH_PREFIX = ['/opt/homebrew/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
 
@@ -197,55 +209,5 @@ export const DEFAULT_PORT = 18080;
 /** 本机回环地址（全局唯一绑定地址） */
 export const LOOPBACK = '127.0.0.1';
 
-/** 代理主机（原脚本 PROXY_HOST 常量） */
+/** 代理主机 */
 export const PROXY_HOST = '127.0.0.1';
-
-export default {
-  APP_DIR,
-  LIB_DIR,
-  WEB_DIR,
-  LAUNCHER,
-  HOME,
-  MACKIT_DIR,
-  CONFIG_JSON,
-  RUNTIME_JSON,
-  LOGS_DIR,
-  HISTORY_DIR,
-  CACHE_DIR,
-  WEBDAV_JSON,
-  BREWGO_CONFIG,
-  RC_ZSH,
-  RC_BASH,
-  RC_ZPROFILE,
-  RC_BASH_PROFILE,
-  SHELL_KIND,
-  SHELL_RC,
-  RIME_DIR,
-  RIME_CUSTOM,
-  RIME_SQUIRREL,
-  RIME_BUILD_SQUIRREL,
-  RIME_MAIN_SCHEMA,
-  RIME_MAIN_DICT,
-  RIME_CN_DICTS,
-  RIME_EN_DICTS,
-  RIME_BUILD_DEFAULT,
-  RIME_DEFAULT_CUSTOM,
-  PLUM_DIR,
-  SQUIRREL_BIN,
-  BREW_BIN,
-  GIT_BIN,
-  XATTR_BIN,
-  SECURITY_BIN,
-  OSASCRIPT_BIN,
-  CURL_BIN,
-  OPEN_BIN,
-  BASH_BIN,
-  NODE_BIN,
-  BREW_PREFIX,
-  PATH_PREFIX,
-  DEFAULT_PORT,
-  LOOPBACK,
-  PROXY_HOST,
-  exists,
-  ensureDirs,
-};

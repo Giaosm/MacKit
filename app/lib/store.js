@@ -1,23 +1,22 @@
 /**
  * MacKit · 持久化层
  *
- * 依据《MacKit-架构设计.md》§3.10 与 Part B §8.9 / §8.11，交付总监决策 A1 / A4：
  *   - ~/.brewgo_config 是代理端口 / 镜像源的唯一事实源，格式不变；
- *     ★ A1：写回改为「原地更新变更键」，保留所有注释与未知键（不再整文件重写）。
+ *     ★ 写回采用「原地更新变更键」，保留所有注释与未知键（不整文件重写）。
  *   - ~/.mackit/config.json 仅存 MacKit 新增项，权限 600。
- *   - 两套保留策略互相独立：任务日志(50 任务/30 天)、任务历史(最近 10 次/30 天)。
- *     （2026-09-16 起自动备份已全部移除：集中备份与 Rime 原地备份删除，
- *      配置迁移唯一入口是「备份中心」的手动导出/导入，见 lib/backup.js。）
+ *   - 两套保留策略互相独立：任务日志（50 任务 / 30 天）、任务历史（最近 10 次 / 30 天）。
+ *     （2026-09-16 起自动备份已全部移除：集中备份与 Rime 原地备份删除；
+ *      配置迁移的唯一入口是「备份中心」的 WebDAV 备份，见 lib/backup.js。）
  *
  * 本文件只使用 node:fs / node:path，不引入 child_process，也不引入 exec.js（避免循环依赖）；
- * 因此错误码以字面量给出（取值与 §3.2 一致）。
+ * 因此错误码以字面量给出（取值与 exec.js 的 ERR 一致）。
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import * as paths from './paths.js';
 
-// 与 §3.2 一致（此处不 import exec.js，避免 exec → store → exec 循环）
+// 与 exec.js 的 ERR 取值一致（此处不 import exec.js，避免 exec → store → exec 循环）
 const E_IO = 'IO_ERROR';
 
 /** MacKit 配置默认值 */
@@ -25,11 +24,11 @@ const MACKIT_DEFAULTS = Object.freeze({ defaultChannel: 'auto', autoFallback: tr
 const MIRROR_IDS = Object.freeze(['official', 'tuna', 'ustc', 'aliyun', 'tencent']);
 const CHANNEL_POLICIES = Object.freeze(['direct_first', 'proxy_first', 'auto']);
 
-/** 保留策略常量（§8.11） */
-export const LOG_KEEP_TASKS = 50;
-export const LOG_KEEP_DAYS = 30;
+/** 保留策略常量 */
+const LOG_KEEP_TASKS = 50;
+const LOG_KEEP_DAYS = 30;
 /** 任务历史保留条数（用户要求：侧边栏「任务历史」最多只留最近 10 次） */
-export const HISTORY_KEEP = 10;
+const HISTORY_KEEP = 10;
 
 // ---------------------------- 通用工具 ----------------------------
 /** 构造带 code 的 Error（形态与 exec.js 的 AppError 兼容）。 */
@@ -48,12 +47,21 @@ function readJsonSafe(p, fallback) {
   if (text === null) return fallback;
   try { return JSON.parse(text); } catch { return fallback; }
 }
+/**
+ * 原子写 JSON：先写同目录临时文件，再 rename 覆盖。
+ * 直接覆盖写若在中途崩溃（断电 / 被 kill）会留下半截 JSON —— 而这里写的是配置、
+ * WebDAV 凭据与任务历史，宁可多一次 rename 也不要写出坏文件。
+ * 临时文件用 `.tmp` 后缀，不会被 listFiles(dir, '.json') 扫进来。
+ */
 function writeJsonSafe(p, obj) {
+  const tmp = `${p}.tmp`;
   try {
     paths.ensureDirs();
-    fs.writeFileSync(p, JSON.stringify(obj, null, 2), 'utf8');
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+    fs.renameSync(tmp, p); // 同目录内 rename 是原子的
     return true;
   } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* 清理失败不影响报错 */ }
     throw mkErr(E_IO, '写入 JSON 文件失败', `${p}: ${err && err.message}`);
   }
 }
@@ -74,7 +82,7 @@ function listFiles(dir, ext, includeDot = false) {
 
 // ---------------------- ~/.brewgo_config（事实源，格式不变） ----------------------
 
-/** 读取 brewgo 配置（复刻 load_config 容错：跳过空行与注释、端口须纯数字、MIRROR 须在枚举内）。 */
+/** 读取 brewgo 配置（容错：跳过空行与注释、端口须纯数字、MIRROR 须在枚举内）。 */
 export function readBrewgo() {
   const result = { httpPort: 7897, socksPort: 7897, mirror: 'official', hadMirrorKey: false, exists: false };
   const text = readTextSafe(paths.BREWGO_CONFIG);
@@ -111,7 +119,7 @@ function normalizeBrewgoInput(v) {
 }
 
 /**
- * 原地更新 ~/.brewgo_config 的变更键（A1）：逐行扫描命中键原地改值，
+ * 原地更新 ~/.brewgo_config 的变更键：逐行扫描命中键原地改值，
  * MIRROR 不存在则追加到末尾；保留所有注释行与未知键。
  */
 export function writeBrewgo(v) {
@@ -355,14 +363,18 @@ export function readHistory(taskId) {
   return t && typeof t === 'object' ? t : null;
 }
 
-/** 保留策略（§8.11）：日志「最近 50 个任务 或 30 天，先到者为准」；任务历史「最近 10 次 或 30 天」。 */
+/**
+ * 保留策略：任务日志「最近 50 个任务 或 30 天，先到者为准」。
+ *
+ * ★ 只扫日志目录：历史由 writeHistory 自己收尾（那里会调 pruneHistory），
+ *   原先这里再扫一遍 history，等于每次任务收尾把同一目录读两遍（2026-09-18 收敛）。
+ */
 export function pruneLogs() {
   pruneByPolicy(paths.LOGS_DIR, '.log', LOG_KEEP_TASKS);
-  pruneByPolicy(paths.HISTORY_DIR, '.json', HISTORY_KEEP);
 }
 
 /** 只保留最近 HISTORY_KEEP 份任务历史（按 mtime 倒序）。 */
-export function pruneHistory() {
+function pruneHistory() {
   pruneByPolicy(paths.HISTORY_DIR, '.json', HISTORY_KEEP);
 }
 
@@ -403,14 +415,3 @@ export function setCached(key, value) {
   paths.ensureDirs();
   writeJsonSafe(cachePath(key), { value, at: Date.now() });
 }
-
-export default {
-  LOG_KEEP_TASKS, LOG_KEEP_DAYS, HISTORY_KEEP,
-  readBrewgo, writeBrewgo,
-  readMackit, writeMackit,
-  readWebdav, writeWebdav, publicWebdav, redactParams,
-  appendLog, readLog, logFilePath,
-  writeHistory, listHistory, readHistory,
-  pruneLogs, pruneHistory,
-  getCached, setCached,
-};

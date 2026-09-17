@@ -1,7 +1,6 @@
 /**
  * MacKit · 任务调度层
  *
- * 依据《MacKit-架构设计.md》§3.3 / §3.4 / §3.6 / §3.7 与 PRD §7.2：
  *   - 全局串行队列：同一时刻只允许 1 个任务（规避 brew 并发抢锁）
  *   - Step 状态机：pending → running → ok/fail/skip/cancelled
  *   - SSE 广播：单一来源在后端（内存环形缓冲 + 落盘）
@@ -14,15 +13,13 @@
 
 import { EventEmitter } from 'node:events';
 import crypto from 'node:crypto';
-import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
-import * as env from './env.js';
 
 /** 内存日志环形缓冲上限 */
-export const RING_MAX = 2000;
+const RING_MAX = 2000;
 /** 单步默认超时（600s） */
-export const DEFAULT_STEP_TIMEOUT_MS = exec.DEFAULT_TIMEOUT_MS;
+const DEFAULT_STEP_TIMEOUT_MS = exec.DEFAULT_TIMEOUT_MS;
 /** 内存中保留的最近任务数（内存裁剪用） */
 const MEMORY_KEEP = 60;
 
@@ -51,7 +48,6 @@ function emit(rec, evt) {
   try { rec.emitter.emit('event', evt); } catch { /* 订阅者异常不影响任务 */ }
 }
 function emitTask(rec) { emit(rec, { type: 'task', taskId: rec.task.id, task: snapshotTask(rec.task) }); }
-function emitStep(rec, step) { emit(rec, { type: 'step', taskId: rec.task.id, step: { ...step } }); }
 
 /** 追加一行日志（写内存环形缓冲 + 落盘 + 广播）。 */
 function pushLog(rec, level, text) {
@@ -84,7 +80,7 @@ function makeBaseCtx(rec) {
     signal: rec.controller.signal,
     log: (level, text) => pushLog(rec, level, text),
     setChannel: () => { /* steps() 阶段无当前步骤，忽略 */ },
-    exec, store, env, paths,
+    exec,
   };
 }
 
@@ -106,8 +102,29 @@ function makeStepCtx(rec, step, stepSignal) {
     signal: stepSignal,
     log: (level, text) => pushLog(rec, level, text),
     setChannel: (c) => { step.channel = c; },
-    exec: boundExec, store, env, paths,
+    exec: boundExec,
   };
+}
+
+/**
+ * 按步骤终态汇总 `{ ok, fail, skip }`（skip 含 cancelled）——全项目唯一口径。
+ * runner 的终态判定与各模块的 finalize（brew / unseal）原先各写一份同样的循环（2026-09-18 收敛）。
+ * @param {Array<{status:string}>} steps
+ * @returns {{ok:number, fail:number, skip:number}}
+ */
+export function countSteps(steps) {
+  const counts = { ok: 0, fail: 0, skip: 0 };
+  for (const s of Array.isArray(steps) ? steps : []) {
+    if (s.status === 'ok') counts.ok += 1;
+    else if (s.status === 'fail') counts.fail += 1;
+    else if (s.status === 'skip' || s.status === 'cancelled') counts.skip += 1;
+  }
+  return counts;
+}
+
+/** 已进入终态的步骤数（pending / running 之外的都算已结束），供 progress 展示。 */
+function doneSteps(steps) {
+  return steps.filter((s) => s.status !== 'pending' && s.status !== 'running').length;
 }
 
 // ------------------------------ 提交与队列 ------------------------------
@@ -215,7 +232,6 @@ async function runTask(rec) {
 
     step.status = 'running';
     step.startedAt = Date.now();
-    emitStep(rec, step);
     emitTask(rec);
     pushLog(rec, 'info', `▶ ${step.title}`);
 
@@ -252,22 +268,16 @@ async function runTask(rec) {
     if (step.channel) pushLog(rec, 'info', `  通道：${step.channel === 'proxy' ? '代理' : '直连'}`);
     if (step.status === 'ok') pushLog(rec, 'ok', `✓ ${step.title} 完成`);
     else if (step.status === 'skip') pushLog(rec, 'warn', `⏭ ${step.title} 已跳过`);
-    emitStep(rec, step);
-    task.progress.done = task.steps.filter((s) => s.status !== 'pending' && s.status !== 'running').length;
+    task.progress.done = doneSteps(task.steps);
     emitTask(rec);
 
     if (cancelled) { skipRemaining(rec, i + 1); break; }
   }
 
   // ---- 汇总 ----
-  const counts = { ok: 0, fail: 0, skip: 0 };
-  for (const s of task.steps) {
-    if (s.status === 'ok') counts.ok += 1;
-    else if (s.status === 'fail') counts.fail += 1;
-    else if (s.status === 'skip' || s.status === 'cancelled') counts.skip += 1;
-  }
+  const counts = countSteps(task.steps);
   task.counts = counts;
-  task.progress.done = task.steps.filter((s) => s.status !== 'pending' && s.status !== 'running').length;
+  task.progress.done = doneSteps(task.steps);
 
   if (cancelled || signal.aborted) {
     task.status = 'cancelled';
@@ -297,7 +307,6 @@ function skipRemaining(rec, from) {
   for (let j = from; j < rec.task.steps.length; j++) {
     if (rec.task.steps[j].status === 'pending') {
       rec.task.steps[j].status = 'skip';
-      emitStep(rec, rec.task.steps[j]);
     }
   }
 }
@@ -363,13 +372,6 @@ export function listTasks() {
   return mem.concat(extra);
 }
 
-/** 获取某任务的日志（内存优先，缺失则从磁盘读）。 */
-export function getLog(taskId) {
-  const rec = records.get(taskId);
-  if (rec && rec.logs.length > 0) return rec.logs.map((l) => ({ ...l }));
-  return store.readLog(taskId);
-}
-
 /** 获取 SSE 连接初始快照 { task, logs }。 */
 export function getSnapshot(taskId) {
   const task = getTask(taskId);
@@ -432,9 +434,3 @@ export function currentTaskId() { return currentId; }
  * @returns {number} 实际尝试发信号的子进程数
  */
 export function forceKill() { return exec.killAllNow('SIGKILL'); }
-
-export default {
-  RING_MAX, DEFAULT_STEP_TIMEOUT_MS,
-  submit, getTask, listTasks, getLog, getSnapshot, subscribe, isFinished,
-  cancel, isBusy, currentTaskId, forceKill,
-};

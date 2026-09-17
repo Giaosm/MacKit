@@ -7,12 +7,12 @@
  * ⚠ 必须落在 `web/` 目录下：静态服务根就是 `web/`，放到别处会 404 →
  *   ESM 加载失败 → **整页白屏**。
  *
- * 提供的构建函数（对齐《MacKit-WebDAV-设计.md》§2 / §7）：
+ * 提供的构建函数：
  *   - buildWebdavSection(ctx)  → 「WebDAV 备份」区块（3 个按钮）DOM 节点
  *   - openRecordsModal(ctx)    → 弹窗 A：远程备份记录（加载态 / 统计行 / 恢复 / 删除）
  *   - openSettingsModal(ctx)   → 弹窗 B：WebDAV 设置（密码显示切换 / 保存 + 自动探测）
  *
- * 契约（§6.1，脱敏，永不回显密码）：
+ * 契约（脱敏，永不回显密码）：
  *   GET  /api/webdav/config   → { url, username, hasPassword, allowInsecureTLS, configured }
  *   PUT  /api/webdav/config   → { url, username, password?, allowInsecureTLS } → 脱敏对象
  *   GET  /api/webdav/backups  → { configured, count, items:[{ name, url, lastModified, size }] }
@@ -24,7 +24,7 @@
  */
 
 /**
- * 可读化字节数（与 views/backups.js 的 humanSize 语义一致）。
+ * 可读化字节数（本文件唯一实现；views/backups.js 已无同名副本）。
  * @param {number|null|undefined} bytes
  * @returns {string}
  */
@@ -92,7 +92,7 @@ async function runBackup(ctx, btn) {
  * 弹窗 A：WebDAV 备份记录。
  * @param {object} ctx
  */
-export function openRecordsModal(ctx) {
+function openRecordsModal(ctx) {
   const { el, ui, api } = ctx;
 
   const statEl = el('span', { class: 'muted' });
@@ -241,7 +241,7 @@ export function openRecordsModal(ctx) {
  * 弹窗 B：WebDAV 设置。
  * @param {object} ctx
  */
-export function openSettingsModal(ctx) {
+function openSettingsModal(ctx) {
   const { el, ui, api } = ctx;
 
   const bodyHost = el('div');
@@ -381,5 +381,3 @@ export function openSettingsModal(ctx) {
   });
   load();
 }
-
-export default { buildWebdavSection, openRecordsModal, openSettingsModal };

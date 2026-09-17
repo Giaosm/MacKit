@@ -1,18 +1,18 @@
 /**
  * MacKit · 前端外壳（无框架）
  *
- * 依据《MacKit-架构设计.md》§1.3 / §3.1 / §3.2 / §3.3 / §3.6 / §8.6：
  *   - 单页 + 哈希路由（#/dashboard|#/brew|#/sysinit|#/rime|#/unseal|#/backups）
- *   - 视图注册表：每个 web/views/*.js 默认导出 { id, title, icon, mount(root, ctx), unmount?() }
+ *   - 视图注册表：每个 web/views/*.js 默认导出 { id, title, mount(root, ctx), unmount?() }
+ *     （侧边栏图标由本文件 NAV 提供，视图不自带 icon）
  *   - 状态单一来源在后端：本文件只做订阅/渲染，不推断任务状态
- *   - API 客户端（统一 §3.2 错误对象）+ SSE 客户端（§3.6，按 seq 去重、Last-Event-ID 补齐）
- *   - 共享组件：toast / modal / confirmDialog / diff / dataTable / 状态灯 / 空态 / 进度 / 步骤条
+ *   - API 客户端（统一错误对象）+ SSE 客户端（按 seq 去重、Last-Event-ID 补齐）
+ *   - 共享组件：toast / modal / confirmDialog / diff / dataTable / 状态灯 / 空态 / 卡片 / kv
  *   - 零外部资源：图标全部内联 SVG，字体/配色走 style.css 的 CSS 变量
  *
  * ★ 视图扩展方式（加一行即可）：
  *   1) VIEW_MODULES 已预置 6 个 id → 动态 import()（缺失的视图会被安全跳过并提示"开发中"）；
  *      继续新增视图：在 VIEW_MODULES 与 NAV 各加一行即可。
- *   2) 视图通过 ctx 使用外壳能力，见文件末尾 window.__MacKitCtx 调试句柄与下方 ctx 构造。
+ *   2) 视图通过 ctx 使用外壳能力，契约见下方 makeCtx（只暴露视图实际需要的成员）。
  */
 
 import { fmtRel } from './reltime.js';
@@ -21,8 +21,6 @@ import { fmtRel } from './reltime.js';
 const DEFAULT_PORT = 18080;
 const HEALTH_POLL_MS = 15_000;
 const TOAST_MS = 4200;
-/** 侧边栏「任务历史」最多展示条数（与后端 store.HISTORY_KEEP 保持一致） */
-const HISTORY_KEEP = 10;
 
 /** 内联 SVG 图标（零外链）。 */
 const ICON = {
@@ -32,10 +30,9 @@ const ICON = {
   ime: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h1M11 9h1M15 9h2"/><path d="M7 13h10"/></svg>',
   lock: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>',
   backups: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
-  refresh: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>',
 };
 
-/** 侧边栏导航（外壳自身定义；视图可自带 title/icon 覆盖）。 */
+/** 侧边栏导航（外壳自身定义；视图可自带 title 覆盖）。 */
 const NAV = [
   { id: 'dashboard', title: '总览', icon: ICON.home },
   { id: 'brew', title: 'Homebrew 管家', icon: ICON.beer },
@@ -73,7 +70,7 @@ const dom = {
 
 // ============================== 全局状态（仅缓存，非事实源） ==============================
 const state = {
-  env: null, config: null, tasks: [], task: null,
+  env: null, config: null, task: null,
   running: false, currentTaskId: null, port: null, history: [],
   view: null, viewInstance: null,
 };
@@ -119,7 +116,7 @@ function el(tag, props = {}, children = []) {
 const fmtTime = (ms) => { try { return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false }); } catch { return ''; } };
 const fmtDateTime = (ms) => { try { return new Date(ms).toLocaleString('zh-CN', { hour12: false }); } catch { return ''; } };
 
-// ============================== API 客户端（§3.2） ==============================
+// ============================== API 客户端 ==============================
 /**
  * 统一请求：成功返回 data；失败抛 ErrObj { code, message, detail? }。
  * @param {'GET'|'POST'|'PUT'} method
@@ -188,17 +185,15 @@ function modal({ title, body, actions = [], danger = false, width }) {
   });
 }
 
-/** 二次确认弹窗基座（供 §7.1 十项危险操作使用）→ Promise<boolean>。 */
+/** 二次确认弹窗基座（供危险操作使用）→ Promise<boolean>。 */
 function confirmDialog({ title, body, confirmLabel = '确认', danger = true }) {
-  return new Promise((resolve) => {
-    modal({
-      title, body, danger,
-      actions: [
-        { label: '取消', kind: 'ghost', onClick: (c) => { c(false); } },
-        { label: confirmLabel, kind: danger ? 'danger' : 'primary', onClick: (c) => { c(true); } },
-      ],
-    }).then((v) => resolve(v === true));
-  });
+  return modal({
+    title, body, danger,
+    actions: [
+      { label: '取消', kind: 'ghost', onClick: (c) => { c(false); } },
+      { label: confirmLabel, kind: danger ? 'danger' : 'primary', onClick: (c) => { c(true); } },
+    ],
+  }).then((v) => v === true);
 }
 
 /** 逐行 diff 渲染（lines = [{type:'same'|'add'|'del', text}]）。 */
@@ -230,25 +225,6 @@ function emptyState({ icon = '·', title, text, actions = [] }) {
     box.append(row);
   }
   return box;
-}
-
-function progressBar(done, total, { fail = false, cancel = false } = {}) {
-  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-  const bar = el('div', { class: `progress__bar${fail ? ' is-fail' : cancel ? ' is-cancel' : ''}`, style: `width:${pct}%` });
-  return el('div', { class: 'progress' }, [bar]);
-}
-
-/** 步骤条：[{title,status,channel,channelPolicy}] → 一行 step 胶囊。 */
-function stepsBar(list) {
-  const wrap = el('div', { class: 'steps' });
-  for (const s of list || []) {
-    const mark = ({ ok: '✓', fail: '✗', skip: '⏭', cancelled: '⊘', running: '⏳', pending: '○' })[s.status] || '○';
-    const kids = [`${mark} ${s.title}`];
-    if (s.channel) kids.push(badge(s.channel === 'proxy' ? '代理' : '直连', s.channel));
-    else if (s.channelPolicy) kids.push(badge({ proxy_first: '代理优先', direct_first: '直连优先', auto: '自动' }[s.channelPolicy] || s.channelPolicy, 'muted'));
-    wrap.append(el('span', { class: `step is-${s.status}`, title: s.error ? s.error.message : '' }, [kids.join('  ')]));
-  }
-  return wrap;
 }
 
 const kv = (k, v) => el('div', { class: 'kv' }, [el('span', { class: 'kv__k', text: k }), el('span', { class: 'kv__v' }, [v && v.nodeType ? v : String(v == null ? '—' : v)])]);
@@ -310,12 +286,22 @@ function dataTable(cfg) {
 // ============================== 日志抽屉 ==============================
 const logSeen = new Set();
 let logOrder = [];
-// 与后端内存环形缓冲对齐（runner.js RING_MAX = 2000）：实时日志是逐条推送的，
-// 前端若不设上限，长任务（brew 升级/大词库安装）会把数组与 DOM 节点无限堆下去。
+// 前端自己的 DOM/数组上限（与后端 runner 的 RING_MAX 同为 2000，但两者是独立的上限：
+// 后端管内存缓冲，这里管浏览器侧 —— 实时日志逐条推送，不设上限会把数组与 DOM 节点堆爆）。
 const LOG_MAX = 2000;
+/**
+ * 空态占位。★ 只在 JS 里渲染一份：原先 index.html 写死了这个 <li id="logEmpty">，
+ * 而 clearLogs() 直接清空 innerHTML 把它一并删掉且不再补回 —— 清一次屏，空态文案就永久消失。
+ */
+function showLogEmpty() {
+  dom.logList.innerHTML = '';
+  dom.logList.append(el('li', { class: 'loglist__empty', text: '暂无日志 · 任务开始后日志会实时显示在这里' }));
+}
 function appendLogLine(line) {
   if (!line || logSeen.has(line.seq)) return;
   logSeen.add(line.seq); logOrder.push(line);
+  const ph = dom.logList.querySelector('.loglist__empty');
+  if (ph) ph.remove();
   const li = el('li', { class: `logline logline--${line.level}` }, [
     el('span', { class: 'logline__ts', text: fmtTime(line.ts) }),
     el('span', { class: 'logline__lvl', text: ({ info: 'ℹ', ok: '✓', warn: '⚠', error: '✗' })[line.level] || 'ℹ' }),
@@ -332,7 +318,7 @@ function appendLogLine(line) {
   if (dom.chkAutoScroll.checked) dom.logBody.scrollTop = dom.logBody.scrollHeight;
   emit('log', line);
 }
-function clearLogs() { logSeen.clear(); logOrder = []; dom.logList.innerHTML = ''; }
+function clearLogs() { logSeen.clear(); logOrder = []; showLogEmpty(); }
 function setLogTaskLabel(text) { dom.logTaskLabel.textContent = text; }
 function openLogDrawer() { dom.logDrawer.classList.remove('logdrawer--collapsed'); dom.btnLogToggle.setAttribute('aria-expanded', 'true'); }
 async function openLogFile() {
@@ -351,7 +337,7 @@ async function openLogFile() {
   });
 }
 
-// ============================== 任务订阅（SSE §3.6） ==============================
+// ============================== 任务订阅（SSE） ==============================
 /** SSE 自动重连次数上限：超过则改用一次性查询兜底（防止永久重连 + attach 的 Promise 悬空）。 */
 const SSE_MAX_RETRY = 5;
 /**
@@ -373,7 +359,6 @@ function attach(taskId, opts = {}) {
         if (msg.task) { state.task = msg.task; state.running = !isTerminal(msg.task.status); emit('task', msg.task); setLogTaskLabel(taskLabel(msg.task)); }
         for (const l of msg.backlog || []) appendLogLine(l);
       } else if (msg.type === 'log') appendLogLine(msg.line);
-      else if (msg.type === 'step') emit('step', msg.step, msg.taskId);
       else if (msg.type === 'task') {
         state.task = msg.task; state.running = !isTerminal(msg.task.status);
         emit('task', msg.task); setLogTaskLabel(taskLabel(msg.task));
@@ -388,11 +373,17 @@ function attach(taskId, opts = {}) {
     // 断流兜底：一次性拉取任务终态。SSE 会无限自动重连，若不设上限，
     // 任务已不存在（404）或服务重启时，旧连接会一直重试且 attach 的 Promise 永久悬空。
     let retries = 0;
+    // 连接成功（含自动重连成功）→ 复位重试计数。否则长任务（brew 升级 / 400MB 模型下载）
+    // 期间累计的几次偶发闪断就会把上限耗光，之后即使网络已恢复也不再跟随日志。
+    es.onopen = () => {
+      if (settled || retries === 0) return;
+      retries = 0;
+      pollHealth(); // 顺带把顶栏从「日志流中断…」恢复成真实服务状态
+    };
     const fallback = async () => {
       let t = null;
       // api() 已把响应解包到 data，而 /api/tasks/:id 返回的**就是任务对象本身**
-      // （不是 { task }）。若在这里再取一次 .task 会恒为 undefined，t 恒为 null →
-      // state.running 永远停在 true，表现为「有任务正在运行」后再也发不出任何任务。
+      // （不是 { task }）。若在这里再取一次 .task 会恒为 undefined，t 恒为 null。
       try { const r = await api('GET', `/api/tasks/${encodeURIComponent(taskId)}`); t = r && typeof r === 'object' && r.id ? r : null; }
       catch { setService('err', '日志流已断开'); }
       if (t) {
@@ -402,6 +393,12 @@ function attach(taskId, opts = {}) {
           state.currentTaskId = null; emit('done', t); refreshHistory();
           if (opts.onDone) { try { opts.onDone(t); } catch (e) { console.error(e); } }
         } else setService('warn', '日志流已断开，任务仍在后台运行');
+      } else {
+        // ★ 连兜底查询也失败：必须复位运行态。否则 state.running 永久停在 true，
+        //   之后每次 runTask 都会被首行的「有任务正在运行」挡掉，用户只能刷新页面。
+        //   （后端 runner 本身有串行队列，前端放行不会造成并发执行。）
+        state.running = false;
+        state.currentTaskId = null;
       }
       finish(t);
     };
@@ -416,7 +413,7 @@ function attach(taskId, opts = {}) {
   });
 }
 
-/** 发起任务：POST → attach。confirm=true 满足 §3.13 危险操作校验。 */
+/** 发起任务：POST → attach。confirm=true 满足后端的危险操作校验。 */
 async function runTask(module, action, params = {}, opts = {}) {
   if (state.running) { toast('warn', '有任务正在运行，请等待结束或取消后再试'); return null; }
   const body = { module, action, params };
@@ -438,12 +435,13 @@ const taskLabel = (t) => t ? `${t.title} · ${{ pending: '排队中', running: '
 // ============================== 历史 ==============================
 async function refreshHistory() {
   try { state.history = await api('GET', '/api/history'); } catch { state.history = []; }
-  renderHistory(); emit('history', state.history);
+  renderHistory();
 }
 function renderHistory() {
   dom.historyList.innerHTML = '';
   if (!state.history.length) { dom.historyList.append(el('li', { class: 'history__empty', text: '📋 暂无任务记录' })); startRelTimer(); return; }
-  for (const h of state.history.slice(0, HISTORY_KEEP)) {
+  // 条数上限由后端 store.HISTORY_KEEP 在写盘时裁剪（/api/history 返回的已是最多 10 条），前端不重复设限
+  for (const h of state.history) {
     const dot = h.status === 'ok' ? 'dot-ok' : h.status === 'fail' ? 'dot-err' : 'muted';
     dom.historyList.append(el('li', {}, [el('button', {
       class: 'history__item', type: 'button',
@@ -574,19 +572,15 @@ async function route() {
   state.viewInstance = { unmount: teardown };
 }
 
-// ============================== ctx（视图上下文，§8.6） ==============================
+// ============================== ctx（视图上下文） ==============================
 function makeCtx(subs) {
   return {
     api, el, state, navigate: (h) => { location.hash = h; },
     runTask,
-    attach,
     on: (ev, fn) => { const u = on(ev, fn); subs.push(u); return u; },
     refreshEnv: refreshEnv,
-    refreshHistory,
-    isTerminal,
-    taskLabel,
     fmtTime, fmtDateTime, fmtRel,
-    ui: { el, toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, progress: progressBar, steps: stepsBar, kv, card, fmtTime, fmtDateTime, fmtRel },
+    ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, kv, card },
   };
 }
 async function refreshEnv(force) {
@@ -599,8 +593,8 @@ async function refreshEnv(force) {
 // ============================== 启动 ==============================
 async function recoverTasks() {
   try {
-    state.tasks = await api('GET', '/api/tasks');
-    const running = state.tasks.find((t) => t.status === 'running' || t.status === 'pending');
+    const tasks = await api('GET', '/api/tasks');
+    const running = tasks.find((t) => t.status === 'running' || t.status === 'pending');
     if (running) {
       state.task = running; setLogTaskLabel(taskLabel(running)); openLogDrawer();
       appendLogLine({ seq: 0, ts: Date.now(), level: 'info', text: `检测到正在运行的任务「${running.title}」，已重新订阅日志…` });
@@ -615,6 +609,7 @@ function boot() {
     const collapsed = dom.logDrawer.classList.toggle('logdrawer--collapsed');
     dom.btnLogToggle.setAttribute('aria-expanded', String(!collapsed));
   });
+  clearLogs(); // 首屏空态由 JS 生成（index.html 里不再存一份文案，见 showLogEmpty）
   dom.btnLogClear.addEventListener('click', clearLogs);
   dom.btnLogCopy.addEventListener('click', async () => {
     const text = logOrder.map((l) => `${fmtTime(l.ts)} [${l.level}] ${l.text}`).join('\n');
@@ -644,9 +639,6 @@ function boot() {
   route();
   recoverTasks();
 }
-
-// 调试句柄：便于 T05 视图开发时在控制台检查外壳能力
-window.__MacKit = { api, el, state, on, emit, runTask, attach, refreshEnv, refreshHistory, fmtRel, refreshRelTimes, ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, progress: progressBar, steps: stepsBar, kv, card, fmtRel, refreshRelTimes } };
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();

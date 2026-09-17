@@ -1,6 +1,6 @@
 /* ==========================================================================
    MacKit · 设计系统（CSS 变量 + 深浅色跟随系统）
-   依据《MacKit-架构设计.md》§8.7：语义命名，:root 浅色 + prefers-color-scheme 深色覆盖。
+   语义命名：:root 浅色 + prefers-color-scheme 深色覆盖。
    零外部资源：不使用任何外链字体 / 图标。
    ========================================================================== */
 
@@ -284,24 +284,6 @@ label.check { display: inline-flex; align-items: center; gap: var(--space-2); cu
 .table tr:hover td { background: var(--bg-sunken); }
 .table__scroll { overflow-x: auto; }
 
-/* ------------------------------ 进度条 ------------------------------ */
-.progress { height: 10px; background: var(--bg-sunken); border-radius: 999px; overflow: hidden; }
-.progress__bar { height: 100%; width: 0; background: var(--accent); transition: width .3s ease; }
-.progress__bar.is-fail { background: var(--err); }
-.progress__bar.is-cancel { background: var(--fg-muted); }
-
-.steps { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-bottom: var(--space-3); }
-.step {
-  display: inline-flex; align-items: center; gap: var(--space-2);
-  padding: var(--space-1) var(--space-3);
-  border: 1px solid var(--border); border-radius: 999px; font-size: 12px;
-  background: var(--bg-elev); color: var(--fg-muted);
-}
-.step.is-running { border-color: var(--info); color: var(--info); }
-.step.is-ok { border-color: var(--ok); color: var(--ok); }
-.step.is-fail { border-color: var(--err); color: var(--err); }
-.step.is-skip, .step.is-cancelled { opacity: .7; }
-
 /* ------------------------------ 空态 ------------------------------ */
 .empty {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -391,6 +373,7 @@ label.check { display: inline-flex; align-items: center; gap: var(--space-2); cu
 .toast--ok { border-left-color: var(--ok); }
 .toast--warn { border-left-color: var(--warn); }
 .toast--err { border-left-color: var(--err); }
+.toast--info { border-left-color: var(--info); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 /* ------------------------------ 服务已关闭遮罩 ------------------------------ */

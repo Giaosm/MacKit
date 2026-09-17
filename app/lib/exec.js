@@ -1,9 +1,8 @@
 /**
  * MacKit · 执行层（唯一子进程出口）
  *
- * 依据《MacKit-架构设计.md》§3.8 与 §8.8：
  *   - 一律 spawn(bin, argsArray, { shell:false })：绝不启用 shell 选项、绝不拼接命令行字符串
- *   - 命令白名单：brew / git / xattr / security / osascript / curl / open（+ 绝对路径的 Squirrel）
+ *   - 命令白名单：brew / git / xattr / security / osascript / curl（+ 绝对路径的 Squirrel）
  *   - 环境变量注入：代理（channel）与 Homebrew 镜像源；PATH 完全固定（不继承宿主）
  *   - 流式 stdout/stderr 逐行回调、超时、AbortSignal 取消（SIGTERM→3s→SIGKILL）
  *   - osascript 管理员授权封装（退出码 -128 = 用户取消）
@@ -16,7 +15,7 @@ import * as paths from './paths.js';
 import * as store from './store.js';
 
 // ---------------------------------------------------------------------------
-// 错误对象（§3.2）
+// 错误对象
 // ---------------------------------------------------------------------------
 
 export const ERR = Object.freeze({
@@ -50,7 +49,7 @@ export class AppError extends Error {
     if (detail !== undefined) this.detail = detail;
   }
 
-  /** 序列化为 §3.2 的 ErrObj */
+  /** 序列化为对外统一的 ErrObj */
   toObj() {
     const obj = { code: this.code, message: this.message };
     if (this.detail) obj.detail = this.detail;
@@ -81,19 +80,18 @@ export function toErrObj(err) {
 // 常量
 // ---------------------------------------------------------------------------
 
-/** 命令白名单（逻辑名） */
-export const WHITELIST = Object.freeze([
-  'brew', 'git', 'xattr', 'security', 'osascript', 'curl', 'open',
-]);
-
 /** 默认单步超时：600s */
 export const DEFAULT_TIMEOUT_MS = 600_000;
 /** 取消时 SIGTERM → SIGKILL 的等待窗口：3s */
-export const KILL_GRACE_MS = 3_000;
+const KILL_GRACE_MS = 3_000;
 /** 累积输出上限，避免异常命令撑爆内存 */
 const MAX_CAPTURE = 4_000_000;
 
-/** 逻辑名 → 固定路径 */
+/**
+ * 命令白名单：逻辑名 → 固定路径。
+ * ★ 白名单即本表的键集（2026-09-18 合并）：原先另有一份平行的 `WHITELIST` 数组需与
+ *   本表手工同步，漏改一处就会出现「名字合法但查不到路径」的空档。
+ */
 const BIN_MAP = Object.freeze({
   brew: paths.BREW_BIN,
   git: paths.GIT_BIN,
@@ -101,14 +99,13 @@ const BIN_MAP = Object.freeze({
   security: paths.SECURITY_BIN,
   osascript: paths.OSASCRIPT_BIN,
   curl: paths.CURL_BIN,
-  open: paths.OPEN_BIN,
 });
 
 /**
  * 允许直接以绝对路径调用的可执行。
- *   - §8.8 的 Squirrel（--reload）
+ *   - Squirrel（--reload）
  *   - plum 的 rime-install 脚本（rime 模块联网安装词库/方案/语法模型所需）：
- *     原脚本以 `bash rime-install ...` 调用；本应用不复刻 bash（不在白名单），
+ *     原本以 `bash rime-install ...` 调用；本应用不使用 bash（不在白名单），
  *     改为直接执行该脚本（自身带 `#!/usr/bin/env bash` shebang，已实测可执行）。
  *   - /bin/bash：仅用于执行 Homebrew 官方安装脚本 install.sh（必须由 bash 解释，
  *     脚本自身会在 macOS 上校验管理员权限并按官方流程安装）；调用方为 brew.install_homebrew。
@@ -158,9 +155,6 @@ export function killAllNow(signal = 'SIGKILL') {
   return n;
 }
 
-/** 当前存活子进程数（仅用于测试与诊断，不参与业务逻辑）。 */
-export function liveChildCount() { return LIVE_CHILDREN.size; }
-
 // ---------------------------------------------------------------------------
 // 解析与校验
 // ---------------------------------------------------------------------------
@@ -170,7 +164,7 @@ export function liveChildCount() { return LIVE_CHILDREN.size; }
  * @param {string} name 逻辑名（brew/git/...）或允许的绝对路径
  * @returns {string} 实际可执行文件路径
  */
-export function resolveBin(name) {
+function resolveBin(name) {
   if (typeof name !== 'string' || name.length === 0) {
     throw new AppError(ERR.CMD_NOT_ALLOWED, '命令为空');
   }
@@ -179,12 +173,11 @@ export function resolveBin(name) {
     if (ABSOLUTE_ALLOWED.includes(name)) return name;
     throw new AppError(ERR.CMD_NOT_ALLOWED, `不允许的命令路径：${name}`);
   }
-  if (!WHITELIST.includes(name)) {
+  const fixed = BIN_MAP[name];
+  if (!fixed) {
     throw new AppError(ERR.CMD_NOT_ALLOWED, `命令不在白名单：${name}`);
   }
-  const fixed = BIN_MAP[name];
-  if (fixed) return fixed;
-  return name;
+  return fixed;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +198,7 @@ function safeConfig() {
 }
 
 /**
- * 注入代理环境变量（严格复刻 `brewgo.sh:54-61` 的小写三键语义）。
+ * 注入代理环境变量（只写小写三键 http_proxy / https_proxy / all_proxy）。
  * @param {Record<string,string|undefined>} env
  * @param {'direct'|'proxy'} channel
  * @param {{httpPort:number,socksPort:number}} cfg
@@ -226,7 +219,7 @@ function applyProxyEnv(env, channel, cfg) {
 }
 
 /**
- * 注入 Homebrew 镜像源环境变量（复刻 `apply_mirror`）。
+ * 注入 Homebrew 镜像源环境变量（BREW_GIT_REMOTE / API_DOMAIN / BOTTLE_DOMAIN）。
  * `MIRROR === 'official'` 时删除三键。
  * @param {Record<string,string|undefined>} env
  * @param {string} mirror
@@ -257,7 +250,7 @@ function applyMirrorEnv(env, mirror) {
  * @param {{env?:Record<string,string>, channel?:('direct'|'proxy'), mirror?:string, noMirror?:boolean}} opts
  * @returns {Record<string,string>}
  */
-export function buildEnv(opts) {
+function buildEnv(opts) {
   /** @type {Record<string,string>} */
   const env = {};
   for (const [k, v] of Object.entries(process.env)) {
@@ -279,14 +272,15 @@ export function buildEnv(opts) {
 
   const cfg = safeConfig();
 
-  // 镜像源：默认注入（与原脚本启动时 apply_mirror 一致）
+  // 镜像源：默认注入
   if (!opts.noMirror) {
     applyMirrorEnv(env, opts.mirror || cfg.mirror);
   }
-  // 代理通道
-  if (opts.channel === 'proxy' || opts.channel === 'direct') {
-    applyProxyEnv(env, opts.channel, cfg);
-  }
+  // 代理通道：缺省按「直连」处理 —— 显式删除宿主可能存在的代理变量。
+  // 不能因为调用方没传 channel 就把宿主的 http_proxy 悄悄带进子进程：那样
+  // 「直连 / 代理」两种语义就只对显式传 channel 的调用成立（历史上卸载 / cleanup /
+  // git 读取等未传 channel 的路径确实会继承宿主代理）。
+  applyProxyEnv(env, opts.channel === 'proxy' ? 'proxy' : 'direct', cfg);
   // 显式追加的环境变量优先级最高
   if (opts.env) {
     for (const [k, v] of Object.entries(opts.env)) {
@@ -467,8 +461,37 @@ export function run(bin, args, opts = {}) {
   });
 }
 
+/**
+ * 执行并吞掉异常，返回统一的「子进程退出码」结构。
+ *
+ * 供「只读探测 / 尽力而为」场景使用（原先 env.runQuiet、sysinit.safeGit、
+ * backup.runGit 各写了一份逐字相同的 try/catch，2026-09-18 收敛到这里）。
+ *
+ * ★ 失败一律回落数字 `-1`，绝不把 AppError 的字符串语义码（如 CMD_NOT_ALLOWED）
+ *   塞进 `code`：下游全部按「子进程退出码」用它（`res.code !== 0`），
+ *   混入字符串会让类型失去意义。原始错误码另见 `errCode`。
+ *
+ * @param {string} bin
+ * @param {string[]} args
+ * @param {import('./exec.js').RunOpts} [opts]
+ * @returns {Promise<{code:number, signal:null, stdout:string, stderr:string, errCode:string|null}>}
+ */
+export async function runSafe(bin, args, opts = {}) {
+  try {
+    return await run(bin, args, opts);
+  } catch (err) {
+    return {
+      code: -1,
+      signal: null,
+      stdout: '',
+      stderr: (err && err.message) || String(err),
+      errCode: (err && err.code) || null,
+    };
+  }
+}
+
 // ---------------------------------------------------------------------------
-// 通道尝试（复刻 run_with_mode）
+// 通道尝试
 // ---------------------------------------------------------------------------
 
 /**
@@ -547,7 +570,7 @@ export function posixQuote(s) {
  * @param {string} s
  * @returns {string}
  */
-export function escapeAppleScript(s) {
+function escapeAppleScript(s) {
   return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
@@ -575,22 +598,3 @@ export async function osascriptAdmin(shellCmd, opts = {}) {
     cancelled: res.code === -128,
   };
 }
-
-export default {
-  ERR,
-  AppError,
-  toErrObj,
-  WHITELIST,
-  MIRROR_REMOTES,
-  DEFAULT_TIMEOUT_MS,
-  KILL_GRACE_MS,
-  resolveBin,
-  buildEnv,
-  run,
-  killAllNow,
-  liveChildCount,
-  runWithChannel,
-  osascriptAdmin,
-  posixQuote,
-  escapeAppleScript,
-};

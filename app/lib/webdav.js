@@ -1,11 +1,11 @@
 /**
  * MacKit · 零依赖 WebDAV 客户端
  *
- * 依据《MacKit-WebDAV-设计.md》§3：用 `node:http` / `node:https` 手写 WebDAV 客户端，
+ * 用 `node:http` / `node:https` 手写 WebDAV 客户端，
  * 覆盖 PROPFIND（列目录）/ PUT（上传）/ GET（下载）/ MKCOL（建目录）/ DELETE（删除），
- * 外加一组可精确单测的**纯函数**（URL 归一化 / XML 解析 / 命名 / 日期）。
+ * 内部辅以一组**纯函数**负责 URL 归一化 / XML 解析 / 文件名与日期处理。
  *
- * 红线（静态测试把关）：
+ * 红线（本模块自行守住，调用方无需关心）：
  *   - 本模块是**纯网络模块**：只 import `node:http` / `node:https` 与 `./exec.js`（取错误载体）。
  *     绝不引入子进程相关模块、绝不 spawn、绝不出现 shell 相关字段。
  *   - 绝不打印任何内容（无 `console.*`）——请求头可能带 Basic 凭据。
@@ -44,7 +44,7 @@ export const DAV_ERR = Object.freeze({
 // 常量
 // ---------------------------------------------------------------------------
 /** MacKit 在 WebDAV 根下的固定子集合名。 */
-export const REMOTE_FOLDER = 'MacKit';
+const REMOTE_FOLDER = 'MacKit';
 
 /** 备份文件名精确正则（删除 / 恢复前必经守卫）。 */
 const BACKUP_NAME_RE = /^mackit-backup-\d{8}-\d{6}\.json$/;
@@ -73,7 +73,7 @@ const MAX_BODY = 8_000_000;
  * @param {string} [password]
  * @returns {string|null} 无凭据返回 null（匿名：不发 Authorization）
  */
-export function buildBasicAuth(username, password) {
+function buildBasicAuth(username, password) {
   const u = username == null ? '' : String(username);
   const p = password == null ? '' : String(password);
   if (!u && !p) return null;
@@ -110,7 +110,7 @@ export function isAllowedBackupName(name) {
  * @param {unknown} name
  * @returns {{ts:number}|null} 非法名 → null
  */
-export function parseBackupName(name) {
+function parseBackupName(name) {
   if (!isAllowedBackupName(name)) return null;
   const m = /^mackit-backup-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.json$/.exec(name);
   if (!m) return null;
@@ -124,7 +124,7 @@ export function parseBackupName(name) {
  * @param {string} u
  * @returns {string}
  */
-export function ensureTrailingSlash(u) {
+function ensureTrailingSlash(u) {
   const s = String(u == null ? '' : u);
   return s.endsWith('/') ? s : s + '/';
 }
@@ -141,7 +141,7 @@ export function ensureTrailingSlash(u) {
  * @returns {URL} 解析成功的绝对 URL
  * @throws {AppError} code = WEBDAV_CONFIG
  */
-export function parseDavUrl(raw, label = 'WebDAV 地址') {
+function parseDavUrl(raw, label = 'WebDAV 地址') {
   const s = String(raw == null ? '' : raw).trim();
   if (!s) throw new AppError(DAV_ERR.CONFIG, `请先填写${label}`);
   let u;
@@ -162,7 +162,7 @@ export function parseDavUrl(raw, label = 'WebDAV 地址') {
  * @param {string} name
  * @returns {string}
  */
-export function joinUrl(base, name) {
+function joinUrl(base, name) {
   return ensureTrailingSlash(base) + encodeURIComponent(name);
 }
 
@@ -172,7 +172,7 @@ export function joinUrl(base, name) {
  * @param {string} baseUrl
  * @returns {string|null}
  */
-export function resolveHref(href, baseUrl) {
+function resolveHref(href, baseUrl) {
   const raw = String(href || '').trim();
   if (raw === '') return null;
   try {
@@ -188,7 +188,7 @@ export function resolveHref(href, baseUrl) {
  * @param {string} s
  * @returns {number|null} 毫秒时间戳 / null
  */
-export function parseDavHttpDate(s) {
+function parseDavHttpDate(s) {
   const t = new Date(String(s == null ? '' : s)).getTime();
   return Number.isFinite(t) ? t : null;
 }
@@ -265,9 +265,9 @@ function isCollection(block) {
  *
  * @param {string} xml
  * @param {string} baseUrl 请求目录的绝对 URL
- * @returns {Array<{name:string,url:string,lastModified:number|null,size:number|null,isDir:boolean}>}
+ * @returns {Array<{name:string,url:string,lastModified:number|null,size:number|null}>}
  */
-export function parsePropfind(xml, baseUrl) {
+function parsePropfind(xml, baseUrl) {
   const body = preprocess(xml);
   const base = String(baseUrl == null ? '' : baseUrl);
   const basePath = safePathname(base);
@@ -309,7 +309,7 @@ export function parsePropfind(xml, baseUrl) {
       lastModified = parsed ? parsed.ts : null;
     }
 
-    out.push({ name, url, lastModified, size, isDir: false });
+    out.push({ name, url, lastModified, size });
   }
 
   out.sort((a, b) => (b.lastModified || 0) - (a.lastModified || 0));
@@ -364,11 +364,10 @@ function classifyError(err) {
 /**
  * 把 HTTP 非成功状态映射为带语义错误码的 AppError。
  * @param {number} status
- * @param {string} action
  * @param {{body?:Buffer}} res
  * @returns {import('./exec.js').AppError}
  */
-function httpError(status, action, res) {
+function httpError(status, res) {
   const detail = res && res.body ? res.body.toString('utf8').slice(0, 300).trim() : '';
   switch (status) {
     case 401: return new AppError(DAV_ERR.AUTH, '认证失败：用户名或密码不正确', detail);
@@ -382,9 +381,9 @@ function httpError(status, action, res) {
 }
 
 /** 断言响应状态命中期望集合，否则抛对应错误码。 */
-function assertOk(res, okCodes, action) {
+function assertOk(res, okCodes) {
   if (okCodes.includes(res.status)) return;
-  throw httpError(res.status, action, res);
+  throw httpError(res.status, res);
 }
 
 /**
@@ -396,7 +395,7 @@ function assertOk(res, okCodes, action) {
  *          username?:string, password?:string, allowInsecureTLS?:boolean}} [opts]
  * @returns {Promise<{status:number, headers:object, body:Buffer}>}
  */
-export function request(url, opts = {}) {
+function request(url, opts = {}) {
   return new Promise((resolve, reject) => {
     let u;
     try {
@@ -532,7 +531,7 @@ export async function testConnection(cfg, opts = {}) {
     timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT,
     ...cfgAuth(cfg, opts),
   });
-  assertOk(res, [200, 207], 'PROPFIND');
+  assertOk(res, [200, 207]);
   return { ok: true };
 }
 
@@ -555,7 +554,7 @@ export async function listBackups(cfg, opts = {}) {
     timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT,
     ...cfgAuth(cfg, opts),
   });
-  assertOk(res, [200, 207], 'PROPFIND');
+  assertOk(res, [200, 207]);
   const items = parsePropfind(res.body.toString('utf8'), dirUrl);
   return { count: items.length, items };
 }
@@ -594,7 +593,7 @@ export async function ensureCollection(cfg, dirUrl, opts = {}) {
       cur = segUrl;
       continue;
     }
-    throw httpError(res.status, 'MKCOL', res);
+    throw httpError(res.status, res);
   }
 }
 
@@ -623,7 +622,7 @@ export async function uploadBackup(cfg, name, text, opts = {}) {
     await ensureCollection(cfg, dirUrl, opts);
     res = await request(fileUrl, { method: 'PUT', headers, body, timeoutMs, ...cfgAuth(cfg, opts) });
   }
-  assertOk(res, [200, 201, 204], 'PUT');
+  assertOk(res, [200, 201, 204]);
   return { url: fileUrl };
 }
 
@@ -642,7 +641,7 @@ export async function downloadBackup(cfg, name, opts = {}) {
     timeoutMs: opts.timeoutMs ?? TRANSFER_TIMEOUT,
     ...cfgAuth(cfg, opts),
   });
-  assertOk(res, [200], 'GET');
+  assertOk(res, [200]);
   return res.body.toString('utf8');
 }
 
@@ -662,27 +661,5 @@ export async function deleteBackup(cfg, name, opts = {}) {
     ...cfgAuth(cfg, opts),
   });
   if (res.status === 404) return; // 已不存在 = 达成目标
-  assertOk(res, [200, 204], 'DELETE');
+  assertOk(res, [200, 204]);
 }
-
-export default {
-  DAV_ERR,
-  REMOTE_FOLDER,
-  request,
-  buildBasicAuth,
-  buildBackupName,
-  isAllowedBackupName,
-  parseBackupName,
-  ensureTrailingSlash,
-  joinUrl,
-  resolveHref,
-  parseDavHttpDate,
-  parsePropfind,
-  remoteDirUrl,
-  testConnection,
-  listBackups,
-  ensureCollection,
-  uploadBackup,
-  downloadBackup,
-  deleteBackup,
-};

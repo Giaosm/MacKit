@@ -1,9 +1,8 @@
 /**
  * MacKit · HTTP 请求行 URL 解析（纯函数，零依赖、无副作用）
  *
- * 为什么单独成模块：`server.js` 顶层会调用 `main()` 启动服务，无法被单测直接
- * `import`（会真起进程）。把这段解析逻辑抽出来，才能对畸形请求行做精确、稳定的单测；
- * `server.js` 是它唯一的调用方。
+ * 为什么单独成模块：畸形请求行的边界处理（见下方「背景」）容易写漏，且这段逻辑完全无副作用；
+ * 抽出来之后 `server.js` 只负责路由与生命周期，解析策略集中在一处。`server.js` 是唯一调用方。
  *
  * 背景（2026-09-16 bug）：`new URL('//', base)` / `new URL('///', base)` 会把开头的
  * `//` 当成 **protocol-relative 的权威段**（`//foo` → host 变成 `foo`）而抛 `Invalid URL`。
@@ -31,5 +30,3 @@ export function parseReqUrl(raw, base) {
   s = s.replace(/^\/+/, '/');
   return new URL(s, base);
 }
-
-export default { parseReqUrl };

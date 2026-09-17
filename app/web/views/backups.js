@@ -15,20 +15,17 @@
  *           · Rime 全部 *.custom.yaml + 已装 .gram 清单。
  * 词库 / 万象模型等大文件不打包，恢复后按需重新下载。
  *
- * 契约（对齐 web/app.js 顶部说明）：默认导出 { id, title, icon, mount(root, ctx) }。
- * 零外部资源：图标全部内联 SVG（stroke="currentColor"）。
+ * 契约（对齐 web/app.js 顶部说明）：默认导出 { id, title, mount(root, ctx) }。
+ * 侧边栏图标由 app.js 的 NAV 统一提供，视图不再自带。
  */
 
 // WebDAV 备份区块 + 弹窗：非路由子模块（必须落在 web/ 下，由本文件相对引入；
 // 切勿把它加进 app.js 的 VIEW_MODULES，否则会多出一个空白路由页）。
 import { buildWebdavSection } from './backups-webdav.js';
 
-const ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>';
-
 export default {
   id: 'backups',
   title: '备份中心',
-  icon: ICON,
 
   mount(root, ctx) {
     const { el } = ctx;

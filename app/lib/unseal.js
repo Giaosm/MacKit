@@ -1,13 +1,12 @@
 /**
- * MacKit · M5 应用解隔离（后端模块）
+ * MacKit · 应用解隔离（后端模块）
  *
- * 依据《MacKit-架构设计.md》§3.7 / §3.12 与《MacKit-PRD.md》§3 M5 表，
  * 语义移植自原 `shell/unseal.sh`（参考脚本已于 2026-09-16 从仓库移除，本文件为该功能的唯一事实源）。
  *
  * 关键约束：
  *   - 路径规范化：剥离首尾引号（拖拽常见）、去掉 `~`、去空白；空/不存在给出明确错误。
  *   - 执行：先普通权限 `xattr -dr com.apple.quarantine <path>`；
- *     仅当普通执行非 0 时才降级为图形授权 `osascriptAdmin`（复刻 unseal.sh:35-45）。
+ *     仅当普通执行非 0 时才降级为图形授权 `osascriptAdmin`。
  *     （实测：无隔离属性时 `xattr -dr` 返回 0，故不会误弹授权框。）
  *   - 取消：授权框返回 -128 → 抛 AUTH_CANCELLED → runner 记为 skip（**不算失败**，不阻断其余项）。
  *   - 文件夹递归发现 `.app`（≤5 层），用于把「拖入的文件夹」展开为可逐项解隔离的目标。
@@ -37,11 +36,11 @@ const ADMIN_TIMEOUT = 180_000;
 
 /**
  * 规范化一个输入路径：剥离首尾引号 / 去空白 / 展开 `~`。
- * 复刻 unseal.sh:13-17（`${APP_PATH%\"}` 等四步）的语义。
+ * 依次：去空白 → 剥离首尾引号 → 再去空白 → 展开 `~`。
  * @param {string|{path?:string}} raw
  * @returns {string}
  */
-export function cleanPath(raw) {
+function cleanPath(raw) {
   let s = raw;
   if (s && typeof s === 'object') s = s.path;
   s = String(s == null ? '' : s);
@@ -57,7 +56,7 @@ export function cleanPath(raw) {
  * @param {number} [maxDepth]
  * @returns {string[]}
  */
-export function discoverApps(dir, maxDepth = MAX_DEPTH) {
+function discoverApps(dir, maxDepth = MAX_DEPTH) {
   const out = [];
   const walk = (d, depth) => {
     if (depth > maxDepth) return;
@@ -116,7 +115,7 @@ function guessNeedsAdmin(p) {
 }
 
 /**
- * 预检单个输入 → PrecheckItem（§3.12）。
+ * 预检单个输入 → PrecheckItem。
  * @param {string} raw
  * @returns {Promise<object>}
  */
@@ -179,11 +178,11 @@ const actions = {
           }
           ctx.log('info', `正在处理: ${t.path}`);
 
-          // ① 普通权限（-dr 递归删除；复刻 unseal.sh:35）
+          // ① 普通权限（-dr 递归删除）
           const r1 = await ctx.exec.run('xattr', ['-dr', QUARANTINE, t.path], { noMirror: true, timeoutMs: XATTR_TIMEOUT });
           if (r1.code === 0) { ctx.log('ok', '已成功移除隔离属性'); return; }
 
-          // ② 降级为图形授权（复刻 unseal.sh:38-44）
+          // ② 降级为图形授权
           ctx.log('warn', '普通权限不足，需要管理员授权...');
           const cmd = `xattr -dr ${QUARANTINE} ${ctx.exec.posixQuote(t.path)}`;
           const r2 = await ctx.exec.osascriptAdmin(cmd, { timeoutMs: ADMIN_TIMEOUT });
@@ -204,6 +203,8 @@ const actions = {
         return;
       }
       // 全失败才判 fail；部分成功视为 ok（对齐批量不中断语义）
+      // 注：与 brew.finalizeBatch 的条件**刻意不同** —— 那里额外要求 skip===0（按「未跳过项是否全失败」判），
+      // 而解隔离场景「有失败且无成功」就应该判 fail，不该因为还有被跳过项而显示为 ok。
       if (fail > 0 && ok === 0) {
         task.status = 'fail';
       } else {

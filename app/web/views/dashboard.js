@@ -1,10 +1,9 @@
 /**
- * MacKit · M1 总览（Dashboard）
+ * MacKit · 总览（Dashboard）
  *
- * 依据《MacKit-架构设计.md》§8.6 视图契约 + 《MacKit-PRD.md》§6.2 / §3 M1 表：
- *   - 环境体检卡网格（与 M2 环境卡同源：GET /api/env）
- *   - 状态灯三色；"代理别名与期望格式不一致"必须为 🟡 + 说明（US-5 环境坑点）
- *   - 空态：可更新为 0 → 「🎉 所有 Homebrew 软件包均为最新」；tapEmpty → 专门解释文案（US-7）
+ *   - 环境体检卡网格（与 Homebrew 页的环境卡同源：GET /api/env）
+ *   - 状态灯三色；"代理别名与期望格式不一致"必须为 🟡 + 说明
+ *   - 空态：可更新为 0 → 「🎉 所有 Homebrew 软件包均为最新」；tapEmpty → 专门解释文案
  *
  * 本视图只读；一切任务状态以后端为准。
  */
@@ -12,13 +11,12 @@
 export default {
   id: 'dashboard',
   title: '总览',
-  icon: '', // 由 app.js 的 NAV 提供
 
   mount(root, ctx) {
     const { el, ui } = ctx;
     const grid = el('div', { class: 'grid grid--2 section' });
     // 「上次体检」时间戳：每次成功刷新后更新，让用户能确认体检真的跑过一次
-    const envCheckedAt = el('span', { class: 'view-head__meta', id: 'envCheckedAt' });
+    const envCheckedAt = el('span', { class: 'view-head__meta' });
 
     const head = el('div', { class: 'view-head' }, [
       el('div', {}, [el('h1', { text: '总览' }), el('div', { class: 'muted', text: '环境体检' })]),
@@ -40,7 +38,7 @@ export default {
     function render(e) {
       grid.innerHTML = '';
       const b = e.brew || {}, n = e.network || {}, sh = e.shell || {}, rm = e.rime || {}, g = e.git || {}, m = e.mirror || {}, pp = e.proxyPorts || {};
-      document.getElementById('envCheckedAt').textContent = e.checkedAt ? `上次检查 ${ctx.fmtTime(e.checkedAt)}` : '';
+      envCheckedAt.textContent = e.checkedAt ? `上次检查 ${ctx.fmtTime(e.checkedAt)}` : '';
 
       // Homebrew
       const outdated = (b.outdatedFormula || 0) + (b.outdatedCask || 0);
@@ -113,8 +111,7 @@ export default {
       }
     }
 
-    const unsub = ctx.on('env', (e) => render(e));
-    root._unsub = unsub;
+    ctx.on('env', (e) => render(e)); // 订阅由 app.js 在视图卸载时统一回收
     load(false);
   },
 

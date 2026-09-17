@@ -1,7 +1,6 @@
 /**
- * MacKit · M2 Homebrew 管家（后端模块）
+ * MacKit · Homebrew 管家（后端模块）
  *
- * 依据《MacKit-架构设计.md》§3.7 / §3.12 与《MacKit-PRD.md》§3 M2 表，
  * 语义移植自原 `shell/brewgo.sh`（参考脚本已于 2026-09-16 从仓库移除，本文件为该功能的唯一事实源）。
  *
  * 契约：
@@ -9,9 +8,15 @@
  *   - actions[action] = { title, destructive?, steps(params, ctx), finalize? }
  *   - queries[name]   = (params) => Promise<data>   （只读；本文件直接用 lib/exec.js，不经 task signal）
  *
- * brew 7 容错：`brew tap` 空输出属正常（US-7）；所有 JSON 解析 try/catch 降级为空数组。
+ * brew 7 容错：`brew tap` 空输出属正常；所有 JSON 解析 try/catch 降级为空数组。
  * 只读命令统一注入 HOMEBREW_NO_AUTO_UPDATE=1，避免隐式自动更新导致的 index.lock 冲突与噪声。
  * 端口 / 镜像源读写一律走 store.readBrewgo() / store.writeBrewgo()。
+ *
+ * 软件包类别（2026-09-18）：搜索 / 索引 / 安装对 cask 与 formula 完全共用，
+ * 差异集中在 KIND_SPEC 一张表里（API 文件、缓存文件、brew 开关、条数下限）。
+ *   - queries.packageSearch({ kind:'cask'|'formula', q })  本地全量索引打分 + brew info 补详情
+ *   - actions.install_casks / install_formulae             逐项指定「代理 / 直连」安装
+ *   - actions.uninstall_casks / uninstall_formulae         批量卸载（destructive，需二次确认）
  */
 
 import fs from 'node:fs';
@@ -20,20 +25,20 @@ import path from 'node:path';
 import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
+import { countSteps } from './runner.js';
 
 const { ERR, AppError } = exec;
 
 /** 只读/升级命令的通用环境（关闭隐式自动更新） */
 const BREW_ENV = Object.freeze({ HOMEBREW_NO_AUTO_UPDATE: '1', HOMEBREW_NO_ENV_HINTS: '1' });
-/** 核心 Tap（卸载需加强警告，复刻 brewgo.sh:355） */
+/** 核心 Tap（卸载需加强警告） */
 const CORE_TAPS = Object.freeze(['homebrew/core', 'homebrew/cask']);
 /** 升级类超时 1800s */
 const UPGRADE_TIMEOUT = 1_800_000;
 
 // ------------------------------ 小工具 ------------------------------
-function lineList(text) {
-  return String(text || '').split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length > 0);
-}
+// 统一实现见 lib/paths.js（2026-09-18 收敛 brew.lineList / env.nonEmptyLines 两份重复）
+const lineList = paths.lines;
 
 /** 读取 MacKit 配置（默认通道 / 自动降级）。 */
 function cfg() {
@@ -42,7 +47,7 @@ function cfg() {
 
 /**
  * 按 autoFallback 开关决定「多通道尝试」还是「单通道」。
- * autoFallback=false 时只试首选通道并失败即终止（MK-M2-21）。
+ * autoFallback=false 时只试首选通道并失败即终止。
  */
 async function runPolicy(ctx, policy, desc, args, opts = {}) {
   const c = cfg();
@@ -73,20 +78,15 @@ async function runPolicy(ctx, policy, desc, args, opts = {}) {
 }
 
 /**
- * 批量动作终态：只要不是「全部失败」，任务算 ok（复刻原脚本不中断语义）。
+ * 批量动作终态：只要不是「全部失败」，任务算 ok（批量操作不中断语义）。
  * ★ 自动清理收尾步骤（id='autoclean'）的成败不计入「软件包成功数」：
  *   它既不影响任务终态判定，也不污染用户可读的成功/跳过/失败计数，
  *   其执行结果仅在日志中体现（避免用户误以为多升级了一个包）。
  */
 function finalizeBatch(task, { log }) {
   const steps = Array.isArray(task.steps) ? task.steps : [];
-  const counts = { ok: 0, fail: 0, skip: 0 };
-  for (const s of steps) {
-    if (s.id === 'autoclean') continue; // 收尾清理步骤不参与软件包计数
-    if (s.status === 'ok') counts.ok += 1;
-    else if (s.status === 'fail') counts.fail += 1;
-    else if (s.status === 'skip' || s.status === 'cancelled') counts.skip += 1;
-  }
+  // 收尾清理步骤（id='autoclean'）不参与软件包计数；计数口径见 runner.countSteps（唯一实现）
+  const counts = countSteps(steps.filter((s) => s.id !== 'autoclean'));
   const autoCleanRan = steps.some((s) => s.id === 'autoclean' && s.status === 'ok');
   const { ok, fail, skip } = counts;
   task.counts = { ok, fail, skip }; // 回写修正后的计数（供 UI / 历史读取）
@@ -136,7 +136,7 @@ async function querySection(kind) {
   const res = await safeRun('brew', args);
   const parsed = res.code === 0 ? parseOutdatedJson(res.stdout, kind) : null;
   if (parsed) return parsed;
-  // 降级：名字列表（brew 7 --quiet 输出，MK-M2-10 数据源）
+  // 降级：名字列表（brew 7 --quiet 输出）
   const quietArgs = isCask
     ? ['outdated', '--cask', '--greedy', '--quiet']
     : ['outdated', '--formula', '--quiet'];
@@ -151,7 +151,7 @@ async function queryInstalled() {
   return {
     formulae: lineList(f.stdout),
     casks: lineList(c.stdout),
-    // brew 7 下 brew tap 输出为空属正常（US-7），必须返回空数组而非报错
+    // brew 7 下 brew tap 输出为空属正常，必须返回空数组而非报错
     taps: lineList(t.stdout),
   };
 }
@@ -161,7 +161,7 @@ async function queryInfo(params) {
   const name = String(params.name || '');
   if (!name) return { lines: [] };
   const res = await safeRun('brew', ['info', kind, name]);
-  // 复刻 uninstall_one_cask 的 `head -5 | sed 's/^/  /'`
+  // 只取 info 前 5 行，并统一缩进两格
   const out = lineList(res.stdout).slice(0, 5).map((l) => `  ${l}`);
   if (out.length === 0 && res.stderr.trim()) {
     out.push(...lineList(res.stderr).slice(0, 5).map((l) => `  ${l}`));
@@ -178,36 +178,61 @@ async function safeRun(bin, args, opts = {}) {
   }
 }
 
-// ------------------------------ Cask 搜索（2026-09-16 新增：Cask 下载页） ------------------------------
+// ------------------------------ 软件包搜索（Cask / Formula 共用） ------------------------------
+/**
+ * 两类软件包的差异表 —— 除这张表以外，搜索 / 索引 / 安装逻辑全部共用同一套代码。
+ *   brewFlag   —— brew install / info 的类别开关
+ *   searchFlag —— brew search 的类别开关
+ *   jsonKey    —— `brew info --json=v2` 中对应的顶层数组键
+ *   apiFile    —— formulae.brew.sh 的全量元数据文件名（国内镜像同路径）
+ *   cacheFile  —— 本地索引缓存文件名（~/.mackit/cache/）
+ *   minCount   —— 索引条数下限，低于此值视为下载到了错误内容
+ *   label      —— 面向用户的类别名
+ */
+const KIND_SPEC = Object.freeze({
+  cask: { kind: 'cask', brewFlag: '--cask', searchFlag: '--casks', jsonKey: 'casks', apiFile: 'cask.json', cacheFile: 'cask-index.json', minCount: 100, label: 'Cask 应用' },
+  formula: { kind: 'formula', brewFlag: '--formula', searchFlag: '--formulae', jsonKey: 'formulae', apiFile: 'formula.json', cacheFile: 'formula-index.json', minCount: 1_000, label: 'Formula' },
+});
+
+/** 归一化类别名：非 formula 一律按 cask 处理。 */
+function normKind(kind) { return kind === 'formula' ? 'formula' : 'cask'; }
+
 /** 搜索结果展示上限（超出时前端提示「显示前 N 个」）。 */
-export const CASK_SEARCH_LIMIT = 30;
+const SEARCH_LIMIT = 30;
 /** 合法 Cask token（防注入：名称最终会作为 spawn 参数，只放行 brew token 字符集）。 */
 const CASK_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._@/-]*$/;
+/** 合法 Formula 名：比 cask 多一个 `+`（如 libc++）。 */
+const FORMULA_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._@/+-]*$/;
+/** 取该类别的合法名称校验正则。 */
+function tokenRe(kind) { return kind === 'formula' ? FORMULA_TOKEN_RE : CASK_TOKEN_RE; }
 
 /**
- * 解析 `brew search --casks <q>` 的 token 列表（纯函数，可单测）。
- * 实测两种形态（2026-09-16，brew 4.x）：
- *   - TTY：`==> Casks` 段头 + 多列表格（一行多个 token，可带 ✔/✘、(disabled) 标记）
- *   - 非 TTY（服务端 spawn 即此形态）：无段头，每行一个 token
- * 所以：有段头时只取 Casks 段；全程无段头时把所有行都视为 cask token。
+ * 解析 `brew search --casks|--formulae <q>` 的名称列表（纯函数）。
+ * 实测两种形态（2026-09-16，brew 4.x；2026-09-18 补充 formula）：
+ *   - TTY：`==> Casks` / `==> Formulae` 段头 + 多列表格（一行多个名称，可带 ✔/✘、(disabled) 标记）
+ *   - 非 TTY（服务端 spawn 即此形态）：无段头，每行一个名称
+ * 所以：有段头时只取本类别的段；全程无段头时把所有行都视为本类别的名称。
  */
-export function parseCaskSearchTokens(text) {
+function parseSearchTokens(text, kind = 'cask') {
+  const k = normKind(kind);
+  const re = tokenRe(k);
+  const sectionRe = k === 'formula' ? /^==>\s*Formulae/i : /^==>\s*Casks/i;
   const out = [];
   const seen = new Set();
   const pushToken = (t) => {
-    if (t && CASK_TOKEN_RE.test(t) && !seen.has(t)) { seen.add(t); out.push(t); }
+    if (t && re.test(t) && !seen.has(t)) { seen.add(t); out.push(t); }
   };
-  let inCasks = null; // null=尚未见到任何段头
+  let inSection = null; // null=尚未见到任何段头
   let sawHeader = false;
   for (const raw of String(text || '').split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
     if (line.startsWith('==>')) {
       sawHeader = true;
-      inCasks = /^==>\s*Casks/i.test(line);
+      inSection = sectionRe.test(line);
       continue;
     }
-    if (sawHeader && inCasks === false) continue; // 其他段（如 Formulae）
+    if (sawHeader && inSection === false) continue; // 其他段（如另一个类别）
     for (const word of line.split(/\s+/)) {
       pushToken(word.replace(/[✔✘]+$/, ''));
     }
@@ -216,44 +241,71 @@ export function parseCaskSearchTokens(text) {
 }
 
 /**
- * 解析 `brew info --cask --json=v2 <tokens...>` 的结果为 token→详情映射（纯函数，可单测）。
- * 注意 JSON v2 里 cask 的 name 是数组；installed 可为版本字符串 / null / 缺失。
+ * 从 JSON v2 条目里取「已安装版本」展示串（纯函数）。
+ * formula 是 `[{version,…}]` 数组，cask 是版本字符串 / {version} / null。
  */
-export function parseCaskInfoJson(text) {
+function parseInstalled(item, kind) {
+  if (kind === 'formula') {
+    const arr = Array.isArray(item.installed) ? item.installed : [];
+    const versions = arr
+      .map((x) => (typeof x === 'string' ? x : (x && typeof x.version === 'string' ? x.version : null)))
+      .filter(Boolean);
+    return versions.length ? versions.join(', ') : null;
+  }
+  if (typeof item.installed === 'string' && item.installed) return item.installed;
+  if (item.installed && typeof item.installed === 'object' && typeof item.installed.version === 'string') return item.installed.version;
+  return null;
+}
+
+/**
+ * 解析 `brew info <类别> --json=v2 <名称...>` 的结果为「名称→详情」映射（纯函数）。
+ * 注意 JSON v2 中：cask 用 token（name 是数组），formula 用 name；两者 installed 结构也不同。
+ */
+function parseInfoJson(text, kind = 'cask') {
+  const k = normKind(kind);
+  const re = tokenRe(k);
+  const spec = KIND_SPEC[k];
   const map = new Map();
   try {
     const obj = JSON.parse(String(text || '{}'));
-    const arr = Array.isArray(obj.casks) ? obj.casks : [];
-    for (const c of arr) {
-      if (!c || typeof c.token !== 'string' || !CASK_TOKEN_RE.test(c.token)) continue;
-      const name = Array.isArray(c.name) ? c.name.filter((n) => typeof n === 'string').join(' / ')
-        : (typeof c.name === 'string' ? c.name : c.token);
-      let installed = null;
-      if (typeof c.installed === 'string' && c.installed) installed = c.installed;
-      else if (c.installed && typeof c.installed === 'object' && typeof c.installed.version === 'string') installed = c.installed.version;
-      map.set(c.token, {
-        name: name || c.token,
-        desc: typeof c.desc === 'string' ? c.desc : '',
-        version: typeof c.version === 'string' ? c.version : null,
-        installed,
+    const arr = Array.isArray(obj[spec.jsonKey]) ? obj[spec.jsonKey] : [];
+    for (const it of arr) {
+      if (!it) continue;
+      const token = k === 'formula' ? it.name : it.token;
+      if (typeof token !== 'string' || !re.test(token)) continue;
+      let name;
+      if (k === 'formula') name = token; // formula 没有独立展示名
+      else if (Array.isArray(it.name)) name = it.name.filter((n) => typeof n === 'string').join(' / ');
+      else name = typeof it.name === 'string' ? it.name : token;
+      map.set(token, {
+        name: name || token,
+        desc: typeof it.desc === 'string' ? it.desc : '',
+        version: k === 'formula'
+          ? (it.versions && typeof it.versions.stable === 'string' ? it.versions.stable : null)
+          : (typeof it.version === 'string' ? it.version : null),
+        installed: parseInstalled(it, k),
       });
     }
-  } catch { /* 降级为空映射：结果行回退为裸 token */ }
+  } catch { /* 降级为空映射：结果行回退为裸名称 */ }
   return map;
 }
 
 /**
- * Cask 搜索：本地索引打分（支持中文名称，对标官网 Algolia）→ `brew info --json=v2` 批量补详情。
- * 索引不可用（下载失败且无缓存）时回退 `brew search --casks`（仅英文，兜底）。
+ * 软件包搜索（Cask / Formula 共用）：
+ * 本地全量索引打分（cask 可命中中文名，对标官网 Algolia）→ `brew info --json=v2` 批量补详情。
+ * 索引不可用（下载失败且无缓存）时回退 `brew search`（仅英文，兜底）。
  */
-async function queryCaskSearch(params) {
+async function queryPackageSearch(params) {
+  const kind = normKind((params && params.kind) || 'cask');
+  const spec = KIND_SPEC[kind];
+  const re = tokenRe(kind);
   const q = String((params && params.q) || '').trim();
-  if (!q) return { query: q, results: [], total: 0, limit: CASK_SEARCH_LIMIT, indexedAt: null };
+  if (!q) return { kind, query: q, results: [], total: 0, limit: SEARCH_LIMIT, indexedAt: null };
   let tokens = null;
   let indexedAt = null;
   try {
-    const idx = await ensureCaskIndex();
-    const hits = searchCaskIndex(idx.casks, q, CASK_SEARCH_LIMIT);
+    const idx = await ensureIndex(kind);
+    const hits = searchIndex(idx.items, q, SEARCH_LIMIT);
     tokens = hits.items.map((c) => c.t);
     indexedAt = idx.builtAt;
   } catch (err) {
@@ -261,77 +313,86 @@ async function queryCaskSearch(params) {
     tokens = null; // 回退路径
   }
   if (tokens === null) {
-    // 兜底：brew 自带搜索（不支持中文；中文查询会得到全量列表，仅在索引不可用时凑合）
-    const res = await safeRun('brew', ['search', '--casks', q]);
-    tokens = parseCaskSearchTokens(res.stdout);
+    // 兜底：brew 自带搜索（cask 不支持中文；中文查询会得到全量列表，仅在索引不可用时凑合）
+    const res = await safeRun('brew', ['search', spec.searchFlag, q]);
+    tokens = parseSearchTokens(res.stdout, kind);
     if (tokens.length === 0) {
       const errText = (res.stderr || '').trim();
       if (!(res.code === 0 || /no (available )?(formulae or casks|formula|cask)/i.test(errText) || errText === '')) {
-        throw new AppError(ERR.CMD_FAILED, 'Cask 搜索失败', errText.split('\n').slice(-3).join('\n'));
+        throw new AppError(ERR.CMD_FAILED, `${spec.label} 搜索失败`, errText.split('\n').slice(-3).join('\n'));
       }
     }
   }
   const total = tokens.length;
-  const shown = tokens.slice(0, CASK_SEARCH_LIMIT).filter((t) => CASK_TOKEN_RE.test(t));
-  if (shown.length === 0) return { query: q, results: [], total: 0, limit: CASK_SEARCH_LIMIT, indexedAt };
-  const info = await safeRun('brew', ['info', '--cask', '--json=v2', ...shown]);
-  const map = parseCaskInfoJson(info.stdout);
+  const shown = tokens.slice(0, SEARCH_LIMIT).filter((t) => re.test(t));
+  if (shown.length === 0) return { kind, query: q, results: [], total: 0, limit: SEARCH_LIMIT, indexedAt };
+  const info = await safeRun('brew', ['info', spec.brewFlag, '--json=v2', ...shown]);
+  const map = parseInfoJson(info.stdout, kind);
   const results = shown.map((t) => ({ token: t, ...(map.get(t) || { name: t, desc: '', version: null, installed: null }) }));
-  return { query: q, results, total, limit: CASK_SEARCH_LIMIT, indexedAt };
+  return { kind, query: q, results, total, limit: SEARCH_LIMIT, indexedAt };
 }
 
-// ------------------------------ Cask 本地索引（对标 formulae.brew.sh 的 Algolia 搜索） ------------------------------
-// 官网搜索（Algolia）索引了 token + 名称（含中文名）+ 描述；brew search 只匹配 token/英文描述，
-// 且对中文查询会退化为全量结果。故下载一次全量 cask 元数据建本地索引，缓存 24h，搜索全程本地打分。
+// ------------------------------ 本地全量索引（对标 formulae.brew.sh 的 Algolia 搜索） ------------------------------
+// 官网搜索（Algolia）索引了名称 + 描述（cask 还含中文名）；brew search 只匹配名称/英文描述，
+// 且 cask 对中文查询会退化为全量结果。故下载一次全量元数据建本地索引，缓存 24h，搜索全程本地打分。
+// cask 与 formula 共用这套机制，差异仅在 API 文件 / 缓存文件 / 条数下限（见 KIND_SPEC，2026-09-18 扩展 formula）。
 
-const CASK_INDEX_TTL_MS = 24 * 60 * 60 * 1000;
-/** 索引合法下限：低于此条数视为下载内容异常（防止把错误页缓存下来）。 */
-const CASK_INDEX_MIN = 100;
+const INDEX_TTL_MS = 24 * 60 * 60 * 1000;
 
-function caskIndexPath() { return path.join(paths.CACHE_DIR, 'cask-index.json'); }
+/** 某类别索引的磁盘缓存路径。 */
+function indexPath(kind) { return path.join(paths.CACHE_DIR, KIND_SPEC[normKind(kind)].cacheFile); }
 
-/** 镜像源对应的 cask.json API 地址（与 exec.MIRROR_REMOTES 同一套映射）。 */
-function caskApiUrl() {
+/** 某类别在「当前镜像源」下的全量元数据 API 地址（与 exec.MIRROR_REMOTES 同一套映射）。 */
+function indexApiUrl(kind) {
+  const spec = KIND_SPEC[normKind(kind)];
   let mirror = 'official';
   try { mirror = store.readBrewgo().mirror || 'official'; } catch { /* ignore */ }
   const remote = exec.MIRROR_REMOTES[mirror];
-  if (remote) return `${remote.replace(/\/brew\.git$/, '')}/homebrew-bottles/api/cask.json`;
-  return 'https://formulae.brew.sh/api/cask.json';
+  if (remote) return `${remote.replace(/\/brew\.git$/, '')}/homebrew-bottles/api/${spec.apiFile}`;
+  return `https://formulae.brew.sh/api/${spec.apiFile}`;
 }
 
 /**
- * 全量 cask.json → 精简索引（纯函数，可单测）。
- * 条目：{ t:token, n:名称（数组以 ' / ' 连接，含中文名）, d:描述, v:版本 }。
+ * 全量元数据（cask.json / formula.json）→ 精简索引（纯函数）。
+ * 条目：{ t:安装用名称（cask 为 token，formula 为 name）, n:展示名（cask 数组以 ' / ' 连接，含中文名）, d:描述, v:版本 }。
  */
-export function buildSlimCaskIndex(jsonText) {
+function buildSlimIndex(jsonText, kind = 'cask') {
+  const k = normKind(kind);
+  const re = tokenRe(k);
   let obj;
   try { obj = JSON.parse(String(jsonText || '[]')); } catch { return []; }
   const arr = Array.isArray(obj) ? obj : [];
-  const casks = [];
+  const items = [];
   for (const c of arr) {
-    if (!c || typeof c.token !== 'string' || !CASK_TOKEN_RE.test(c.token)) continue;
-    const name = Array.isArray(c.name) ? c.name.filter((n) => typeof n === 'string').join(' / ')
-      : (typeof c.name === 'string' ? c.name : '');
-    casks.push({
-      t: c.token,
+    if (!c) continue;
+    const token = k === 'formula' ? c.name : c.token;
+    if (typeof token !== 'string' || !re.test(token)) continue;
+    const name = k === 'formula' ? token
+      : (Array.isArray(c.name) ? c.name.filter((n) => typeof n === 'string').join(' / ')
+        : (typeof c.name === 'string' ? c.name : ''));
+    const version = k === 'formula'
+      ? (c.versions && typeof c.versions.stable === 'string' ? c.versions.stable : '')
+      : (typeof c.version === 'string' ? c.version : '');
+    items.push({
+      t: token,
       n: name,
       d: typeof c.desc === 'string' ? c.desc : '',
-      v: typeof c.version === 'string' ? c.version : '',
+      v: version,
     });
   }
-  return casks;
+  return items;
 }
 
 /**
- * 本地打分搜索（纯函数，可单测）。
- * 排序权重：token 完全匹配 > token 前缀 > token 包含 > 名称包含（支持中文）> 描述包含；
- * 同分按 token 字典序。返回 { items, total }（items 截取前 limit 条，total 为全部命中数）。
+ * 本地打分搜索（纯函数）。
+ * 排序权重：名称完全匹配 > 名称前缀 > 名称包含 > 展示名包含（cask 可命中中文）> 描述包含；
+ * 同分按名称字典序。返回 { items, total }（items 截取前 limit 条，total 为全部命中数）。
  */
-export function searchCaskIndex(casks, q, limit = CASK_SEARCH_LIMIT) {
+function searchIndex(items, q, limit = SEARCH_LIMIT) {
   const query = String(q || '').trim().toLowerCase();
   if (!query) return { items: [], total: 0 };
   const scored = [];
-  for (const c of casks) {
+  for (const c of items) {
     const token = c.t.toLowerCase();
     const name = (c.n || '').toLowerCase();
     const desc = (c.d || '').toLowerCase();
@@ -348,79 +409,87 @@ export function searchCaskIndex(casks, q, limit = CASK_SEARCH_LIMIT) {
 }
 
 /** 读磁盘索引缓存（损坏/缺失返回 null）。 */
-function readIndexCache() {
+function readIndexCache(kind) {
   try {
-    const obj = JSON.parse(fs.readFileSync(caskIndexPath(), 'utf8'));
-    if (obj && typeof obj.builtAt === 'number' && Array.isArray(obj.casks)) return obj;
+    const obj = JSON.parse(fs.readFileSync(indexPath(kind), 'utf8'));
+    if (obj && typeof obj.builtAt === 'number' && Array.isArray(obj.items)) return obj;
   } catch { /* ignore */ }
   return null;
 }
 
-function writeIndexCache(casks) {
+function writeIndexCache(kind, items) {
   try {
     paths.ensureDirs();
-    fs.writeFileSync(caskIndexPath(), JSON.stringify({ builtAt: Date.now(), casks }), 'utf8');
+    fs.writeFileSync(indexPath(kind), JSON.stringify({ builtAt: Date.now(), items }), 'utf8');
   } catch { /* 缓存写失败不影响本次搜索 */ }
 }
 
 /**
- * 直连优先（失败换代理）下载全量 cask.json。
+ * 直连优先（失败换代理）下载全量元数据。
  * ★ 必须用 `curl -o 临时文件` 落盘再读：exec 层 stdout 捕获上限 4MB，
- *   而 cask.json 约 18MB，走 stdout 会被静默截断导致 JSON 解析失败（2026-09-16 实测踩坑）。
+ *   而 cask.json 约 18MB、formula.json 约 32MB，走 stdout 会被静默截断导致 JSON 解析失败（2026-09-16 实测踩坑）。
+ * ★ `--compressed` 让 curl 协商 gzip：formula.json 32MB→5MB、cask.json 18MB→2MB，首次搜索明显更快。
  */
-async function downloadCaskIndex() {
-  const url = caskApiUrl();
-  const tmpFile = `${caskIndexPath()}.download`;
+async function downloadIndex(kind) {
+  const spec = KIND_SPEC[normKind(kind)];
+  const url = indexApiUrl(kind);
+  const tmpFile = `${indexPath(kind)}.download`;
   try {
-    await exec.runWithChannel('direct_first', '下载 Cask 索引', 'curl',
-      ['-fsSL', '--max-time', '180', '-o', tmpFile, url],
-      { timeoutMs: 200_000, env: { HOMEBREW_NO_ENV_HINTS: '1' } });
+    await exec.runWithChannel('direct_first', `下载 ${spec.label} 索引`, 'curl',
+      ['-fsSL', '--compressed', '--max-time', '300', '-o', tmpFile, url],
+      { timeoutMs: 320_000, env: { HOMEBREW_NO_ENV_HINTS: '1' } });
     const raw = fs.readFileSync(tmpFile, 'utf8');
-    const casks = buildSlimCaskIndex(raw);
-    if (casks.length < CASK_INDEX_MIN) {
-      throw new AppError(ERR.PARSE_FAILED, 'Cask 索引内容异常', `仅解析到 ${casks.length} 条`);
+    const items = buildSlimIndex(raw, kind);
+    if (items.length < spec.minCount) {
+      throw new AppError(ERR.PARSE_FAILED, `${spec.label} 索引内容异常`, `仅解析到 ${items.length} 条`);
     }
-    return casks;
+    return items;
   } finally {
     try { fs.rmSync(tmpFile, { force: true }); } catch { /* ignore */ }
   }
 }
 
-/** 内存态（含单飞去重）：并发搜索只触发一次下载。 */
-let caskIndexState = { at: 0, casks: null, loading: null };
+/** 内存态（含单飞去重）：每个类别一份，并发搜索只触发一次下载。 */
+const indexStates = {
+  cask: { at: 0, items: null, loading: null },
+  formula: { at: 0, items: null, loading: null },
+};
 
 /**
- * 确保索引可用：内存 → 24h 内磁盘缓存 → 下载；下载失败时回退旧磁盘缓存。
- * 返回 { casks, builtAt, source }，source ∈ memory|cache|downloaded|stale；全不可用则 throw。
+ * 确保某类别索引可用：内存 → 24h 内磁盘缓存 → 下载；下载失败时回退旧磁盘缓存。
+ * 返回 { items, builtAt, source }，source ∈ memory|cache|downloaded|stale；全不可用则 throw。
  */
-async function ensureCaskIndex() {
-  if (caskIndexState.casks && Date.now() - caskIndexState.at < CASK_INDEX_TTL_MS) {
-    return { casks: caskIndexState.casks, builtAt: caskIndexState.at, source: 'memory' };
+async function ensureIndex(kind) {
+  const k = normKind(kind);
+  const spec = KIND_SPEC[k];
+  const st = indexStates[k];
+  if (st.items && Date.now() - st.at < INDEX_TTL_MS) {
+    return { items: st.items, builtAt: st.at, source: 'memory' };
   }
-  const cached = readIndexCache();
-  if (cached && Date.now() - cached.builtAt < CASK_INDEX_TTL_MS) {
-    caskIndexState = { at: cached.builtAt, casks: cached.casks, loading: null };
-    return { casks: cached.casks, builtAt: cached.builtAt, source: 'cache' };
+  const cached = readIndexCache(k);
+  if (cached && Date.now() - cached.builtAt < INDEX_TTL_MS) {
+    st.at = cached.builtAt; st.items = cached.items; st.loading = null;
+    return { items: cached.items, builtAt: cached.builtAt, source: 'cache' };
   }
-  if (!caskIndexState.loading) {
-    caskIndexState.loading = downloadCaskIndex()
-      .then((casks) => {
+  if (!st.loading) {
+    st.loading = downloadIndex(k)
+      .then((items) => {
         const at = Date.now();
-        caskIndexState = { at, casks, loading: null };
-        writeIndexCache(casks);
-        return { casks, builtAt: at, source: 'downloaded' };
+        st.at = at; st.items = items; st.loading = null;
+        writeIndexCache(k, items);
+        return { items, builtAt: at, source: 'downloaded' };
       })
       .catch((err) => {
-        caskIndexState.loading = null;
+        st.loading = null;
         throw err;
       });
   }
   try {
-    return await caskIndexState.loading;
+    return await st.loading;
   } catch (err) {
-    if (cached) return { casks: cached.casks, builtAt: cached.builtAt, source: 'stale' };
+    if (cached) return { items: cached.items, builtAt: cached.builtAt, source: 'stale' };
     if (err instanceof AppError && (err.code === ERR.CANCELLED || err.code === ERR.TIMEOUT)) throw err;
-    throw new AppError(ERR.NET_UNREACHABLE, 'Cask 索引下载失败（且无本地缓存）', (err && err.message) || String(err));
+    throw new AppError(ERR.NET_UNREACHABLE, `${spec.label} 索引下载失败（且无本地缓存）`, (err && err.message) || String(err));
   }
 }
 
@@ -438,12 +507,12 @@ const INSTALL_SCRIPT_MIN_BYTES = 5_000;
  * 官方推荐写入 shell 配置的那一行（显式指定 shell）。
  * 官方 install.sh 的 `Next steps` 提示为 `eval "$(<prefix>/bin/brew shellenv zsh)"`。
  */
-export function buildShellenvLine(prefix, shell = 'zsh') {
+function buildShellenvLine(prefix, shell = 'zsh') {
   return `eval "$(${prefix}/bin/brew shellenv ${shell})"`;
 }
 
 /**
- * 生成「追加到 rc 文件」的完整新内容（纯函数，可单测）。
+ * 生成「追加到 rc 文件」的完整新内容（纯函数）。
  *
  * 等效官方给出的前两条命令：
  *   ① `echo >> <rc>`          —— 补一个换行（原文末尾无换行时，直接追加会把新配置
@@ -452,15 +521,15 @@ export function buildShellenvLine(prefix, shell = 'zsh') {
  * 因此：原文非空且末尾无换行 → 补一个 \n；已有换行 → 多出一个空行（与官方一致）。
  * 注意绝不 trim 原文，保留用户文件原有结尾内容。
  */
-export function buildShellenvBlock(existingText, line) {
+function buildShellenvBlock(existingText, line) {
   const text = String(existingText || '');
   const head = text === '' ? '' : `${text}\n`;
   return `${head}# Added by MacKit (Homebrew)\n${line}\n`;
 }
 
-/** 判断 rc 文件内容是否已包含 brew shellenv 配置（纯函数，可单测）。 */
-export function isShellenvConfigured(text) {
-  return /brew\s+shellenv/.test(String(text || ''));
+/** 判断 rc 文件内容是否已包含 brew shellenv 配置（纯函数）。 */
+function isShellenvConfigured(text) {
+  return paths.SHELLENV_RE.test(String(text || ''));
 }
 
 /**
@@ -609,13 +678,15 @@ function homebrewInstallSteps() {
   ];
 }
 
-/** 为 install_casks 生成「每目标一步」的安装步骤（mode: proxy|direct）。 */
-function caskInstallSteps(items) {
+/** 为 install_casks / install_formulae 生成「每目标一步」的安装步骤（mode: proxy|direct）。 */
+function installSteps(items, kind) {
+  const spec = KIND_SPEC[normKind(kind)];
+  const re = tokenRe(spec.kind);
   const list = (Array.isArray(items) ? items : [])
     .map((it) => ({ name: String((it && it.name) || '').trim(), mode: it && it.mode === 'proxy' ? 'proxy' : 'direct' }))
-    .filter((it) => it.name && CASK_TOKEN_RE.test(it.name));
+    .filter((it) => it.name && re.test(it.name));
   if (list.length === 0) {
-    return [{ id: 'noop', title: '无可安装项', run: async (ctx) => { ctx.log('warn', '未指定要安装的 Cask 应用'); } }];
+    return [{ id: 'noop', title: '无可安装项', run: async (ctx) => { ctx.log('warn', `未指定要安装的 ${spec.label}`); } }];
   }
   const plans = list.map((it, i) => ({
     id: `install_${i}`, title: `安装 ${it.name}`,
@@ -623,7 +694,7 @@ function caskInstallSteps(items) {
     timeoutMs: UPGRADE_TIMEOUT,
     run: async (ctx) => {
       const label = `${it.name} ${it.mode === 'proxy' ? '代理' : '直连'}安装`;
-      const args = ['install', '--cask', it.name];
+      const args = ['install', spec.brewFlag, it.name];
       const c = cfg();
       if (c.autoFallback === false) {
         ctx.log('info', `尝试${it.mode === 'proxy' ? '代理' : '直连'}执行: ${label} ...`);
@@ -647,7 +718,7 @@ function caskInstallSteps(items) {
 // ------------------------------ 动作定义 ------------------------------
 const actions = {
 
-  /** brew 本体更新（proxy_first，复刻 MK-M2-03） */
+  /** brew 本体更新（proxy_first） */
   brew_update: {
     title: '更新 Homebrew 本体',
     channelPolicy: 'proxy_first',
@@ -703,7 +774,7 @@ const actions = {
     finalize: finalizeBatch,
   },
 
-  /** 清理缓存（Q5：不加确认；失败不阻断） */
+  /** 清理缓存（不加确认；失败不阻断） */
   cleanup: {
     title: '清理缓存',
     destructive: false,
@@ -744,15 +815,23 @@ const actions = {
     steps: () => [shellenvStep()],
   },
 
-  /** Cask 安装（Cask 下载页：搜索后逐项指定代理/直连；非 destructive，新增不删改） */
+  /** Cask 安装（软件下载页：搜索后逐项指定代理/直连；非 destructive，新增不删改） */
   install_casks: {
     title: 'Cask 安装',
     destructive: false,
-    steps: (params) => caskInstallSteps(params.items),
+    steps: (params) => installSteps(params.items, 'cask'),
     finalize: finalizeBatch,
   },
 
-  /** 卸载 Cask 应用（危险操作，复刻 uninstall_one_cask + uninstall_multi） */
+  /** Formula 安装（命令行工具 / 库，等价 `brew install --formula <名称>`；非 destructive） */
+  install_formulae: {
+    title: 'Formula 安装',
+    destructive: false,
+    steps: (params) => installSteps(params.items, 'formula'),
+    finalize: finalizeBatch,
+  },
+
+  /** 卸载 Cask 应用（危险操作，逐项执行、失败不中断其余项） */
   uninstall_casks: {
     title: '卸载 Cask 应用',
     destructive: true,
@@ -760,7 +839,15 @@ const actions = {
     finalize: finalizeBatch,
   },
 
-  /** 卸载 Tap 软件源（危险操作，复刻 uninstall_one_tap） */
+  /** 卸载 Formula（危险操作） */
+  uninstall_formulae: {
+    title: '卸载 Formula',
+    destructive: true,
+    steps: (params) => batchUninstallSteps(params.names, 'formula'),
+    finalize: finalizeBatch,
+  },
+
+  /** 卸载 Tap 软件源（危险操作） */
   uninstall_taps: {
     title: '卸载 Tap 软件源',
     destructive: true,
@@ -768,16 +855,22 @@ const actions = {
     finalize: finalizeBatch,
   },
 };
-/** 为一个批量卸载动作生成「每目标一步」的步骤（失败不中断其余目标）。 */
+/**
+ * 为一个批量卸载动作生成「每目标一步」的步骤（失败不中断其余目标）。
+ * kind ∈ tap | cask | formula；cask / formula 走同一段逻辑，仅 brew 开关与警告文案不同（KIND_SPEC）。
+ */
 function batchUninstallSteps(names, kind) {
+  const isTap = kind === 'tap';
+  const spec = isTap ? null : KIND_SPEC[normKind(kind)];
   const list = Array.isArray(names) ? names.filter((n) => typeof n === 'string' && n) : [];
   if (list.length === 0) {
-    return [{ id: 'noop', title: '无可卸载项', run: async (ctx) => { ctx.log('warn', `未选择任何${kind === 'tap' ? '软件源' : 'Cask 应用'}`); } }];
+    const what = isTap ? '软件源' : spec.label;
+    return [{ id: 'noop', title: '无可卸载项', run: async (ctx) => { ctx.log('warn', `未选择任何${what}`); } }];
   }
   return list.map((name, i) => ({
-    id: `uninstall_${i}`, title: `${kind === 'tap' ? '卸载软件源' : '卸载'} ${name}`,
+    id: `uninstall_${i}`, title: `${isTap ? '卸载软件源' : '卸载'} ${name}`,
     run: async (ctx) => {
-      if (kind === 'tap') {
+      if (isTap) {
         if (CORE_TAPS.includes(name)) {
           ctx.log('warn', `注意: ${name} 为 Homebrew 核心软件源，卸载后需通过 brew tap 重新安装`);
         }
@@ -792,16 +885,18 @@ function batchUninstallSteps(names, kind) {
         ctx.log('ok', `${name} 卸载成功`);
         return;
       }
-      const check = await safeCtx(ctx, ['list', '--cask']);
+      const check = await safeCtx(ctx, ['list', spec.brewFlag]);
       if (!lineList(check.stdout).includes(name)) {
         ctx.log('error', `${name} 未安装`);
         throw new AppError(ERR.NOT_FOUND, `${name} 未安装`);
       }
-      const info = await safeCtx(ctx, ['info', '--cask', name]);
+      const info = await safeCtx(ctx, ['info', spec.brewFlag, name]);
       for (const l of lineList(info.stdout).slice(0, 5)) ctx.log('info', `  ${l}`);
-      ctx.log('error', '警告: 卸载将删除应用及其数据');
+      ctx.log('error', spec.kind === 'formula'
+        ? '警告: 卸载将删除该 Formula 及其安装文件（依赖它的软件包可能受影响）'
+        : '警告: 卸载将删除应用及其数据');
       ctx.log('warn', `正在卸载 ${name} ...`);
-      const res = await safeCtx(ctx, ['uninstall', '--cask', name]);
+      const res = await safeCtx(ctx, ['uninstall', spec.brewFlag, name]);
       if (res.code !== 0) { ctx.log('error', `${name} 卸载失败`); throw new AppError(ERR.CMD_FAILED, `${name} 卸载失败`, res.stderr.trim()); }
       ctx.log('ok', `${name} 卸载成功`);
     },
@@ -823,7 +918,7 @@ async function safeCtx(ctx, args) {
 
 /**
  * 「升级完成后自动清理缓存」收尾步骤（受 mackit.autoCleanup 控制，默认开）。
- * 语义复刻原脚本 `brew cleanup --prune=all && log_ok || log_warn`：
+ * 等价 `brew cleanup --prune=all`，失败只记 warn：
  * 失败只记 warn，绝不 throw、不阻断、不改任务终态；finalizeBatch 亦不计入成功数。
  */
 function autoCleanupStep() {
@@ -852,6 +947,6 @@ export default {
     outdated: queryOutdated,
     installed: queryInstalled,
     info: queryInfo,
-    caskSearch: queryCaskSearch,
+    packageSearch: queryPackageSearch,
   },
 };

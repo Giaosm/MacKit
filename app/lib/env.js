@@ -1,23 +1,22 @@
 /**
  * MacKit · 环境探测层
  *
- * 依据《MacKit-架构设计.md》§3.11：
- *   - snapshot({force}) 30s 缓存，返回 EnvSnapshot（M1 体检卡 / M2 环境卡同源）
- *   - networkTest() 复刻 `brewgo.sh:175-196` 的网络口径
- *   - gitConfig(key) / tokenExists() 供 M3 使用
+ *   - snapshot({force}) 30s 缓存，返回 EnvSnapshot（总览体检卡 / Homebrew 环境卡同源）
+ *   - networkTest()：直连与代理各探一次（含出口 IP），任一可达即不算全断
+ *   - Git 的读写在 lib/git.js（2026-09-18 收敛），本文件只负责把它们聚合成快照
  *   - 镜像源表（5 项）
  *
- * 附加（对 T03 的交接）：shell rc 的别名解析与删除范围计算函数
- *   analyzeRc() / findAliasBlock() / computeAliasRemovalRange() / expectedAliasLines()
- *   —— 严格落实交付总监决策 A2：移除时只删除 alias 定义块，绝不删除注释行。
+ * 附加：shell rc 的别名解析与删除范围计算
+ *   analyzeRc() / computeAliasRemovalRange() / expectedAliasLines()（供 sysinit 使用）
+ *   —— 移除时只删除 alias 定义块，绝不删除注释行。
  *
  * 全部探测走异步子进程（exec.js），不阻塞事件循环。brew 命令串行执行以避免抢锁。
  */
 
-import fs from 'node:fs';
 import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
+import * as git from './git.js';
 
 /** 快照缓存时长 */
 const CACHE_TTL_MS = 30_000;
@@ -27,7 +26,7 @@ const CACHE_KEY = 'env-snapshot';
 // 镜像源表
 // ---------------------------------------------------------------------------
 
-export const MIRRORS = Object.freeze([
+const MIRRORS = Object.freeze([
   { id: 'official', label: '官方 (GitHub)', brew: '' },
   // brew 镜像 URL 唯一来源 = exec.MIRROR_REMOTES（applyMirrorEnv 用的也是它），
   // 原先同一组 URL 在两处各写一份，加镜像时容易漏改其中一处（2026-09-16 收敛）
@@ -42,7 +41,7 @@ export const MIRRORS = Object.freeze([
  * @param {string} id
  * @returns {string}
  */
-export function mirrorLabel(id) {
+function mirrorLabel(id) {
   const m = MIRRORS.find((x) => x.id === id);
   return m ? m.label : '未知';
 }
@@ -59,37 +58,29 @@ function normLines(text) {
 }
 
 /**
- * 运行一条命令并吞掉异常，返回统一结构。
+ * 运行一条只读探测命令并吞掉异常（默认不注入 brew 镜像源）。
+ * 兜底逻辑本身在 exec.runSafe（2026-09-18 收敛），这里只额外做「白名单拒绝只告警一次」：
+ * 这类失败若静默吞掉，会把真 bug 伪装成「探测不到」。
  * @param {string} bin
  * @param {string[]} args
  * @param {import('./exec.js').RunOpts} [opts]
  * @returns {Promise<{code:number, stdout:string, stderr:string}>}
  */
-/** 编码类错误（如命令被白名单拒绝）只告警一次，避免把真 bug 静默吞掉。 */
 const warnedNotAllowed = new Set();
 async function runQuiet(bin, args, opts = {}) {
-  try {
-    const res = await exec.run(bin, args, { noMirror: true, ...opts });
-    return res;
-  } catch (err) {
-    const e = /** @type {any} */ (err);
-    if (e && e.code === exec.ERR.CMD_NOT_ALLOWED && !warnedNotAllowed.has(bin)) {
-      warnedNotAllowed.add(bin);
-      console.warn(`[env] 命令不在白名单，已跳过（应改用裸命令名）：${bin}`);
-    }
-    return { code: typeof e.code === 'number' ? e.code : -1, stdout: '', stderr: e.message || String(err) };
+  const res = await exec.runSafe(bin, args, { noMirror: true, ...opts });
+  if (res.errCode === exec.ERR.CMD_NOT_ALLOWED && !warnedNotAllowed.has(bin)) {
+    warnedNotAllowed.add(bin);
+    console.warn(`[env] 命令不在白名单，已跳过（应改用裸命令名）：${bin}`);
   }
+  return res;
 }
 
-function nonEmptyLines(text) {
-  return String(text || '')
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
-}
+// 统一实现见 lib/paths.js（2026-09-18 收敛 lineList / nonEmptyLines 两份重复）
+const nonEmptyLines = paths.lines;
 
 // ---------------------------------------------------------------------------
-// shell rc 别名解析（A2）
+// shell rc 别名解析
 // ---------------------------------------------------------------------------
 
 /**
@@ -99,7 +90,7 @@ function nonEmptyLines(text) {
  * @param {string} name 'proxy' | 'unproxy'
  * @returns {{start:number, end:number, lines:string[]}|null}
  */
-export function findAliasBlock(lines, name) {
+function findAliasBlock(lines, name) {
   const startRe = new RegExp('^\\s*alias\\s+' + name + '\\s*=');
   for (let i = 0; i < lines.length; i++) {
     const m = startRe.exec(lines[i]);
@@ -143,7 +134,7 @@ export function computeAliasRemovalRange(text, name) {
 
 /**
  * 生成「将要写入」的期望别名行（单行版，端口取自当前配置）。
- * 复刻 `proxy.sh` 的别名语义。
+ * 别名语义：proxy 导出 http/https 代理并回显出口 IP；unproxy 取消这两个变量。
  * @param {number} port
  * @returns {string[]}
  */
@@ -214,7 +205,7 @@ export function detectShell() {
 }
 
 // ---------------------------------------------------------------------------
-// 网络体检（复刻 brewgo.sh:175-196）
+// 网络体检
 // ---------------------------------------------------------------------------
 
 /**
@@ -255,7 +246,7 @@ async function probeIp(channel) {
  * 两者全失败 → allFailed=true。
  * @returns {Promise<{direct:any, proxy:any, allFailed:boolean}>}
  */
-export async function networkTest() {
+async function networkTest() {
   /** @type {{ok:boolean, ip:string|null, location:string|null, error?:any}} */
   const direct = { ok: false, ip: null, location: null };
   /** @type {{ok:boolean, ip:string|null, location:string|null, error?:any}} */
@@ -295,31 +286,8 @@ export async function networkTest() {
 // ---------------------------------------------------------------------------
 // git / token
 // ---------------------------------------------------------------------------
-
-/**
- * 读取一条 git 全局配置。
- * @param {string} key
- * @returns {Promise<string|null>}
- */
-export async function gitConfig(key) {
-  const res = await runQuiet('git', ['config', '--global', '--get', key], { timeoutMs: 10_000 });
-  if (res.code !== 0) return null;
-  const val = res.stdout.trim();
-  return val.length > 0 ? val : null;
-}
-
-/**
- * 检查 GitHub 凭据是否存在于 Keychain（`git credential-osxkeychain get`）。
- * @returns {Promise<boolean>}
- */
-export async function tokenExists() {
-  const res = await runQuiet(
-    'git',
-    ['credential-osxkeychain', 'get'],
-    { stdin: 'protocol=https\nhost=github.com\n\n', timeoutMs: 10_000 }
-  );
-  return /^username=/m.test(res.stdout);
-}
+// 具体读写已收敛到 lib/git.js（2026-09-18）：原先这里的 gitConfig / tokenExists 与
+// sysinit.safeGit、backup.runGit / readGithubCredential 属同一批逻辑的多份拷贝。
 
 // ---------------------------------------------------------------------------
 // 快照
@@ -332,9 +300,8 @@ export async function tokenExists() {
  */
 function readShellenvConfigured() {
   for (const f of [paths.RC_ZPROFILE, paths.RC_BASH_PROFILE]) {
-    try {
-      if (fs.existsSync(f) && /brew\s+shellenv/.test(fs.readFileSync(f, 'utf8'))) return true;
-    } catch { /* ignore */ }
+    const text = paths.readTextSafe(f);
+    if (text !== null && paths.SHELLENV_RE.test(text)) return true;
   }
   return false;
 }
@@ -379,7 +346,7 @@ async function brewSnapshot() {
 
   const taps = await runQuiet('brew', ['tap'], { timeoutMs: 15_000 });
   snap.tapList = nonEmptyLines(taps.stdout);
-  // brew 7 下 brew tap 输出为空属正常（US-7），不视为错误
+  // brew 7 下 brew tap 输出为空属正常，不视为错误
   snap.tapEmpty = snap.tapList.length === 0;
 
   return snap;
@@ -400,13 +367,13 @@ async function gitSnapshot() {
   };
   if (!installed) return snap;
 
-  snap.userName = await gitConfig('user.name');
-  snap.userEmail = await gitConfig('user.email');
-  snap.safeDirectory = await gitConfig('safe.directory');
-  snap.httpProxy = await gitConfig('http.proxy');
-  snap.httpsProxy = await gitConfig('https.proxy');
-  snap.credentialHelper = await gitConfig('credential.helper');
-  snap.tokenExists = await tokenExists();
+  snap.userName = await git.config('user.name');
+  snap.userEmail = await git.config('user.email');
+  snap.safeDirectory = await git.config('safe.directory');
+  snap.httpProxy = await git.config('http.proxy');
+  snap.httpsProxy = await git.config('https.proxy');
+  snap.credentialHelper = await git.config('credential.helper');
+  snap.tokenExists = await git.credentialExists();
   snap.status = snap.userName ? 'ok' : 'warn';
   return snap;
 }
@@ -482,13 +449,26 @@ export async function snapshot(opts = {}) {
       return cached.value;
     }
   }
+  // ★ 并发去重：一次体检要跑 5 条 brew 命令 + 4 次网络探测，而首屏多个视图会同时请求
+  //   /api/env（还有 15s 一次的健康轮询与各处 refreshEnv(true)）。没有这层去重就会并行
+  //   跑多轮 brew —— 与本文件「brew 命令串行以避免抢锁」的约束冲突（index.lock）。
+  if (inflight) return inflight;
+  const gen = generation;
+  inflight = buildSnapshot(gen).finally(() => { inflight = null; });
+  return inflight;
+}
 
+/** 正在构建的快照（并发去重）；generation 用于丢弃「构建期间配置已变」的过期结果。 */
+let inflight = null;
+let generation = 0;
+
+async function buildSnapshot(gen) {
   const cfg = store.readBrewgo();
   const mackit = store.readMackit();
 
   const brew = await brewSnapshot();
   const network = await networkTest();
-  const git = await gitSnapshot();
+  const gitInfo = await gitSnapshot(); // 变量名避开上方的 git 模块导入
   const rime = rimeSnapshot();
   const shell = shellSnapshot();
 
@@ -519,34 +499,22 @@ export async function snapshot(opts = {}) {
       hadMirrorKey: cfg.hadMirrorKey,
     },
     shell,
-    git,
+    git: gitInfo,
     rime,
     mackit,
     checkedAt: Date.now(),
   };
 
-  store.setCached(CACHE_KEY, result);
+  // 构建期间配置被改过（invalidate 提升 generation）→ 结果已过期，不写缓存，
+  // 让下一次请求自然重算；否则会把旧配置的快照重新喂给 30s 内的所有调用方。
+  if (gen === generation) store.setCached(CACHE_KEY, result);
   return result;
 }
 
 /**
- * 清空环境快照缓存。
+ * 清空环境快照缓存（并作废正在构建中的那一次，见 buildSnapshot 的 gen 校验）。
  */
 export function invalidate() {
+  generation += 1;
   try { store.setCached(CACHE_KEY, null); } catch { /* ignore */ }
 }
-
-export default {
-  MIRRORS,
-  mirrorLabel,
-  findAliasBlock,
-  computeAliasRemovalRange,
-  expectedAliasLines,
-  analyzeRc,
-  detectShell,
-  networkTest,
-  gitConfig,
-  tokenExists,
-  snapshot,
-  invalidate,
-};

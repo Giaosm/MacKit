@@ -1,7 +1,5 @@
 /**
- * MacKit · M2 Homebrew 管家（视图）
- *
- * 依据《MacKit-架构设计.md》§8.6 + 《MacKit-PRD.md》§6.3 / §3 M2 表 / §7.1。
+ * MacKit · Homebrew 管家（视图）
  *
  * 结构（按用户澄清后的目标形态）：
  *   - 环境卡 + 通道指示（实际通道由 SSE 的 step.channel 反映）
@@ -11,9 +9,9 @@
  *       · 每项两个互斥按钮「代理 / 直连」，默认都不选；未选 = 不更新
  *       · 快捷「全部代理 / 全部直连 / 清除全部选择」+ 实时汇总「已选 N 项（代理 X / 直连 Y）」
  *       · 底部「▶ 开始逐项升级」→ upgrade_one_by_one（items: [{name,kind,mode}]，mode∈proxy|direct|skip）
- *   - 卸载管理：Cask（多选 + 二次确认 + brew info 前 5 行）/ Tap（核心源加强警告 + 空态解释）
- *   - Cask 下载：本地搜索 Homebrew Cask 仓库（brew search + info 补详情），结果逐项「代理/直连」直接安装
- *   - 设置（端口 / 镜像 5 卡 / 默认通道 / 自动降级 / 缓存清理；改端口后展示 Q3 提示，不自动改 Git）
+ *   - 卸载管理：Formula / Cask（多选 + 二次确认 + brew info 前 5 行）/ Tap（核心源加强警告 + 空态解释）
+ *   - 软件下载：Formula / Cask 双类别，本地全量索引搜索（brew info --json=v2 补详情），结果逐项「代理/直连」直接安装
+ *   - 设置（端口 / 镜像 5 卡 / 默认通道 / 自动降级 / 缓存清理；改端口后仅提示，不自动改 Git）
  *
  * 已移除：原「更新中心」标签与 6 步完整更新前端入口、「更新策略」单选、已装统计入口。
  *         原「历史」标签（升级/卸载历史表）—— 任务历史统一由侧边栏「任务历史」承载，避免两处重复。
@@ -59,7 +57,7 @@ export default {
       el('div', { class: 'row' }, [envMeta, envBtn]),
     ]), envBox, tabsBox, panelBox);
 
-    const TABS = [['upgrade', '升级列表'], ['cask', 'Cask 下载'], ['uninstall', '卸载管理'], ['settings', '设置']];
+    const TABS = [['upgrade', '升级列表'], ['download', '软件下载'], ['uninstall', '卸载管理'], ['settings', '设置']];
     let active = 'upgrade';
     let env = null;
     let envBusy = false;
@@ -313,29 +311,37 @@ export default {
     }
 
     // ================= 面板：卸载管理 =================
+    // Formula 与 Cask 都走「已装列表多选 → 二次确认 → 批量卸载」，差异只有接口 kind 与动作名。
+    const UNINSTALL_TABS = [['cask', 'Cask 应用'], ['formula', 'Formula'], ['tap', 'Tap 软件源']];
+    const PKG_LABEL = { cask: 'Cask 应用', formula: 'Formula' };
+
     function panelUninstall(box) {
       let kind = 'cask';
       const tabs = el('div', { class: 'toolbar' });
       const host = el('div');
       let installed = { formulae: [], casks: [], taps: [] };
       let ct = null;
-      const drawTabs = () => { tabs.innerHTML = ''; for (const [k, l] of [['cask', 'Cask 应用'], ['tap', 'Tap 软件源']]) tabs.append(el('button', { class: `btn btn--sm${kind === k ? ' btn--primary' : ''}`, type: 'button', text: l, on: { click: () => { kind = k; drawTabs(); draw(); } } })); };
+      const drawTabs = () => { tabs.innerHTML = ''; for (const [k, l] of UNINSTALL_TABS) tabs.append(el('button', { class: `btn btn--sm${kind === k ? ' btn--primary' : ''}`, type: 'button', text: l, on: { click: () => { kind = k; drawTabs(); draw(); } } })); };
       async function load() {
         host.innerHTML = ''; host.append(el('div', { class: 'view-loading', text: '正在读取已安装列表…' }));
         try { installed = await api('GET', '/api/brew/installed'); } catch (err) { host.innerHTML = ''; host.append(el('div', { class: 'err-box', text: `读取失败：${err.message || err}` })); return; }
         draw();
       }
-      async function uninstallCasks() {
+      /** Formula / Cask 卸载共用：勾选 → 拉取 brew info 前 5 行 → 二次确认 → 派发对应动作。 */
+      async function uninstallPackages() {
         const rows = ct.getSelectedRows();
-        if (!rows.length) return ui.toast('warn', '请先勾选要卸载的 Cask 应用');
+        if (!rows.length) return ui.toast('warn', `请先勾选要卸载的 ${PKG_LABEL[kind]}`);
         const infos = [];
-        for (const r of rows) { try { infos.push({ name: r.name, lines: (await api('GET', `/api/brew/info?kind=cask&name=${encodeURIComponent(r.name)}`)).lines }); } catch { infos.push({ name: r.name, lines: [] }); } }
+        for (const r of rows) { try { infos.push({ name: r.name, lines: (await api('GET', `/api/brew/info?kind=${kind}&name=${encodeURIComponent(r.name)}`)).lines }); } catch { infos.push({ name: r.name, lines: [] }); } }
         const body = el('div', {}, [
           el('p', { text: '将卸载：' }), el('ul', {}, rows.map((r) => el('li', { text: r.name }))),
-          ...infos.map((b) => el('div', {}, [el('div', { class: 'muted', text: `${b.name} 应用信息（brew info 前 5 行）：` }), el('div', { class: 'diff' }, (b.lines.length ? b.lines : ['（无信息）']).map((l) => el('div', { class: 'diff__line', text: l })))])),
-          el('div', { class: 'err-box', text: '⚠ 卸载将删除应用及其数据，且不可撤销。' }),
+          ...infos.map((b) => el('div', {}, [el('div', { class: 'muted', text: `${b.name} 信息（brew info 前 5 行）：` }), el('div', { class: 'diff' }, (b.lines.length ? b.lines : ['（无信息）']).map((l) => el('div', { class: 'diff__line', text: l })))])),
+          el('div', { class: 'err-box', text: kind === 'formula'
+            ? '⚠ 卸载将删除该 Formula 及其安装文件（依赖它的软件包可能受影响），且不可撤销。'
+            : '⚠ 卸载将删除应用及其数据，且不可撤销。' }),
         ]);
-        if (await ui.confirmDialog({ title: `确认卸载 Cask 应用（${rows.length} 个）`, body, confirmLabel: '确认卸载' })) await ctx.runTask('brew', 'uninstall_casks', { names: rows.map((r) => r.name) }, { confirm: true });
+        const action = kind === 'formula' ? 'uninstall_formulae' : 'uninstall_casks';
+        if (await ui.confirmDialog({ title: `确认卸载 ${PKG_LABEL[kind]}（${rows.length} 个）`, body, confirmLabel: '确认卸载' })) await ctx.runTask('brew', action, { names: rows.map((r) => r.name) }, { confirm: true });
       }
       async function uninstallTaps() {
         const checked = Array.from(host.querySelectorAll('input[type=checkbox][data-tap]:checked')).map((c) => c.dataset.tap);
@@ -346,26 +352,40 @@ export default {
       }
       function draw() {
         host.innerHTML = '';
-        if (kind === 'cask') {
-          const casks = installed.casks || [];
-          if (!casks.length) { host.append(ui.card('Cask 应用', ui.empty({ icon: 'ℹ', title: '没有已安装的 Cask 应用', actions: [{ label: '重新检测', onClick: load }] }))); return; }
-          ct = ui.dataTable({ columns: [{ key: 'name', label: '应用' }], rows: casks.map((n) => ({ name: n })), selectable: true, searchable: true, rowKey: (r) => r.name, emptyText: '无' });
-          host.append(ui.card('Cask 应用', el('div', {}, [ct.el, el('div', { class: 'row section' }, [el('button', { class: 'btn btn--danger', type: 'button', text: '卸载选中', on: { click: uninstallCasks } })])])));
-        } else {
+        if (kind === 'tap') {
           const taps = installed.taps || [];
           if (!taps.length) { host.append(ui.card('Tap 软件源', ui.empty({ icon: 'ℹ', title: '未检测到自定义 Tap 软件源', text: 'Homebrew 7 默认不再显式列出 core / cask 等内置源，属正常现象。', actions: [{ label: '重新检测', onClick: load }] }))); return; }
           const list = el('div', { class: 'filelist' }, taps.map((t) => el('li', {}, [el('label', { class: 'check' }, [el('input', { type: 'checkbox', dataset: { tap: t } }), el('span', { text: t, class: CORE_TAPS.includes(t) ? 'dot-warn' : '' })])])));
           host.append(ui.card('Tap 软件源', el('div', {}, [list, el('div', { class: 'row section' }, [el('button', { class: 'btn btn--danger', type: 'button', text: '卸载选中', on: { click: uninstallTaps } })])])));
+          return;
         }
+        const label = PKG_LABEL[kind];
+        const names = (kind === 'formula' ? installed.formulae : installed.casks) || [];
+        if (!names.length) { host.append(ui.card(label, ui.empty({ icon: 'ℹ', title: `没有已安装的 ${label}`, actions: [{ label: '重新检测', onClick: load }] }))); return; }
+        ct = ui.dataTable({ columns: [{ key: 'name', label: '名称' }], rows: names.map((n) => ({ name: n })), selectable: true, searchable: true, rowKey: (r) => r.name, emptyText: '无' });
+        host.append(ui.card(label, el('div', {}, [ct.el, el('div', { class: 'row section' }, [el('button', { class: 'btn btn--danger', type: 'button', text: '卸载选中', on: { click: uninstallPackages } })])])));
       }
       onPanel('done', (t) => { if (t.module === 'brew') load(); });
       box.append(tabs, host); drawTabs(); load();
     }
 
-    // ================= 面板：Cask 下载（搜索 + 直连/代理安装） =================
-    function panelCask(box) {
+    // ================= 面板：软件下载（Formula / Cask 搜索 + 直连/代理安装） =================
+    // 两个类别共用同一套流程（搜索 / 排序 / 安装通道选择），差异只有：接口 kind、安装动作名、文案。
+    const DOWNLOAD_KINDS = [
+      ['cask', 'Cask 应用（图形界面）'],
+      ['formula', 'Formula（命令行工具 / 库）'],
+    ];
+    const DOWNLOAD_PLACEHOLDER = {
+      cask: '搜索 Cask 应用，如：chrome、wechat、vscode…',
+      formula: '搜索 Formula，如：node、ffmpeg、ripgrep…',
+    };
+    const DOWNLOAD_LABEL = { cask: 'Cask 应用', formula: 'Formula' };
+
+    function panelDownload(box) {
       const host = el('div', { class: 'section' });
-      const searchI = el('input', { type: 'search', placeholder: '搜索 Cask 应用，如：chrome、wechat、vscode…', style: 'max-width:340px' });
+      const kindTabs = el('div', { class: 'toolbar' });
+      let kind = 'cask';
+      const searchI = el('input', { type: 'search', placeholder: DOWNLOAD_PLACEHOLDER[kind], style: 'max-width:340px' });
       const status = el('span', { class: 'muted' });
       const cancelBtn = el('button', { class: 'btn btn--danger btn--sm', type: 'button', text: '取消任务', disabled: true, on: { click: (e) => cancelCurrent(e.target) } });
       const listHost = el('div');
@@ -376,31 +396,53 @@ export default {
       const refreshTaskState = () => { cancelBtn.disabled = !ctx.state.running; };
       onPanel('task', refreshTaskState);
 
+      function drawKindTabs() {
+        kindTabs.innerHTML = '';
+        for (const [k, label] of DOWNLOAD_KINDS) {
+          kindTabs.append(el('button', {
+            class: `btn btn--sm${kind === k ? ' btn--primary' : ''}`, type: 'button', text: label,
+            on: { click: () => { if (kind === k) return; kind = k; drawKindTabs(); switchKind(); } },
+          }));
+        }
+      }
+      /** 切换类别：作废在途请求（seq 自增），改写输入提示，有词则立刻重搜。 */
+      function switchKind() {
+        seq += 1;
+        searchI.placeholder = DOWNLOAD_PLACEHOLDER[kind];
+        status.textContent = '';
+        if (q) runSearch(); else showHint();
+      }
+
       function showHint() {
+        const isCask = kind === 'cask';
         listHost.innerHTML = '';
         listHost.append(ui.empty({
-          icon: '📦', title: '搜索并安装 Cask 应用',
-          text: '支持按名称搜索（含中文名，如「微信」「企业微信」），效果等同 formulae.brew.sh/cask；点「代理下载 / 直连下载」直接创建安装任务。首次搜索需下载一次索引，之后本地秒搜。',
+          icon: '📦', title: isCask ? '搜索并安装 Cask 应用' : '搜索并安装 Formula（命令行工具 / 库）',
+          text: isCask
+            ? '支持按名称搜索（含中文名，如「微信」「企业微信」），效果等同 formulae.brew.sh/cask；点「代理下载 / 直连下载」直接创建安装任务。首次搜索需下载一次索引，之后本地秒搜。'
+            : '支持按名称 / 描述搜索 Homebrew formula，效果等同 formulae.brew.sh；点「代理安装 / 直连安装」直接创建安装任务（等价 brew install <名称>）。首次搜索需下载一次索引，之后本地秒搜。',
         }));
       }
 
       async function runSearch() {
         const my = ++seq;
+        const k = kind;  // 绑定本次请求的类别：响应回来时用户可能已切走
+        const label = DOWNLOAD_LABEL[k];
         status.textContent = '搜索中…';
         listHost.innerHTML = '';
-        listHost.append(el('div', { class: 'view-loading', text: '正在搜索 Cask…' }));
+        listHost.append(el('div', { class: 'view-loading', text: `正在搜索 ${label}…` }));
         try {
-          const data = await api('GET', `/api/brew/cask-search?q=${encodeURIComponent(q)}`);
+          const data = await api('GET', `/api/brew/package-search?kind=${k}&q=${encodeURIComponent(q)}`);
           if (my !== seq) return;
           status.textContent = (data.total > 0
             ? `共 ${data.total} 个匹配${data.total > data.limit ? `，显示前 ${data.limit} 个` : ''}`
             : '') + (data.indexedAt ? ` · 索引 ${ctx.fmtDateTime(data.indexedAt)}` : '');
           listHost.innerHTML = '';
           if (!data.results || data.results.length === 0) {
-            listHost.append(ui.empty({ icon: '🔍', title: `没有匹配「${q}」的 Cask 应用`, text: '试试更短的关键词，或确认应用在 Homebrew Cask 仓库中存在。' }));
+            listHost.append(ui.empty({ icon: '🔍', title: `没有匹配「${q}」的 ${label}`, text: '试试更短的关键词，或确认它在 Homebrew 仓库中存在。' }));
             return;
           }
-          listHost.append(ui.card('Cask 搜索结果', el('div', {}, data.results.map(resultRow))));
+          listHost.append(ui.card(`${label} 搜索结果`, el('div', {}, data.results.map((r) => resultRow(r, k)))));
         } catch (err) {
           if (my !== seq) return;
           status.textContent = '';
@@ -409,12 +451,14 @@ export default {
         }
       }
 
-      function install(name, mode) {
+      function install(name, mode, k) {
         // runTask 内部有「任务运行中」互斥 + 自动打开日志抽屉，失败会 toast
-        ctx.runTask('brew', 'install_casks', { items: [{ name, mode }] });
+        const action = k === 'formula' ? 'install_formulae' : 'install_casks';
+        ctx.runTask('brew', action, { items: [{ name, mode }] });
       }
 
-      function resultRow(r) {
+      function resultRow(r, k) {
+        const verb = k === 'formula' ? '安装' : '下载';
         const installedBadge = r.installed
           ? ui.badge(`已装${r.installed === r.version ? '' : ' ' + r.installed}`, 'ok')
           : null;
@@ -426,8 +470,8 @@ export default {
             r.version ? el('span', { class: 'muted', text: `  ·  ${r.version}` }) : null,
           ]),
           el('span', { style: 'flex-shrink:0; margin-left:12px' }, [
-            el('button', { class: 'btn btn--sm', type: 'button', text: '代理下载', on: { click: () => install(r.token, 'proxy') } }), ' ',
-            el('button', { class: 'btn btn--sm', type: 'button', text: '直连下载', on: { click: () => install(r.token, 'direct') } }),
+            el('button', { class: 'btn btn--sm', type: 'button', text: `代理${verb}`, on: { click: () => install(r.token, 'proxy', k) } }), ' ',
+            el('button', { class: 'btn btn--sm', type: 'button', text: `直连${verb}`, on: { click: () => install(r.token, 'direct', k) } }),
           ]),
         ]);
       }
@@ -441,10 +485,11 @@ export default {
         pendingTimers.add(timer);
       });
 
-      // 安装任务结束后刷新「已装」标识（顺带覆盖其他 brew 动作对 cask 列表的影响）
+      // 安装任务结束后刷新「已装」标识（顺带覆盖其他 brew 动作对已装列表的影响）
       onPanel('done', (t) => { if (t.module === 'brew' && q) runSearch(); });
 
-      host.append(el('div', { class: 'toolbar' }, [searchI, el('span', { class: 'grow' }), status, cancelBtn]), listHost);
+      host.append(kindTabs, el('div', { class: 'toolbar' }, [searchI, el('span', { class: 'grow' }), status, cancelBtn]), listHost);
+      drawKindTabs();
       showHint();
       box.append(host);
     }
@@ -464,7 +509,7 @@ export default {
         const portCard = ui.card('🔌 代理端口', el('div', {}, [
           el('div', { class: 'row' }, [el('span', { class: 'muted', style: 'width:120px', text: 'HTTP 端口' }), httpI]),
           el('div', { class: 'row section' }, [el('span', { class: 'muted', style: 'width:120px', text: 'SOCKS5 端口' }), socksI]),
-          el('div', { class: 'muted', text: '非纯数字或超范围（1–65535）的输入将被忽略并保持原值（对齐原脚本行为）。' }),
+          el('div', { class: 'muted', text: '非纯数字或超范围（1–65535）的输入将被忽略并保持原值。' }),
           el('div', { class: 'row section' }, [el('button', { class: 'btn btn--primary', type: 'button', text: '保存端口', on: { click: () => savePorts(httpI, socksI) } })]),
         ]));
 
@@ -504,7 +549,7 @@ export default {
         const socks = ok(socksI.value.trim()) ? Number(socksI.value) : cur.socksPort;
         if (http === cur.httpPort && socks === cur.socksPort) ui.toast('warn', '端口未变化或输入非法，已保持原值');
         await saveConfig({ proxy: { httpPort: http, socksPort: socks } }, `端口已保存：HTTP=${http} / SOCKS5=${socks}`);
-        // Q3：改端口后展示提示，不自动改 Git 代理
+        // 改端口后展示提示，不自动改 Git 代理
         hintBox.innerHTML = '';
         try {
           const e = await ctx.refreshEnv(true);
@@ -519,7 +564,7 @@ export default {
     }
 
     // ---------------- 面板注册 ----------------
-    const panels = { upgrade: panelUpgrade, cask: panelCask, uninstall: panelUninstall, settings: panelSettings };
+    const panels = { upgrade: panelUpgrade, download: panelDownload, uninstall: panelUninstall, settings: panelSettings };
 
     /**
      * 面板级订阅：面板内部一律用 onPanel 代替 ctx.on。

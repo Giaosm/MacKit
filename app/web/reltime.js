@@ -1,5 +1,5 @@
 /**
- * 相对时间格式化（纯函数，无 DOM 依赖 —— 因此可被 Node 直接 import 做单测）。
+ * 相对时间格式化（纯函数，无 DOM 依赖，可在浏览器与 Node 中直接 import）。
  * 规则：<1 分钟「刚刚」；<1 小时「N 分钟前」；同一自然日「N 小时前」；
  *      昨天「昨天 HH:MM」；前天「前天 HH:MM」；3–6 天「N 天前」；
  *      同年更早「MM-DD」；跨年「YYYY-MM-DD」。
@@ -38,5 +38,3 @@ export function fmtRel(ms, now = Date.now()) {
   if (target.getFullYear() === ref.getFullYear()) return `${MM}-${DD}`;
   return `${target.getFullYear()}-${MM}-${DD}`;
 }
-
-export default { fmtRel };

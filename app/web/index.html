@@ -42,7 +42,7 @@
     <!-- 侧边栏 -->
     <aside class="sidebar" id="sidebar">
       <nav class="nav" id="nav" aria-label="主导航">
-        <!-- 视图导航项由 app.js 渲染（T04） -->
+        <!-- 视图导航项由 app.js 渲染 -->
       </nav>
 
       <div class="sidebar__divider" role="separator"></div>
@@ -59,7 +59,7 @@
           </button>
         </div>
         <ul class="history__list" id="historyList">
-          <!-- 任务历史条目由 app.js 渲染（T04） -->
+          <!-- 任务历史条目由 app.js 渲染 -->
         </ul>
       </section>
     </aside>
@@ -96,9 +96,8 @@
       </div>
 
       <div class="logdrawer__body" id="logBody">
-        <ol class="loglist" id="logList">
-          <li class="loglist__empty" id="logEmpty">暂无日志 · 任务开始后日志会实时显示在这里</li>
-        </ol>
+        <!-- 空态占位由 app.js 的 showLogEmpty() 渲染（避免清屏后文案丢失 / 文案两处维护） -->
+        <ol class="loglist" id="logList"></ol>
       </div>
     </footer>
   </div>

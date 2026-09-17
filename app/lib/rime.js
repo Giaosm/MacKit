@@ -1,23 +1,22 @@
 /**
- * MacKit · M4 Rime 输入法管家（后端模块）
+ * MacKit · Rime 输入法管家（后端模块）
  *
- * 依据《MacKit-架构设计.md》§3.7 / §3.9 / §3.12 与《MacKit-PRD.md》§3 M4 表，
  * 语义移植自原 `shell/rime_ice.sh`（参考脚本已于 2026-09-16 从仓库移除，本文件为该功能的唯一事实源）。
  *
  * 关键约束：
- *   - 不引入任何 YAML 库：`squirrel.yaml` 用「行式解析器」自研（§3.9），只认
+ *   - 不引入任何 YAML 库：`squirrel.yaml` 用「行式解析器」自研，只认
  *     顶层 `preset_color_schemes:`、2 空格缩进的方案键、4+ 空格缩进的字段；
  *     跳过注释行、剥离行内注释、剥离引号。
  *   - `normalizeColor` 是全项目唯一的色值解析函数；**8 位色值一律视为 AARRGGBB**
  *     （alpha 在前两位），6 位视为 RRGGBB（alpha=1）。
- *   - A3：`native` 只有 `name` 没有色值 → colors=null（前端用中性色兜底，不报错）。
+ *   - `native` 只有 `name` 没有色值 → colors=null（前端用中性色兜底，不报错）。
  *   - 兜底链：squirrel.yaml → build/squirrel.yaml → 降级（22 款名称 + 无色值），**不报错**。
  *   - 写 squirrel.custom.yaml 前不做自动备份（2026-09-16 起自动备份已移除，
- *     配置迁移走「备份中心」手动导出/导入）。
+ *     配置迁移走「备份中心」的 WebDAV 备份）。
  *   - `patch_yaml` 双语义：键已存在→原地替换该行；不存在→在 `patch:` 之后插入；
- *     无 `patch:`→先追加 `patch:` 再插入（精确复刻 sed 行为）。
+ *     无 `patch:`→先追加 `patch:` 再插入。
  *   - 皮肤 ID/名称的唯一事实源 = 本文件的 SKIN_IDS / SKIN_NAMES 常量表
- *     （由原 rime_ice.sh:210-222 的 skin_ids / skin_names 忠实迁移而来）。
+ *     （两者顺序严格一一对应）。
  */
 
 import fs from 'node:fs';
@@ -32,22 +31,22 @@ const NET_TIMEOUT = 1_800_000;
 const PLUM_GIT_URL = 'https://github.com/rime/plum.git';
 
 // ---------------------------------------------------------------------------
-// 常量表（唯一事实源：本文件；由原 rime_ice.sh:123-131 方案 / 209-223 皮肤 忠实迁移）
+// 常量表（唯一事实源：本文件）
 // ---------------------------------------------------------------------------
 
-/** 8 个输入方案 id（rime_ice.sh:123-127） */
+/** 8 个输入方案 id */
 const SCHEME_IDS = Object.freeze([
   'rime_ice', 'double_pinyin', 'double_pinyin_flypy', 'double_pinyin_mspy',
   'double_pinyin_sogou', 'double_pinyin_abc', 'double_pinyin_jiajia',
   'double_pinyin_ziguang',
 ]);
-/** 8 个输入方案名称（rime_ice.sh:128-131，顺序与 id 一致） */
+/** 8 个输入方案名称（顺序与 id 一致） */
 const SCHEME_NAMES = Object.freeze([
   '雾凇拼音（全拼）', '自然码双拼', '小鹤双拼', '微软双拼', '搜狗双拼',
   '智能ABC双拼', '拼音加加双拼', '紫光双拼',
 ]);
 
-/** 22 款皮肤 id（rime_ice.sh:210-214） */
+/** 22 款皮肤 id */
 const SKIN_IDS = Object.freeze([
   'purity_of_form_custom', 'native', 'aqua', 'azure', 'luna',
   'ink', 'lost_temple', 'dark_temple', 'psionics', 'purity_of_form',
@@ -56,9 +55,9 @@ const SKIN_IDS = Object.freeze([
   'solarized_dark', 'retro_green', 'retro_orange',
 ]);
 /**
- * 22 款皮肤名称（rime_ice.sh:216-222，顺序与 id 一致，**逐字照搬**）。
- * 注：`星際我爭霸`(第 12 项) 为原脚本中的错别字（应为"星際爭霸"），此处保留原样，
- * 以保证与 rime_ice.sh 的 skin_names 完全一致，属于「原脚本依据」的忠实迁移。
+ * 22 款皮肤名称（顺序与 id 严格一一对应）。
+ * 注：`星際我爭霸`（第 12 项）是历史遗留的错别字（应为"星際爭霸"），保留原样，
+ * 以免与既有用户已见到的名称不一致。
  */
 const SKIN_NAMES = Object.freeze([
   '純粹的形式／Purity of Form Custom', '系統配色', '碧水／Aqua', '青天／Azure',
@@ -69,7 +68,7 @@ const SKIN_NAMES = Object.freeze([
   '曬經・日／Solarized Light', '曬經・月／Solarized Dark', '綠色熒光屏', '琥珀色熒光屏',
 ]);
 
-/** 4 种布局（rime_ice.sh:240-252 的 set_appearance 映射） */
+/** 4 种布局 */
 const LAYOUTS = Object.freeze([
   { index: 1, layout: 'stacked', orientation: 'horizontal', label: '竖向候选 + 水平文字（默认）' },
   { index: 2, layout: 'linear', orientation: 'horizontal', label: '横向候选 + 水平文字' },
@@ -123,7 +122,7 @@ function unquote(s) {
 
 /**
  * 剥离行内注释：只删除「行内空白 + #」起的尾部注释，保留作为颜色字面量前缀的 `#`。
- * 覆盖 §3.9 规则 4（`value.split('#')[0]`）的意图，同时对 `#RRGGBB` 形式更安全。
+ * 覆盖「按 # 截断取值」的意图，同时对 `#RRGGBB` 形式更安全。
  */
 function stripInlineComment(v) {
   return String(v == null ? '' : v).replace(/\s#.*$/, '').trim();
@@ -141,7 +140,7 @@ function stripInlineComment(v) {
  * @param {string} raw
  * @returns {{hex:string, alpha:number, valid:boolean}}
  */
-export function normalizeColor(raw) {
+function normalizeColor(raw) {
   const INVALID = { hex: '#CCCCCC', alpha: 1, valid: false };
   if (raw === null || raw === undefined) return { ...INVALID };
   const s = unquote(stripInlineComment(raw));
@@ -170,7 +169,7 @@ export function normalizeColor(raw) {
  * @param {string} text
  * @returns {Map<string, {name:string, colors:(Object|null)}>}
  */
-export function parseSquirrelSchemes(text) {
+function parseSquirrelSchemes(text) {
   const map = new Map();
   const lines = String(text == null ? '' : text).split(/\r?\n/);
   let inSchemes = false;
@@ -225,7 +224,7 @@ function resolveColors(raw) {
  * 读取 22 款皮肤（兜底链：squirrel.yaml → build/squirrel.yaml → 降级），**永不抛错**。
  * @returns {{schemes:Array<{id:string,name:string,colors:Object|null,hasColors:boolean}>, source:'squirrel'|'build'|'degraded'}}
  */
-export function readSkins() {
+function readSkins() {
   const tryParse = (file) => {
     const text = readTextSafe(file);
     if (text === null) return null;
@@ -249,14 +248,14 @@ export function readSkins() {
 // ---------------------------------------------------------------------------
 
 /**
- * 精确复刻 rime_ice.sh 的 patch_yaml：命中 `^\s*<key>:` 则原地替换该行整行值，
+ * patch_yaml：命中 `^\s*<key>:` 则原地替换该行整行值，
  * 否则在 `^patch:` 行之后插入；无 `patch:` 行则先追加 `patch:`。
  * @param {string} text
  * @param {string} key
  * @param {string} value
  * @returns {string}
  */
-export function patchYaml(text, key, value) {
+function patchYaml(text, key, value) {
   let lines = String(text == null ? '' : text).split('\n');
   if (lines.length === 1 && lines[0] === '') lines = []; // 空文件：不留前导空行
   const re = new RegExp(`^(\\s*)${escapeRe(key)}:`);
@@ -285,13 +284,13 @@ function readCurrentAppearance() {
 }
 
 /**
- * 从 YAML 文本中解析第一个 `- schema: X` 列表项（纯函数，可单测）。
+ * 从 YAML 文本中解析第一个 `- schema: X` 列表项（纯函数）。
  * 用于 schema_list：build/default.yaml 是部署后的编译结果（真实生效），
  * default.custom.yaml 是 patch 源（兼容 `patch:` 与 `__patch:`/Rx 两种格式）。
  * @param {string} text
  * @returns {string|null}
  */
-export function parseFirstSchema(text) {
+function parseFirstSchema(text) {
   const m = /^[ \t]*-[ \t]*schema:[ \t]*["']?([\w-]+)/m.exec(String(text == null ? '' : text));
   return m ? m[1] : null;
 }
@@ -324,12 +323,12 @@ function readGrammarModels() {
 }
 
 /**
- * 解析 rime_ice.dict.yaml 里的 `version: "YYYY-MM-DD"`（纯函数，可单测）。
+ * 解析 rime_ice.dict.yaml 里的 `version: "YYYY-MM-DD"`（纯函数）。
  * 上游（iDvel/rime-ice）在每次词库更新时同步该版本号，可直接对比判断「词库是否有新版本」。
  * @param {string} text
  * @returns {string|null}
  */
-export function parseDictVersion(text) {
+function parseDictVersion(text) {
   const m = /^[ \t]*version:[ \t]*["']?(\d{4}-\d{2}-\d{2})["']?[ \t]*(?:#.*)?$/m.exec(String(text == null ? '' : text));
   return m ? m[1] : null;
 }
@@ -338,8 +337,8 @@ export function parseDictVersion(text) {
 // 动作辅助
 // ---------------------------------------------------------------------------
 
-const netPolicy = (p) => ({ auto: 'auto', direct: 'direct_first', proxy: 'proxy_first' }[String((p && p.channel) || '')] || 'proxy_first'); // params.channel 覆盖；缺省 proxy_first（§3.7）
-/** 走网络通道执行（默认 proxy_first，复刻 rime_ice.sh；可由 params.channel 覆盖）。 */
+const netPolicy = (p) => ({ auto: 'auto', direct: 'direct_first', proxy: 'proxy_first' }[String((p && p.channel) || '')] || 'proxy_first'); // params.channel 覆盖；缺省 proxy_first
+/** 走网络通道执行（默认 proxy_first，可由 params.channel 覆盖）。 */
 async function runNet(ctx, desc, bin, args, extra = {}) {
   const res = await ctx.exec.runWithChannel(netPolicy(ctx.params), desc, bin, args, {
     timeoutMs: NET_TIMEOUT,
@@ -350,14 +349,14 @@ async function runNet(ctx, desc, bin, args, extra = {}) {
   return res;
 }
 
-/** 检查 git 可用（rime_ice.sh:53-56）。 */
+/** 检查 git 可用。 */
 async function requireGit(ctx) {
   const res = await ctx.exec.run('git', ['--version'], { noMirror: true, timeoutMs: 15_000 });
   if (res.code !== 0) throw new AppError(ERR.ENV_MISSING, '未找到 git，请先安装 git');
   ctx.log('ok', `Git: ${res.stdout.trim()}`);
 }
 
-/** ensure_plum：已存在则 pull，否则 clone（rime_ice.sh:95-103）。 */
+/** ensure_plum：已存在则 pull，否则 clone。 */
 async function ensurePlum(ctx) {
   if (paths.exists(paths.PLUM_DIR)) {
     ctx.log('info', 'plum 已存在，正在更新...');
@@ -382,7 +381,7 @@ async function runRimeInstall(ctx, recipe) {
   return res;
 }
 
-/** deploy_rime：存在可执行则 `Squirrel --reload`，否则提示手动重新部署（rime_ice.sh:59-91）。 */
+/** deploy_rime：存在可执行则 `Squirrel --reload`，否则提示手动重新部署。 */
 async function deployRime(ctx) {
   if (!paths.exists(paths.SQUIRREL_BIN)) {
     ctx.log('warn', '未找到 Squirrel 可执行文件，请手动重新部署（点击菜单栏「重新部署」）');
@@ -544,7 +543,7 @@ function grammarDownloadStep() {
 const DEPLOY_STEP = { id: 'deploy', title: '重新部署', run: async (ctx) => { await deployRime(ctx); } };
 
 // ---------------------------------------------------------------------------
-// 动作定义（§3.7 表）
+// 动作定义
 // ---------------------------------------------------------------------------
 const actions = {
   /** 安装 / 更新词库：先判断本地是否已安装——
@@ -642,14 +641,14 @@ const RIME_ICE_DICT_ATOMS = [
 ];
 
 /**
- * 解析 Atom feed 第一条 <entry> 的 updated/title（纯函数，可单测）。
+ * 解析 Atom feed 第一条 <entry> 的 updated/title（纯函数）。
  * 注意：① <feed> 根节点自身也有 <updated>，必须锚定 <entry> 内的；
  *      ② GitHub 的 entry 里 <title> 在 <updated> **之前**，不能假设顺序——
  *         先截取整块 <entry>…</entry> 再在块内分别提取。
  * @param {string} xml
  * @returns {{date: string, title: string}|null}
  */
-export function parseAtomLatest(xml) {
+function parseAtomLatest(xml) {
   const entry = /<entry>([\s\S]*?)<\/entry>/.exec(String(xml == null ? '' : xml));
   if (!entry) return null;
   const d = /<updated>([^<]+)<\/updated>/.exec(entry[1]);
@@ -738,8 +737,3 @@ export default {
     upstream: queryUpstream,
   },
 };
-
-// 供单测使用（隔离 HOME 下验证写入/移除/检测逻辑）
-// SKIN_IDS 一并导出：原 shell/rime_ice.sh 移除后，它是 22 款皮肤清单的唯一事实源，
-// 单测用它校验真实 squirrel.yaml 的方案集合与顺序。
-export { SKIN_IDS, grammarCustomPath, readGrammarApplied, applyGrammarPatch, removeGrammarPatch, GRAMMAR_PATCH_TEXT };
