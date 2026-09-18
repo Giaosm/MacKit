@@ -484,6 +484,9 @@ async function showHistory(h) {
 }
 
 // ============================== 服务状态 ==============================
+// 「服务已关闭」遮罩期间的快速探测定时器（常规轮询 15s，对「刚被重新拉起」来说太慢）
+let veilPollTimer = null;
+
 function setService(level, text) {
   dom.serviceStatus.className = `service-status is-${level}`;
   dom.serviceText.textContent = text;
@@ -491,6 +494,11 @@ function setService(level, text) {
 async function pollHealth() {
   try {
     const d = await api('GET', '/api/health');
+    // 服务回来了，页面却还停在「服务已关闭」遮罩上 —— 说明用户点了关闭服务后，
+    // 又从启动台/Dock 把 MacKit 打开了，而浏览器复用的就是这个旧标签页（启动器会优先
+    // 聚焦已打开同一地址的标签）。页面自己不会醒，这里推一把重载回正常界面。
+    // 地址栏里的 hash 会保留，视图不丢。
+    if (!dom.shutdownVeil.hidden) { location.reload(); return; }
     state.port = d.port;
     if (d.port && d.port !== DEFAULT_PORT) setService('warn', `服务运行中 · 127.0.0.1:${d.port}（${DEFAULT_PORT} 被占用，已顺延）`);
     else setService('ok', `服务运行中 · 127.0.0.1:${d.port || DEFAULT_PORT}`);
@@ -514,6 +522,9 @@ async function shutdown() {
   }
   try { await api('POST', '/api/shutdown'); } catch { /* 服务可能已退出 */ }
   dom.shutdownVeil.hidden = false;
+  // 用户很可能马上又从启动台把 MacKit 点开，而浏览器复用的正是这个标签页。
+  // 常规轮询 15s 太慢（会让人以为点了没反应），遮罩期间把探测间隔压到 2s。
+  if (!veilPollTimer) veilPollTimer = setInterval(pollHealth, 2000);
 }
 
 // ============================== 路由 + 视图注册 ==============================
