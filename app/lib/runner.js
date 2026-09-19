@@ -1,7 +1,9 @@
 /**
  * MacKit · 任务调度层
  *
- *   - 全局串行队列：同一时刻只允许 1 个任务（规避 brew 并发抢锁）
+ *   - 按 lane 分区的串行队列（设计 §5.2）：同一 lane 内串行、不同 lane 间并行。
+ *     default lane = 现有 7 个模块（行为不变）；music lane = 音乐下载/安装；music-search lane = 搜索会话。
+ *     这样既保住 brew 串行（不抢 index.lock），又让音乐下载可与其它任务并行。
  *   - Step 状态机：pending → running → ok/fail/skip/cancelled
  *   - SSE 广播：单一来源在后端（内存环形缓冲 + 落盘）
  *   - 取消：AbortSignal → exec.js 侧 SIGTERM→等 3s→SIGKILL；未开始步骤置 skip；不回滚
@@ -16,18 +18,34 @@ import crypto from 'node:crypto';
 import * as store from './store.js';
 import * as exec from './exec.js';
 
-/** 内存日志环形缓冲上限 */
 const RING_MAX = 2000;
-/** 单步默认超时（600s） */
 const DEFAULT_STEP_TIMEOUT_MS = exec.DEFAULT_TIMEOUT_MS;
-/** 内存中保留的最近任务数（内存裁剪用） */
-const MEMORY_KEEP = 60;
+/** 内存中保留的最近任务数（内存裁剪用；对外 listTasks 上限 TASKS_LIST_KEEP，落盘历史另有 HISTORY_KEEP=10） */
+const MEMORY_KEEP = 10;
+/** listTasks 对外返回的最大条数（只回最新）。 */
+const TASKS_LIST_KEEP = 10;
 
 /** @type {Map<string, any>} */
 const records = new Map();
-const queue = [];
-let running = false;
-let currentId = null;
+
+// ------------------------------ lane 分区队列（设计 §5.2） ------------------------------
+// 每个 lane 有各自独立的 queue / running / currentId：**同一 lane 内串行、不同 lane 间并行**。
+//   · default lane = 现有 7 个模块（不传 lane 即落这里，行为 100% 不变）；
+//   · music lane  = 音乐模块的下载 / 安装等写任务；
+//   · music-search lane = 音乐搜索会话的子进程（独立于 music lane，取消下载时不误杀）。
+// brew 抢锁安全：只有 default lane 会跑 brew，且 default lane 内部仍严格串行 ⇒ 任意时刻
+// 至多 1 个 brew 进程，index.lock 不会争用；music lane 不调用 brew，两者无共享资源。
+const DEFAULT_LANE = 'default';
+/** @type {Map<string, {queue:string[], running:boolean, currentId:string|null}>} */
+const LANES = new Map();
+
+/** 取（必要时创建）指定 lane 的状态槽；name 缺省落 DEFAULT_LANE。 */
+function lane(name) {
+  const n = typeof name === 'string' && name ? name : DEFAULT_LANE;
+  let l = LANES.get(n);
+  if (!l) { l = { queue: [], running: false, currentId: null }; LANES.set(n, l); }
+  return l;
+}
 
 // ------------------------------ 序号 #N ------------------------------
 // 注意：该编号已不再作为用户可见编号（前端改为展示相对时间），仅作内部排序 / 溯源用。
@@ -74,31 +92,44 @@ function snapshotTask(task) {
 // ------------------------------ 上下文构造 ------------------------------
 /** 构造 steps(params, ctx) 阶段的基础上下文。 */
 function makeBaseCtx(rec) {
+  // 把本任务的 lane 注入每一条 exec 出口，使 steps() 阶段发起的子进程也被正确打标
+  // （设计 §5.2）。显式传入的 opts.lane 优先级更高，允许模块在特殊场景覆盖。
+  const boundExec = {
+    ...exec,
+    run: (bin, args, opts = {}) => exec.run(bin, args, { lane: rec.lane, ...opts }),
+    runWithChannel: (policy, desc, bin, args, opts = {}) => exec.runWithChannel(policy, desc, bin, args, { lane: rec.lane, ...opts }),
+    osascriptAdmin: (shellCmd, opts = {}) => exec.osascriptAdmin(shellCmd, { lane: rec.lane, ...opts }),
+    openInFinder: (dir, opts = {}) => exec.openInFinder(dir, { lane: rec.lane, ...opts }),
+  };
   return {
     params: rec.task.params,
     taskId: rec.task.id,
+    lane: rec.lane,
     signal: rec.controller.signal,
     log: (level, text) => pushLog(rec, level, text),
     setChannel: () => { /* steps() 阶段无当前步骤，忽略 */ },
-    exec,
+    exec: boundExec,
   };
 }
 
 /**
  * 构造单步执行上下文。
  * ★ 注入到 ctx.exec 的执行接口会把本步 AbortSignal **默认绑定**，
- *   即使模块调用 exec.run 时忘记传 signal，取消 / 超时依然能终止子进程。
+ *   即使模块调用 exec.run 时忘记传 signal，取消 / 超时依然能终止子进程；
+ *   并同时注入本任务的 lane，使下载 / 安装子进程落在 music lane（设计 §5.2）。
  */
 function makeStepCtx(rec, step, stepSignal) {
   const boundExec = {
     ...exec,
-    run: (bin, args, opts = {}) => exec.run(bin, args, { signal: stepSignal, ...opts }),
-    runWithChannel: (policy, desc, bin, args, opts = {}) => exec.runWithChannel(policy, desc, bin, args, { signal: stepSignal, ...opts }),
-    osascriptAdmin: (shellCmd, opts = {}) => exec.osascriptAdmin(shellCmd, { signal: stepSignal, ...opts }),
+    run: (bin, args, opts = {}) => exec.run(bin, args, { signal: stepSignal, lane: rec.lane, ...opts }),
+    runWithChannel: (policy, desc, bin, args, opts = {}) => exec.runWithChannel(policy, desc, bin, args, { signal: stepSignal, lane: rec.lane, ...opts }),
+    osascriptAdmin: (shellCmd, opts = {}) => exec.osascriptAdmin(shellCmd, { signal: stepSignal, lane: rec.lane, ...opts }),
+    openInFinder: (dir, opts = {}) => exec.openInFinder(dir, { signal: stepSignal, lane: rec.lane, ...opts }),
   };
   return {
     params: rec.task.params,
     taskId: rec.task.id,
+    lane: rec.lane,
     signal: stepSignal,
     log: (level, text) => pushLog(rec, level, text),
     setChannel: (c) => { step.channel = c; },
@@ -108,7 +139,6 @@ function makeStepCtx(rec, step, stepSignal) {
 
 /**
  * 按步骤终态汇总 `{ ok, fail, skip }`（skip 含 cancelled）——全项目唯一口径。
- * runner 的终态判定与各模块的 finalize（brew / unseal）原先各写一份同样的循环（2026-09-18 收敛）。
  * @param {Array<{status:string}>} steps
  * @returns {{ok:number, fail:number, skip:number}}
  */
@@ -128,18 +158,21 @@ function doneSteps(steps) {
 }
 
 // ------------------------------ 提交与队列 ------------------------------
-/** 提交一个任务（全局串行排队），返回任务快照。 */
+/** 提交一个任务（按 lane 排队：同 lane 串行、跨 lane 并行），返回任务快照。 */
 export function submit(spec) {
   const { module, action, params = {}, actionDef } = spec;
   if (!actionDef || typeof actionDef.steps !== 'function') {
     throw new exec.AppError(exec.ERR.NOT_FOUND, '未知动作，无法创建任务');
   }
+  // 缺省 lane 落 default：现有 7 个模块调用 submit() 不传 lane，行为与改动前完全等价。
+  const laneName = typeof spec.lane === 'string' && spec.lane ? spec.lane : DEFAULT_LANE;
 
   const task = {
     id: newTaskId(),
     seq: seqCounter++,
     module,
     action,
+    lane: laneName,
     title: actionDef.title || action,
     params: params || {},
     status: 'pending',
@@ -157,30 +190,32 @@ export function submit(spec) {
 
   const rec = {
     task, actionDef, logs: [], seq: 0,
+    lane: laneName,
     emitter: new EventEmitter(),
     controller: new AbortController(),
     finished: false, started: false,
   };
   rec.emitter.setMaxListeners(0);
   records.set(task.id, rec);
-  queue.push(task.id);
-  pump();
+  lane(laneName).queue.push(task.id);
+  pump(laneName);
   return snapshotTask(task);
 }
 
-/** 队列泵：串行取下一个未完成任务执行。 */
-function pump() {
-  if (running) return;
-  while (queue.length > 0) {
-    const id = queue.shift();
+/** 队列泵：在指定 lane 内串行取下一个未完成任务执行。 */
+function pump(laneName) {
+  const L = lane(laneName);
+  if (L.running) return;
+  while (L.queue.length > 0) {
+    const id = L.queue.shift();
     const rec = records.get(id);
     if (!rec || rec.finished) continue;
-    running = true;
-    currentId = id;
+    L.running = true;
+    L.currentId = id;
     runTask(rec).catch(() => { /* runTask 内部已兜底 */ }).finally(() => {
-      running = false;
-      currentId = null;
-      pump();
+      L.running = false;
+      L.currentId = null;
+      pump(laneName);
     });
     return;
   }
@@ -329,7 +364,6 @@ function finishRecord(rec) {
   pruneMemory();
 }
 
-/** 内存裁剪：保留最近 MEMORY_KEEP 个任务。 */
 function pruneMemory() {
   if (records.size <= MEMORY_KEEP) return;
   const finished = [...records.values()].filter((r) => r.finished).sort((a, b) => (a.task.createdAt || 0) - (b.task.createdAt || 0));
@@ -353,7 +387,7 @@ export function getTask(taskId) {
 /** 列出任务（内存中的运行中 + 最近）；内存为空时回落最近历史，供刷新 / 重启恢复展示。 */
 export function listTasks() {
   const mem = [...records.values()].map((r) => snapshotTask(r.task)).sort((a, b) => b.createdAt - a.createdAt);
-  if (mem.length >= 20) return mem.slice(0, 20);
+  if (mem.length >= TASKS_LIST_KEEP) return mem.slice(0, TASKS_LIST_KEEP);
   const seen = new Set(mem.map((t) => t.id));
   const extra = [];
   try {
@@ -366,7 +400,7 @@ export function listTasks() {
         createdAt: h.startedAt || 0, startedAt: h.startedAt ?? null, endedAt: h.endedAt ?? null,
         error: null, logPath: store.logFilePath(h.id), cancellable: false,
       });
-      if (mem.length + extra.length >= 20) break;
+      if (mem.length + extra.length >= TASKS_LIST_KEEP) break;
     }
   } catch { /* ignore */ }
   return mem.concat(extra);
@@ -390,7 +424,6 @@ export function subscribe(taskId, handler) {
   return () => { try { rec.emitter.off('event', wrapped); } catch { /* ignore */ } };
 }
 
-/** 任务是否处于终态。 */
 export function isFinished(taskId) {
   const rec = records.get(taskId);
   if (rec) return rec.finished;
@@ -418,11 +451,23 @@ export function cancel(taskId) {
   return true;
 }
 
-/** 是否有任务正在执行。 */
-export function isBusy() { return running; }
+/** 是否有**任一** lane 正在执行任务（waitForIdle 依赖它）。 */
+export function isBusy() { return [...LANES.values()].some((l) => l.running); }
 
-/** 当前运行任务 id。 */
-export function currentTaskId() { return currentId; }
+export function isBusyLane(name) { return lane(name).running; }
+
+/**
+ * 当前运行任务 id（default lane）。
+ * ★ 保持向后兼容：原语义即「全局唯一运行任务 id」，现在等价于 default lane 的当前任务。
+ */
+export function currentTaskId() { return lane(DEFAULT_LANE).currentId; }
+
+export function currentTaskIdLane(name) { return lane(name).currentId; }
+
+/** 所有 lane 的当前运行任务 id（不含空槽），供 gracefulShutdown 逐任务取消。 */
+export function activeTaskIds() {
+  return [...LANES.values()].map((l) => l.currentId).filter((id) => typeof id === 'string' && id.length > 0);
+}
 
 /**
  * 立即整组强杀当前所有存活子进程（SIGKILL，不等宽限期）。
@@ -434,3 +479,11 @@ export function currentTaskId() { return currentId; }
  * @returns {number} 实际尝试发信号的子进程数
  */
 export function forceKill() { return exec.killAllNow('SIGKILL'); }
+
+/**
+ * 只强杀指定 lane 的存活子进程（SIGKILL）。
+ * 用途：音乐模块「取消全部下载」时只清 music lane，不动 music-search lane 的搜索子进程。
+ * @param {string} name
+ * @returns {number}
+ */
+export function forceKillLane(name) { return exec.killLaneNow(name, 'SIGKILL'); }

@@ -29,8 +29,7 @@ const CACHE_KEY = 'env-snapshot';
 
 const MIRRORS = Object.freeze([
   { id: 'official', label: '官方 (GitHub)', brew: '' },
-  // brew 镜像 URL 唯一来源 = exec.MIRROR_REMOTES（applyMirrorEnv 用的也是它），
-  // 原先同一组 URL 在两处各写一份，加镜像时容易漏改其中一处（2026-09-16 收敛）
+  // brew 镜像 URL 唯一来源 = exec.MIRROR_REMOTES（applyMirrorEnv 用的也是它）
   { id: 'tuna', label: '清华 TUNA', brew: exec.MIRROR_REMOTES.tuna },
   { id: 'ustc', label: '中科大 USTC', brew: exec.MIRROR_REMOTES.ustc },
   { id: 'aliyun', label: '阿里云', brew: exec.MIRROR_REMOTES.aliyun },
@@ -51,8 +50,9 @@ function mirrorLabel(id) {
 // 小工具
 // ---------------------------------------------------------------------------
 
-// 统一实现见 lib/paths.js（2026-09-16 收敛 6 份重复）
 const readTextSafe = paths.readTextSafe;
+// 本文件别名：多处 brew 快照统计使用（实现统一在 lib/paths.js）
+const nonEmptyLines = paths.lines;
 
 function normLines(text) {
   return String(text).split(/\r?\n/);
@@ -76,9 +76,6 @@ async function runQuiet(bin, args, opts = {}) {
   }
   return res;
 }
-
-// 统一实现见 lib/paths.js（2026-09-18 收敛 lineList / nonEmptyLines 两份重复）
-const nonEmptyLines = paths.lines;
 
 // ---------------------------------------------------------------------------
 // shell rc 别名解析
@@ -285,10 +282,8 @@ async function networkTest() {
 }
 
 // ---------------------------------------------------------------------------
-// git / token
+// git / token（具体读写见 lib/git.js）
 // ---------------------------------------------------------------------------
-// 具体读写已收敛到 lib/git.js（2026-09-18）：原先这里的 gitConfig / tokenExists 与
-// sysinit.safeGit、backup.runGit / readGithubCredential 属同一批逻辑的多份拷贝。
 
 // ---------------------------------------------------------------------------
 // 快照

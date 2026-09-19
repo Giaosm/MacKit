@@ -1,7 +1,7 @@
 /**
  * MacKit · 前端外壳（无框架）
  *
- *   - 单页 + 哈希路由（#/dashboard|#/brew|#/dsh|#/sysinit|#/rime|#/unseal|#/backups）
+ *   - 单页 + 哈希路由（#/dashboard|#/brew|#/dsh|#/music|#/sysinit|#/rime|#/unseal|#/backups）
  *   - 视图注册表：每个 web/views/*.js 默认导出 { id, title, mount(root, ctx), unmount?() }
  *     （侧边栏图标由本文件 NAV 提供，视图不自带 icon）
  *   - 状态单一来源在后端：本文件只做订阅/渲染，不推断任务状态
@@ -32,6 +32,8 @@ const ICON = {
   backups: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
   // DeepSeek Harness：终端窗口（dsh web / plugin 都从命令行来）
   dsh: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>',
+  // 音乐下载：双音符
+  music: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
 };
 
 /** 侧边栏导航（外壳自身定义；视图可自带 title 覆盖）。 */
@@ -39,6 +41,7 @@ const NAV = [
   { id: 'dashboard', title: '总览', icon: ICON.home },
   { id: 'brew', title: 'Homebrew 管家', icon: ICON.beer },
   { id: 'dsh', title: 'DeepSeek Harness', icon: ICON.dsh },
+  { id: 'music', title: '音乐下载', icon: ICON.music },
   { id: 'sysinit', title: '系统初始化', icon: ICON.gear },
   { id: 'rime', title: 'Rime 输入法', icon: ICON.ime },
   { id: 'unseal', title: '应用解隔离', icon: ICON.lock },
@@ -47,12 +50,13 @@ const NAV = [
 
 /**
  * ★ 视图注册表：加一行即可挂载一个新视图。
- * 7 个视图（dashboard / brew / dsh / sysinit / rime / unseal / backups）均已实现；对应文件缺失时会安全降级为"开发中"提示。
+ * 8 个视图（dashboard / brew / dsh / music / sysinit / rime / unseal / backups）均已实现；对应文件缺失时会安全降级为"开发中"提示。
  */
 const VIEW_MODULES = {
   dashboard: () => import('./views/dashboard.js'),
   brew: () => import('./views/brew.js'),
   dsh: () => import('./views/dsh.js'),
+  music: () => import('./views/music.js'),
   sysinit: () => import('./views/sysinit.js'),
   rime: () => import('./views/rime.js'),
   unseal: () => import('./views/unseal.js'),
@@ -253,7 +257,6 @@ function emptyState({ icon = '·', title, text, actions = [] }) {
 
 const kv = (k, v) => el('div', { class: 'kv' }, [el('span', { class: 'kv__k', text: k }), el('span', { class: 'kv__v' }, [v && v.nodeType ? v : String(v == null ? '—' : v)])]);
 
-/** 卡片：title + 可选状态灯 + 内容节点。 */
 function card(title, content, { light = null, extra = null } = {}) {
   const head = el('div', { class: 'card__head' }, [el('div', { class: 'card__title' }, [light ? statusLight(light) : null, title])]);
   if (extra) head.append(extra);

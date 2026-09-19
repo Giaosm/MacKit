@@ -9,8 +9,7 @@
  *      配置迁移的唯一入口是「备份中心」的 WebDAV 备份，见 lib/backup.js。）
  *
  * 本文件只使用 node:fs / node:path，不引入 child_process，也不引入 exec.js（避免循环依赖）；
- * 因此错误码以字面量给出（取值与 exec.js 的 ERR 一致），统一经 paths.mkCodedError 构造
- * （2026-09-19 起全项目只有那一份实现）。
+ * 因此错误码以字面量给出（取值与 exec.js 的 ERR 一致），统一经 paths.mkCodedError 构造。
  */
 
 import fs from 'node:fs';
@@ -18,12 +17,37 @@ import path from 'node:path';
 import * as paths from './paths.js';
 
 
-/** MacKit 配置默认值 */
-const MACKIT_DEFAULTS = Object.freeze({ defaultChannel: 'auto', autoFallback: true, autoCleanup: true, lastCheckedAt: null, version: 1 });
+const MACKIT_DEFAULTS = Object.freeze({
+  defaultChannel: 'auto', autoFallback: true, autoCleanup: true, lastCheckedAt: null, version: 1,
+  // 音乐模块（第 8 模块）配置：默认下载目录 / 命名模板 / 网络通道 / 已选音源
+  musicDownloadDir: paths.MUSIC_DEFAULT_DIR,
+  musicNameTemplate: '{歌手} - {歌名}.{ext}',
+  musicChannel: 'auto',
+  // ★ null = 从未配置（前端回落默认勾选）；[] = 用户明确清空（必须尊重，不得回落默认）
+  musicSources: null,
+  // 是否随音频同时保存歌词 .lrc（musicdl 自动旁写；false = 下载后删除旁车歌词）
+  musicSaveLyrics: true,
+  // R0 · 代理配置（v2 增量）：代理地址来源 + 自定义 HTTP / SOCKS5 地址（均 `host:port`，不带 scheme）
+  // ★ 与上面 4 个键同口径：**默认值 / 读取 / 写入三处缺一不可**，否则「保存了但没生效」。
+  musicProxySource: 'homebrew',
+  musicProxyHttp: '',
+  musicProxySocks5: '',
+});
+/** 音乐模块可选的网络通道策略（auto = 直连，必要时由用户手动切代理） */
+const MUSIC_CHANNELS = Object.freeze(['auto', 'direct', 'proxy']);
+/** 音乐模块代理地址来源（v2）：跟随 Homebrew 或自定义 */
+const MUSIC_PROXY_SOURCES = Object.freeze(['homebrew', 'custom']);
+/**
+ * 代理地址校验正则：`host:port`。
+ * host 允许 IPv4 / 主机名（`[A-Za-z0-9.\-]+`），port 为 1–5 位数字（范围另判 1–65535）。
+ * 该形状天然拒绝 `://`、空格、路径、查询串、中文、回车等非法输入（design v2 §A.1 / Q1）。
+ */
+const PROXY_ADDR_RE = /^([A-Za-z0-9.\-]+):(\d{1,5})$/;
+/** 非法代理地址时的统一可读提示（前端直接 toast 这句）。 */
+const PROXY_ADDR_HINT = '请填写 主机:端口，例如 127.0.0.1:7897，不要带 http://';
 const MIRROR_IDS = Object.freeze(['official', 'tuna', 'ustc', 'aliyun', 'tencent']);
 const CHANNEL_POLICIES = Object.freeze(['direct_first', 'proxy_first', 'auto']);
 
-/** 保留策略常量 */
 const LOG_KEEP_TASKS = 50;
 const LOG_KEEP_DAYS = 30;
 /** 任务历史保留条数（用户要求：侧边栏「任务历史」最多只留最近 10 次） */
@@ -31,7 +55,6 @@ const HISTORY_KEEP = 10;
 
 // ---------------------------- 通用工具 ----------------------------
 function safeStat(p) { try { return fs.statSync(p); } catch { return null; } }
-// 统一实现见 lib/paths.js（2026-09-16 收敛 6 份重复）
 const readTextSafe = paths.readTextSafe;
 function readJsonSafe(p, fallback) {
   const text = readTextSafe(p);
@@ -49,11 +72,23 @@ function writeJsonSafe(p, obj) {
   try {
     paths.ensureDirs();
     fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
-    fs.renameSync(tmp, p); // 同目录内 rename 是原子的
+    try {
+      fs.renameSync(tmp, p); // 同目录内 rename 是原子的（首选路径）
+    } catch (err) {
+      // 实测：脱离终端的常驻进程在这台 macOS 上 rename 会被拒（EPERM，疑似
+      // provenance/TCC 策略），但原地覆盖写允许 —— 降级为直接写目标文件。
+      // 代价只是丢失「中途崩溃不留半截文件」的原子性保证，可接受。
+      if (err && err.code === 'EPERM') {
+        fs.writeFileSync(p, JSON.stringify(obj, null, 2), 'utf8');
+        try { fs.rmSync(tmp, { force: true }); } catch { /* 已降级，tmp 仅是多余副本 */ }
+        return true;
+      }
+      throw err;
+    }
     return true;
   } catch (err) {
     try { fs.rmSync(tmp, { force: true }); } catch { /* 清理失败不影响报错 */ }
-    throw paths.mkCodedError(E_IO, '写入 JSON 文件失败', `${p}: ${err && err.message}`);
+    throw paths.mkCodedError('IO_ERROR', '写入 JSON 文件失败', `${p}: ${err && err.message}`);
   }
 }
 /**
@@ -179,12 +214,41 @@ export function writeBrewgo(v) {
   try {
     fs.writeFileSync(target, out.join('\n') + '\n', 'utf8');
   } catch (err) {
-    throw paths.mkCodedError(E_IO, '写入 ~/.brewgo_config 失败', String(err && err.message));
+    throw paths.mkCodedError('IO_ERROR', '写入 ~/.brewgo_config 失败', String(err && err.message));
   }
   return { httpPort, socksPort, mirror };
 }
 
 // ---------------------------- ~/.mackit/config.json ----------------------------
+
+/**
+ * `host:port` 是否为合法代理地址（Q1）：形状匹配 **且** 端口在 1–65535。
+ * @param {string} s
+ * @returns {boolean}
+ */
+export function isValidProxyAddr(s) {
+  const m = PROXY_ADDR_RE.exec(String(s == null ? '' : s));
+  if (!m) return false;
+  const port = Number.parseInt(m[2], 10);
+  return port >= 1 && port <= 65535;
+}
+
+/**
+ * 归一化代理地址（**唯一校验出口**，design v2 §A.1）：
+ *   · 空 / 全空白       → `''`（表示该协议不启用）；
+ *   · 合法 `host:port`  → 原样（已 trim）返回；
+ *   · 非空但非法        → `''`（调用方按「不启用」处理；**写入口**另有抛错校验见 writeMackit）。
+ *
+ * 所有代理派生（resolveProxy / resolveInstallProxyEnv / 前端回显）都从这里取值，
+ * 杜绝各处自拼代理字符串。
+ * @param {unknown} raw
+ * @returns {string} 归一化后的 `host:port`，或 `''`
+ */
+export function normalizeProxyAddr(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (s === '') return '';
+  return isValidProxyAddr(s) ? s : '';
+}
 
 /** 读取 MacKit 专属配置（缺失/损坏时回落默认值）。 */
 export function readMackit() {
@@ -195,6 +259,20 @@ export function readMackit() {
     // 升级完成后是否自动清理缓存：默认 true（对齐用户要求「默认开」）
     autoCleanup: typeof raw.autoCleanup === 'boolean' ? raw.autoCleanup : MACKIT_DEFAULTS.autoCleanup,
     lastCheckedAt: typeof raw.lastCheckedAt === 'number' ? raw.lastCheckedAt : null,
+    // 音乐模块。缺失/类型不符一律回落默认值（缺省下载目录、命名模板、通道、音源）。
+    musicDownloadDir: typeof raw.musicDownloadDir === 'string' && raw.musicDownloadDir.trim()
+      ? raw.musicDownloadDir : MACKIT_DEFAULTS.musicDownloadDir,
+    musicNameTemplate: typeof raw.musicNameTemplate === 'string' && raw.musicNameTemplate.trim()
+      ? raw.musicNameTemplate : MACKIT_DEFAULTS.musicNameTemplate,
+    musicChannel: MUSIC_CHANNELS.includes(raw.musicChannel) ? raw.musicChannel : MACKIT_DEFAULTS.musicChannel,
+    musicSources: Array.isArray(raw.musicSources)
+      ? raw.musicSources.filter((s) => typeof s === 'string' && s.length > 0) : MACKIT_DEFAULTS.musicSources,
+    musicSaveLyrics: raw.musicSaveLyrics !== false,
+    // R0 · 代理三键（容错读出）：枚举外回落 homebrew；地址经 normalizeProxyAddr 归一（非法即视为空）。
+    musicProxySource: MUSIC_PROXY_SOURCES.includes(raw.musicProxySource)
+      ? raw.musicProxySource : MACKIT_DEFAULTS.musicProxySource,
+    musicProxyHttp: normalizeProxyAddr(raw.musicProxyHttp),
+    musicProxySocks5: normalizeProxyAddr(raw.musicProxySocks5),
     version: 1,
   };
 }
@@ -217,6 +295,48 @@ export function writeMackit(patch = {}) {
     next.autoCleanup = !!patch.autoCleanup;
   }
   if (patch.lastCheckedAt !== undefined) next.lastCheckedAt = typeof patch.lastCheckedAt === 'number' ? patch.lastCheckedAt : null;
+  // 音乐模块配置（缺失字段 = 不改写；空串回落默认值）
+  if (patch.musicDownloadDir !== undefined) {
+    const v = String(patch.musicDownloadDir || '').trim();
+    next.musicDownloadDir = v || MACKIT_DEFAULTS.musicDownloadDir;
+  }
+  if (patch.musicNameTemplate !== undefined) {
+    const v = String(patch.musicNameTemplate || '').trim();
+    next.musicNameTemplate = v || MACKIT_DEFAULTS.musicNameTemplate;
+  }
+  if (patch.musicChannel !== undefined && MUSIC_CHANNELS.includes(patch.musicChannel)) {
+    next.musicChannel = patch.musicChannel;
+  }
+  if (patch.musicSources !== undefined && Array.isArray(patch.musicSources)) {
+    next.musicSources = patch.musicSources.filter((s) => typeof s === 'string' && s.length > 0);
+  }
+  if (patch.musicSaveLyrics !== undefined && typeof patch.musicSaveLyrics === 'boolean') {
+    next.musicSaveLyrics = patch.musicSaveLyrics;
+  }
+  // R0 · 代理三键（v2）：写入 + 校验。**仅当本次 patch 含任一代理字段时才校验**，
+  // 避免「保存下载目录」这类无关 patch 因存量非法值被误拦。
+  if (patch.musicProxySource !== undefined || patch.musicProxyHttp !== undefined || patch.musicProxySocks5 !== undefined) {
+    // 代理来源：枚举内才改，枚举外保持原值（与 musicChannel 同口径）
+    const source = (patch.musicProxySource !== undefined && MUSIC_PROXY_SOURCES.includes(patch.musicProxySource))
+      ? patch.musicProxySource : cur.musicProxySource;
+    // 地址：本次给了就用本次的（trim），否则沿用原值
+    const http = patch.musicProxyHttp !== undefined ? String(patch.musicProxyHttp == null ? '' : patch.musicProxyHttp).trim() : cur.musicProxyHttp;
+    const socks = patch.musicProxySocks5 !== undefined ? String(patch.musicProxySocks5 == null ? '' : patch.musicProxySocks5).trim() : cur.musicProxySocks5;
+    // 逐字段校验：非空但非法 → 抛 PARSE_FAILED（→ HTTP 422），**不写盘**
+    if (http !== '' && !isValidProxyAddr(http)) {
+      throw paths.mkCodedError('PARSE_FAILED', PROXY_ADDR_HINT, `musicProxyHttp=${http}`);
+    }
+    if (socks !== '' && !isValidProxyAddr(socks)) {
+      throw paths.mkCodedError('PARSE_FAILED', PROXY_ADDR_HINT, `musicProxySocks5=${socks}`);
+    }
+    // 跨字段：选「自定义」时两址皆空 → 拦截（A8）
+    if (source === 'custom' && http === '' && socks === '') {
+      throw paths.mkCodedError('PARSE_FAILED', '选择「自定义」代理时，请至少填写一个协议地址（HTTP 或 SOCKS5）', '');
+    }
+    next.musicProxySource = source;
+    next.musicProxyHttp = http;
+    next.musicProxySocks5 = socks;
+  }
   next.version = 1;
 
   writeJsonSafe(paths.CONFIG_JSON, next);
@@ -230,7 +350,6 @@ export function writeMackit(patch = {}) {
 // 任何未知键都会在下一次改设置时被静默丢弃；独立文件彻底避开这个坑，且无需改动既有语义。
 // 文件权限 600、密码明文（与既有备份信封含明文 Token 的立场一致，用户已确认）。
 
-/** WebDAV 配置默认值。 */
 const WEBDAV_DEFAULTS = Object.freeze({ url: '', username: '', password: '', allowInsecureTLS: false, version: 1 });
 
 /** 读取 WebDAV 配置（缺文件/字段缺失/类型不符 → 逐字段回落默认值）。 */
@@ -305,7 +424,6 @@ export function publicWebdav() {
 
 // --------------------------- 日志（落盘）+ 历史 ---------------------------
 
-/** 日志文件路径。 */
 export function logFilePath(taskId) { return path.join(paths.LOGS_DIR, `${taskId}.log`); }
 
 /** 追加一行日志（逐行 JSON）。 */
@@ -334,7 +452,6 @@ export function readLog(taskId) {
   return out;
 }
 
-/** 历史文件路径。 */
 function historyFilePath(taskId) { return path.join(paths.HISTORY_DIR, `${taskId}.json`); }
 
 /**
@@ -403,7 +520,6 @@ export function listHistory() {
   return out;
 }
 
-/** 读取某任务完整历史。 */
 export function readHistory(taskId) {
   const t = readJsonSafe(historyFilePath(taskId), null);
   return t && typeof t === 'object' ? t : null;
@@ -411,9 +527,7 @@ export function readHistory(taskId) {
 
 /**
  * 保留策略：任务日志「最近 50 个任务 或 30 天，先到者为准」。
- *
- * ★ 只扫日志目录：历史由 writeHistory 自己收尾（那里会调 pruneHistory），
- *   原先这里再扫一遍 history，等于每次任务收尾把同一目录读两遍（2026-09-18 收敛）。
+ * ★ 只扫日志目录：历史由 writeHistory 自己收尾（那里会调 pruneHistory）。
  */
 export function pruneLogs() {
   pruneByPolicy(paths.LOGS_DIR, '.log', LOG_KEEP_TASKS);
@@ -452,14 +566,12 @@ function cachePath(key) {
   return path.join(paths.CACHE_DIR, `${safe}.json`);
 }
 
-/** 读取缓存项。 */
 export function getCached(key) {
   const obj = readJsonSafe(cachePath(key), null);
   if (!obj || typeof obj.at !== 'number') return null;
   return { value: obj.value, at: obj.at };
 }
 
-/** 写入缓存项。 */
 export function setCached(key, value) {
   paths.ensureDirs();
   writeJsonSafe(cachePath(key), { value, at: Date.now() });

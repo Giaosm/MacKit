@@ -25,7 +25,6 @@ const { ERR, AppError } = exec;
 
 /** 远端比较结果的缓存时长（10 分钟） */
 const CHECK_TTL_MS = 10 * 60 * 1000;
-/** 缓存键（落在 ~/.mackit/cache/selfupdate-check.json） */
 const CHECK_CACHE_KEY = 'selfupdate-check';
 /** 状态查询里的 fetch 超时（每个通道；runWithChannel 最多试两个通道） */
 const CHECK_FETCH_TIMEOUT_MS = 15_000;

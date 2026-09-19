@@ -42,15 +42,12 @@ const NPM_ENV = Object.freeze({
 const INSTALL_TIMEOUT_MS = 900_000;
 /** 插件市场超时（pnpm 在 profile 目录里装依赖） */
 const MARKET_TIMEOUT_MS = 600_000;
-/** 只读探测超时 */
 const PROBE_TIMEOUT_MS = 30_000;
 /** DSH 要求的最低 Node 主版本（低于则只告警，不阻断） */
 const NODE_MIN_MAJOR = 20;
 
 // ------------------------------ 小工具 ------------------------------
-/** 取命令输出的第一行非空内容。 */
 const firstLine = (res) => paths.lines(res && res.stdout)[0] || null;
-/** 取末尾若干行（报错摘要）。 */
 const tail = (text, n = 3) => String(text || '').trim().split('\n').slice(-n).join('\n');
 
 /** 「失败自动换通道」开关（与 brew 模块共用 ~/.mackit/config.json 的 autoFallback）。 */
@@ -125,11 +122,9 @@ function pnpmInvocation(prefix) {
  * 用 curl 而不是 `npm view`：后者要起一个 node 进程 + 读 npm 配置，慢一个数量级。
  */
 const REGISTRY_LATEST_URL = `https://registry.npmjs.org/${paths.DSH_PACKAGE}/latest`;
-/** 命中结果的缓存时长（12 小时） */
 const LATEST_TTL_MS = 12 * 60 * 60 * 1000;
 /** 失败结果的缓存时长（1 小时）——失败也缓存，免得每次开页面都去撞一次网络 */
 const LATEST_FAIL_TTL_MS = 60 * 60 * 1000;
-/** 缓存键（落在 ~/.mackit/cache/dsh-latest-version.json） */
 const LATEST_CACHE_KEY = 'dsh-latest-version';
 
 /**

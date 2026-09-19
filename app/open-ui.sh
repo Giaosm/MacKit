@@ -12,7 +12,13 @@
 #    所以「点几次攒几个标签」只在 Chromium 系上出现。
 #
 #  这里改成：问系统「默认浏览器是谁」→ 用 AppleScript 找**已经打开同一地址**的标签
-#    并聚焦它 → 找不到才新建。Safari 与 Chromium 系的 AppleScript 接口不同，各写一份。
+#    并聚焦它 → **顺手强制刷新一次** → 找不到才新建。Safari 与 Chromium 系的 AppleScript
+#    接口不同，各写一份。
+#
+#  ★ 为什么必须刷新（2026-09-20 踩坑）：界面是原生 JS 多文件、浏览器只在本页加载时取一次。
+#    只聚焦不刷新的话，服务端更新后旧标签里跑的还是**旧版界面代码**——用户以为「重新双击
+#    图标 = 拿到新界面」，实际什么都没变，排障时极具迷惑性。代价：刷新会丢弃页面内的
+#    未提交状态（输入框内容、进行中的搜索展示），换来「每次从图标进入都是最新界面」。
 #
 #  ★ 为什么脚本是「拼接」出来的而不是写死的 heredoc：
 #    AppleScript 里 `tell application <变量>` 在**编译期拿不到该应用的字典**，
@@ -92,6 +98,7 @@ on run argv
     if wIdx > 0 then
       set current tab of window wIdx to tab tIdx of window wIdx
       set index of window wIdx to 1
+      set URL of tab tIdx of window wIdx to target
     else
       if (count of windows) is 0 then make new document
       set URL of current tab of front window to target
@@ -124,6 +131,7 @@ on run argv
     if wIdx > 0 then
       set active tab index of window wIdx to tIdx
       set index of window wIdx to 1
+      tell tab tIdx of window wIdx to reload
     else
       if (count of windows) is 0 then make new window
       tell window 1 to make new tab with properties {URL:target}

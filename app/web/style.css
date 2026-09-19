@@ -421,3 +421,167 @@ label.check { display: inline-flex; align-items: center; gap: var(--space-2); cu
 .wvd-item { padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border); }
 .wvd-item:last-child { border-bottom: none; }
 .wvd-item__ops { flex: none; }
+
+/* ------------------------------ 音乐下载（第 8 模块增量） ------------------------------ */
+/* 复用 .card/.toolbar/.table/.badge/.diff/.field/.row/.btn/.muted；此处只补音乐专属的
+   分区容器、音源选择面板、自建结果表、下载队列与部署区。颜色一律走 CSS 变量。 */
+
+/* ① 环境条（已就绪 / 可更新） */
+.music-envbar { border-radius: var(--radius); }
+.music-envbar__row { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+.music-envbar__label { font-weight: 600; }
+.music-envbar--ok { border-left: 3px solid var(--ok); }
+.music-envbar--warn { border-left: 3px solid var(--warn); }
+.music-envbar--err { border-left: 3px solid var(--err); }
+
+/* ① 部署区（未部署 / 损坏） */
+.music-deploy { border-radius: var(--radius); }
+.music-deploy--warn { border-left: 3px solid var(--warn); }
+.music-deploy--err { border-left: 3px solid var(--err); }
+.music-deploy--ok { border-left: 3px solid var(--ok); }
+.music-deploy__head { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-3); }
+.music-deploy__title { font-weight: 600; font-size: 15px; }
+.music-deploy__desc { margin-bottom: var(--space-3); }
+.music-deploy__acts { margin-top: var(--space-4); }
+.music-cmds { margin-bottom: var(--space-3); }
+.music-notes { margin: var(--space-3) 0 0; padding-left: var(--space-5); color: var(--fg-muted); font-size: 13px; }
+.music-notes li { margin-bottom: var(--space-1); }
+.warn-text { color: var(--warn); }
+
+/* ② 搜索区 */
+.music-search-row { margin-bottom: var(--space-2); }
+.music-kw, .music-url { width: 100%; }
+/* 覆盖全局 select width:100%——每源上限选择器要与搜索框/按钮同排一行 */
+.music-persource { width: auto; flex: 0 0 auto; padding: var(--space-2); border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--fg); font: inherit; cursor: pointer; white-space: nowrap; }
+.music-search-status { min-height: 1.4em; }
+
+/* ② 音源选择面板 */
+.music-srcquick { margin-bottom: var(--space-3); }
+.music-srclist { display: flex; flex-direction: column; gap: var(--space-3); }
+.music-srcgroup { border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+.music-srcgroup__head {
+  display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-sunken); font-weight: 600;
+}
+.music-srcgroup__list {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--space-1) var(--space-3); padding: var(--space-3);
+}
+.music-srcitem { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ③ 结果区（自建表） */
+.music-table .music-col-check { width: 36px; }
+.music-caret { padding: 0 var(--space-1); min-width: 18px; }
+.music-row.is-album td { font-weight: 600; }
+.music-indent { padding-left: var(--space-5) !important; }
+.music-empty-cell { padding: var(--space-3) 0; }
+
+/* ④ 下载队列 */
+.music-queue { display: flex; flex-direction: column; gap: var(--space-2); }
+.music-taskrow {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+}
+.music-taskrow--running { border-left: 3px solid var(--accent); }
+.music-taskrow--ok { border-left: 3px solid var(--ok); }
+.music-taskrow--fail { border-left: 3px solid var(--err); }
+.music-taskrow--cancelled { border-left: 3px solid var(--fg-muted); }
+.music-taskrow__head { gap: var(--space-2); }
+.music-taskrow__title { font-weight: 600; }
+.music-taskrow__ops { flex: none; }
+.music-tasks { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-2); }
+.music-chip {
+  font-size: 11px; padding: 1px var(--space-2); border-radius: 999px;
+  border: 1px solid var(--border); background: var(--bg-sunken); color: var(--fg-muted);
+}
+.music-chip--ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+.music-chip--fail { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
+.music-chip--running { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.music-tasklog { max-height: 60vh; }
+
+/* ④b 安装进度：已用时 / 进度条 / 实时日志 / 失败块（Bug C 反馈链路） */
+.music-taskrow__elapsed { font-variant-numeric: tabular-nums; }
+.music-progress { margin-top: var(--space-2); }
+.music-bar {
+  height: 8px; border-radius: 999px; background: var(--bg-sunken);
+  border: 1px solid var(--border); overflow: hidden;
+}
+.music-bar__fill {
+  height: 100%; width: 0; background: var(--accent); border-radius: 999px;
+  transition: width .3s ease;
+}
+/* 运行中：条纹缓动，表达「进行中」（musicdl 安装可能数分钟，必须有动效） */
+.music-bar--active .music-bar__fill {
+  background-image: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 55%, var(--bg-elev)), var(--accent));
+  background-size: 200% 100%;
+  animation: music-bar-move 1.2s linear infinite;
+}
+@keyframes music-bar-move { from { background-position: 0 0; } to { background-position: -200% 0; } }
+.music-progress__label { margin-top: var(--space-1); font-size: 12px; }
+/* 实时日志滚动区：等宽、限高、可滚动、自动吸底 */
+.music-livlog { max-height: 220px; overflow-y: auto; margin-top: var(--space-2); }
+/* 日志时间列：宽度自适应（.diff__no 固定 32px 是给 diff 行号的，装不下 8 字符时间戳会重叠） */
+.music-logts { color: var(--fg-muted); flex: none; }
+.diff__warn { color: var(--warn); }
+/* 翻页条（结果区 / 下载队列共用）：居中、上一页·页码·下一页 */
+.music-pager { display: flex; align-items: center; justify-content: center; gap: var(--space-2); padding: var(--space-2) 0 0; }
+/* 失败错误块（红）：显性化失败原因 + 重试入口 */
+.music-taskerr {
+  margin-top: var(--space-2); padding: var(--space-2) var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--err) 45%, var(--border));
+  border-left: 3px solid var(--err);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--err) 8%, transparent);
+}
+.music-taskerr__title { color: var(--err); font-weight: 600; }
+.music-taskerr__detail {
+  margin: var(--space-2) 0 0; padding: var(--space-2);
+  background: var(--bg-sunken); border-radius: var(--radius-sm);
+  color: var(--fg-muted); font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  max-height: 160px; overflow: auto;
+}
+.music-taskerr__ops { margin-top: var(--space-2); gap: var(--space-2); }
+
+/* ⑤ 下载目录 */
+.music-dirpath, .music-tmpldisp {
+  background: var(--bg-sunken); border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3); word-break: break-all;
+}
+.music-tmplvars { margin: var(--space-2) 0; }
+
+/* ⑤ 命名模板：三选一分段按钮（v2 新增） */
+.music-tmplseg { gap: var(--space-2); margin: var(--space-2) 0; }
+.music-tmplseg__btn {
+  border: 1px solid var(--border); background: var(--bg-elev); color: var(--fg);
+  border-radius: var(--radius-sm); padding: var(--space-1) var(--space-3); cursor: pointer;
+  font: inherit; line-height: 1.6;
+}
+.music-tmplseg__btn:hover { border-color: var(--accent); }
+.music-tmplseg__btn.is-active {
+  border-color: var(--accent); color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  font-weight: 600;
+}
+
+/* ③ 结果表：可排序表头（v2 新增） */
+.music-th-sort { cursor: pointer; user-select: none; white-space: nowrap; }
+.music-th-sort:hover { color: var(--accent); }
+.music-th-sort.is-active { color: var(--accent); }
+.music-th-sort__arrow { color: var(--fg-muted); font-size: 12px; }
+
+/* ⑤ 代理设置子区（v2 新增）。Q8：仅通道=「走代理」时渲染 */
+.music-proxy {
+  margin-top: var(--space-3); padding: var(--space-3);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-elev);
+}
+.music-proxy__title { font-weight: 600; margin-bottom: var(--space-2); }
+.music-proxy__mode { gap: var(--space-4); margin-bottom: var(--space-2); }
+.music-proxy__homebrew { margin-bottom: var(--space-2); }
+.music-proxy__custom { display: flex; flex-direction: column; gap: var(--space-2); }
+.music-proxy__input { width: 100%; max-width: 320px; }
+.music-proxy__hint { font-size: 13px; }
+.music-proxy__acts { margin-top: var(--space-3); }
+
+

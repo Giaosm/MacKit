@@ -21,13 +21,9 @@ import * as exec from './exec.js';
 
 const { ERR, AppError } = exec;
 
-/** 隔离属性名 */
 const QUARANTINE = 'com.apple.quarantine';
-/** 文件夹递归发现 .app 的最大层级 */
 const MAX_DEPTH = 5;
-/** 单次 xattr 超时 */
 const XATTR_TIMEOUT = 120_000;
-/** 授权框超时 */
 const ADMIN_TIMEOUT = 180_000;
 
 // ---------------------------------------------------------------------------
@@ -73,7 +69,6 @@ function discoverApps(dir, maxDepth = MAX_DEPTH) {
   return out;
 }
 
-/** 去重后的目标展开结果。 */
 function expandTargets(inputs) {
   const targets = [];
   const seen = new Set();

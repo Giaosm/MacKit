@@ -24,10 +24,7 @@ const { ERR, AppError } = exec;
 const GIT_KEYS = git.GIT_KEYS;
 
 // ------------------------------ 工具 ------------------------------
-// 统一实现见 lib/paths.js（2026-09-16 收敛 6 份重复）
 const readText = paths.readTextSafe;
-// 写文本文件：统一实现见 lib/paths.js 的 writeText（失败抛 code=IO_ERROR，
-// 裸 fs 错误没有 code 会被 server 报成 502 命令失败）。2026-09-19 收敛三份重复实现。
 const writeText = paths.writeText;
 
 /** 生成首次运行的占位建议值：一律不含任何姓氏/邮箱/GitHub ID 字面量。 */
@@ -183,7 +180,6 @@ async function queryAliasPreview(params) {
 }
 
 // ------------------------------ Git 执行 ------------------------------
-// 统一实现在 lib/git.js（2026-09-18 收敛：与 backup.runGit / env 的 git 分支是同一段兜底）
 const safeGit = git.run;
 
 // ------------------------------ 动作定义 ------------------------------

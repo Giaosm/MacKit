@@ -24,7 +24,7 @@ import * as paths from './lib/paths.js';
 import * as store from './lib/store.js';
 import * as runner from './lib/runner.js';
 import * as env from './lib/env.js';
-import { AppError, ERR, toErrObj } from './lib/exec.js';
+import { AppError, ERR, toErrObj, hasLiveChildren } from './lib/exec.js';
 import { DAV_ERR, urlHasCredentials } from './lib/webdav.js';
 import { parseReqUrl } from './lib/requrl.js';
 
@@ -40,7 +40,7 @@ const VERSION = readVersion();
 function log(...args) { console.log('[MacKit]', ...args); } // 被启动器重定向到 ~/.mackit/server.out
 
 // ------------------------------ 功能模块注册表（动态接入） ------------------------------
-const MODULE_FILES = Object.freeze({ brew: 'brew.js', sysinit: 'sysinit.js', rime: 'rime.js', unseal: 'unseal.js', backup: 'backup.js', dsh: 'dsh.js', selfupdate: 'selfupdate.js' });
+const MODULE_FILES = Object.freeze({ brew: 'brew.js', sysinit: 'sysinit.js', rime: 'rime.js', unseal: 'unseal.js', backup: 'backup.js', dsh: 'dsh.js', selfupdate: 'selfupdate.js', music: 'music.js' });
 const registry = new Map();
 
 async function loadModules() {
@@ -232,11 +232,53 @@ function handleSse(req, res, taskId, url) {
  */
 const TASK_ID_RE = /^t_\d+_[0-9a-f]{6}$/;
 
+/**
+ * decodeURIComponent 的安全包装：畸形转义（如 `%`、`%zz`、`%E0%A4`）会抛 URIError，
+ * 原先会被顶层 catch 兜成 502 CMD_FAILED "URI malformed" —— 不泄露也不挂死，但语义不对。
+ * 这类输入本质是「路径里的 id 不存在」，统一转成 NOT_FOUND（404）。
+ * @param {string} raw URL 路径段（未解码）
+ * @param {string} [message='未找到该目标'] 面向用户的 404 文案
+ * @returns {string} 解码后的字符串
+ */
+function safeDecode(raw, message = '未找到该目标') {
+  try { return decodeURIComponent(raw); }
+  catch { throw new AppError(ERR.NOT_FOUND, message); }
+}
+
 /** 校验并返回任务 id；不合法一律按「不存在」处理，不泄露路径信息。 */
 function requireTaskId(raw) {
-  const id = decodeURIComponent(raw);
+  const id = safeDecode(raw, '未找到该任务');
   if (!TASK_ID_RE.test(id)) throw new AppError(ERR.NOT_FOUND, '未找到该任务');
   return id;
+}
+
+/**
+ * 解析并提交一个「模块动作」任务（POST /api/tasks 与音乐专用路由 /api/music/openFolder 共用）。
+ *
+ * 校验链：模块存在 → 动作存在且有 steps → destructive 需 confirm → 透传模块 lane（音乐 lane='music'）。
+ * 抽成函数是为了让「音乐专用路由」复用同一套语义（尤其 destructive / confirm 判定不重复实现）。
+ *
+ * @param {{module?:string, action?:string, params?:object, confirm?:boolean}} body 请求体
+ * @returns {{taskId:string, task:object}}
+ */
+function submitModuleAction(body) {
+  const moduleId = String((body && body.module) || '');
+  const action = String((body && body.action) || '');
+  const def = registry.get(moduleId);
+  if (!def) throw new AppError(ERR.NOT_FOUND, `模块「${moduleId}」尚未实现`);
+  const actionDef = def.actions && def.actions[action];
+  if (!actionDef || typeof actionDef.steps !== 'function') throw new AppError(ERR.NOT_FOUND, `未知动作：${moduleId}.${action}`);
+  if (actionDef.destructive === true && body.confirm !== true) {
+    throw new AppError(ERR.CONFIRM_REQUIRED, '该操作为危险操作，缺少二次确认（confirm:true）');
+  }
+  // 透传模块声明的 lane：音乐模块 lane='music'，其余模块无 lane → runner 落 default lane。
+  const task = runner.submit({
+    module: moduleId, action,
+    params: body.params && typeof body.params === 'object' ? body.params : {},
+    actionDef,
+    lane: typeof def.lane === 'string' && def.lane ? def.lane : undefined,
+  });
+  return { taskId: task.id, task };
 }
 
 async function handleApi(req, res, url) {
@@ -326,6 +368,85 @@ async function handleApi(req, res, url) {
   // DeepSeek Harness（安装状态 / 版本探测；安装本身走任务流 POST /api/tasks）
   if (method === 'GET' && pathname === '/api/dsh/status') { ok(res, await queryModule('dsh', 'status', {})); return; }
 
+  // 音乐模块（只读查询 + 搜索/歌单会话；下载/安装走任务流 POST /api/tasks）
+  // deployStatus：四态（not_deployed/broken/deployed/outdated）；/api/music/env 作为旧路径别名保留。
+  if (method === 'GET' && (pathname === '/api/music/deployStatus' || pathname === '/api/music/env')) {
+    ok(res, await queryModule('music', 'deployStatus', { force: url.searchParams.get('force') === '1' }));
+    return;
+  }
+  if (method === 'GET' && pathname === '/api/music/sources') { ok(res, await queryModule('music', 'sources', {})); return; }
+  if (method === 'GET' && pathname === '/api/music/config') { ok(res, await queryModule('music', 'config', {})); return; }
+  if (method === 'PUT' && pathname === '/api/music/config') {
+    const body = await readBody(req);
+    store.writeMackit({
+      musicDownloadDir: body.downloadDir,
+      musicNameTemplate: body.nameTemplate,
+      musicChannel: body.channel,
+      musicSources: body.sources,
+      musicSaveLyrics: body.saveLyrics,
+      // R0 · 代理配置（v2）：透传三个新增字段；非法地址由 writeMackit 抛 PARSE_FAILED → 422 且不写盘
+      musicProxySource: body.proxySource,
+      musicProxyHttp: body.proxyHttp,
+      musicProxySocks5: body.proxySocks5,
+    });
+    ok(res, await queryModule('music', 'config', {}));
+    return;
+  }
+  // 选择下载目录：osascript 弹系统目录框（只读，不写配置；失败前端回落手输）
+  if (method === 'GET' && pathname === '/api/music/chooseFolder') {
+    ok(res, await queryModule('music', 'chooseFolder', {}));
+    return;
+  }
+  // 在 Finder 打开下载目录（P0-6）：音乐专用路由，复用 submitModuleAction 的动作语义
+  // （open_folder 为普通动作、非 destructive，故无需 confirm）。目录不存在由步骤内自动创建。
+  if (method === 'POST' && pathname === '/api/music/openFolder') {
+    const body = await readBody(req);
+    ok(res, submitModuleAction({
+      module: 'music',
+      action: 'open_folder',
+      params: body && typeof body === 'object' ? body : {},
+    }));
+    return;
+  }
+  if (method === 'POST' && pathname === '/api/music/search') {
+    const body = await readBody(req);
+    ok(res, await queryModule('music', 'search', body));
+    return;
+  }
+  if (method === 'POST' && pathname === '/api/music/playlist') {
+    const body = await readBody(req);
+    ok(res, await queryModule('music', 'playlist', body));
+    return;
+  }
+  // 取消搜索 / 歌单：id 由 map 校验（非 task id 格式），必须先于下面的轮询路由匹配
+  const musicCancelMatch = /^\/api\/music\/search\/([^/]+)\/cancel$/.exec(pathname);
+  if (method === 'POST' && musicCancelMatch) {
+    ok(res, await queryModule('music', 'searchCancel', { id: safeDecode(musicCancelMatch[1], '未找到该会话') }));
+    return;
+  }
+  const playlistCancelMatch = /^\/api\/music\/playlist\/([^/]+)\/cancel$/.exec(pathname);
+  if (method === 'POST' && playlistCancelMatch) {
+    ok(res, await queryModule('music', 'searchCancel', { id: safeDecode(playlistCancelMatch[1], '未找到该会话') }));
+    return;
+  }
+  const musicPollMatch = /^\/api\/music\/search\/([^/]+)$/.exec(pathname);
+  if (method === 'GET' && musicPollMatch) {
+    ok(res, await queryModule('music', 'searchPoll', {
+      id: safeDecode(musicPollMatch[1], '未找到该会话'),
+      since: Number.parseInt(url.searchParams.get('since') || '0', 10) || 0,
+    }));
+    return;
+  }
+  // 歌单解析与搜索同构：轮询同一个会话注册表（同一 searchId）
+  const playlistPollMatch = /^\/api\/music\/playlist\/([^/]+)$/.exec(pathname);
+  if (method === 'GET' && playlistPollMatch) {
+    ok(res, await queryModule('music', 'searchPoll', {
+      id: safeDecode(playlistPollMatch[1], '未找到该会话'),
+      since: Number.parseInt(url.searchParams.get('since') || '0', 10) || 0,
+    }));
+    return;
+  }
+
   // MacKit 自身更新状态（force=1 绕过 10 分钟缓存，强制 fetch 一次）
   if (method === 'GET' && pathname === '/api/selfupdate/status') {
     ok(res, await queryModule('selfupdate', 'status', { force: url.searchParams.get('force') === '1' }));
@@ -339,7 +460,6 @@ async function handleApi(req, res, url) {
     return;
   }
 
-  // 备份中心（2026-09-17 起只剩 WebDAV 一条链路；手动导出 / 导入已移除）
   // WebDAV 备份（配置 / 列表走同步接口；上传 / 恢复 / 删除走任务流 POST /api/tasks）
   if (method === 'GET' && pathname === '/api/webdav/config') {
     const c = store.publicWebdav();
@@ -380,17 +500,7 @@ async function handleApi(req, res, url) {
   // 任务
   if (method === 'POST' && pathname === '/api/tasks') {
     const body = await readBody(req);
-    const moduleId = String(body.module || '');
-    const action = String(body.action || '');
-    const def = registry.get(moduleId);
-    if (!def) throw new AppError(ERR.NOT_FOUND, `模块「${moduleId}」尚未实现`);
-    const actionDef = def.actions && def.actions[action];
-    if (!actionDef || typeof actionDef.steps !== 'function') throw new AppError(ERR.NOT_FOUND, `未知动作：${moduleId}.${action}`);
-    if (actionDef.destructive === true && body.confirm !== true) {
-      throw new AppError(ERR.CONFIRM_REQUIRED, '该操作为危险操作，缺少二次确认（confirm:true）');
-    }
-    const task = runner.submit({ module: moduleId, action, params: body.params && typeof body.params === 'object' ? body.params : {}, actionDef });
-    ok(res, { taskId: task.id, task });
+    ok(res, submitModuleAction(body));
     return;
   }
   if (method === 'GET' && pathname === '/api/tasks') { ok(res, runner.listTasks()); return; }
@@ -504,18 +614,29 @@ async function gracefulShutdown(reason, exitCode = 0) {
   shuttingDown = true;
   log(`开始优雅关闭（${reason}）…`);
   try {
-    const cur = runner.currentTaskId();
-    if (cur) {
-      runner.cancel(cur);
-      await waitForIdle(GRACEFUL_WAIT_MS);
-      // 等满上限仍未空闲 → 显式整组 SIGKILL 补一刀再退出。
-      // 不能只依赖 exec 内部那个「SIGTERM→3s→SIGKILL」兜底定时器：它带 unref，
-      // 而 process.exit 会直接把它连同其它未触发的定时器一起丢掉，忽略 SIGTERM
-      // 的子进程就变成孤儿（常驻服务里会持续累积）。
-      if (runner.isBusy()) {
-        const n = runner.forceKill();
-        log(`等待 ${GRACEFUL_WAIT_MS}ms 仍未结束，已强杀 ${n} 个子进程`);
-      }
+    // 多 lane 并行：逐个取消所有 lane 上的当前任务（而非仅 default lane 的那一个）。
+    const ids = runner.activeTaskIds();
+    if (ids.length) {
+      for (const id of ids) { try { runner.cancel(id); } catch { /* ignore */ } }
+    }
+
+    // ★ 音乐**搜索 / 歌单会话**不经 runner（session.js 直接用 exec.run 起 bridge.py，lane
+    //   'music-search'），所以 activeTaskIds() / isBusy() 都看不见它。只凭 runner 状态决定
+    //   是否补杀，会在「只有搜索在跑」时 ids.length === 0、整段回收被跳过 → Python 变孤儿。
+    //   这里经 registry 动态取模块、用 ?. 调用：模块缺失 / 未加载时完全不影响退出。
+    try {
+      const music = registry.get('music');
+      if (music && typeof music.shutdown === 'function') music.shutdown();
+    } catch (err) { log('取消音乐搜索会话失败（继续退出）：', err && err.message); }
+
+    if (ids.length) await waitForIdle(GRACEFUL_WAIT_MS);
+
+    // 等满上限仍未空闲，**或**仍有任何存活子进程（含 runner 看不见的搜索会话）→ 整组 SIGKILL 补一刀。
+    // 不能只依赖 exec 内部那个「SIGTERM→3s→SIGKILL」兜底定时器：它带 unref，
+    // 而 process.exit 会直接把它连同其它未触发的定时器一起丢掉，忽略 SIGTERM 的子进程就变成孤儿。
+    if (runner.isBusy() || hasLiveChildren()) {
+      const n = runner.forceKill();
+      log(`仍有子进程未结束，已强杀 ${n} 个`);
     }
   } catch (err) { log('关闭前回收任务失败（继续退出）：', err && err.message); }
   for (const res of sseClients) { try { res.end(); } catch { /* ignore */ } }

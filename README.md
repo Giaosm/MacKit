@@ -2,7 +2,7 @@
 
 macOS 日常维护工具箱 —— 把零碎的维护操作收拢到一个本地网页界面上，点点鼠标就能用。
 
-完全离线、零依赖：后端只用 Node 内置模块，前端是原生 HTML/CSS/JS，不需要 `npm install`，不装任何第三方包。
+核心零依赖：后端只用 Node 内置模块，前端是原生 HTML/CSS/JS，不需要 `npm install`，不装任何 npm 第三方包。唯一的例外是**可选的「音乐下载」模块** —— 它按需在 `~/.mackit/py` 下装一个隔离的 Python 环境（`musicdl`，仅限非商业用途）；不装它，其余 7 个模块照常离线可用。
 
 服务只监听 `127.0.0.1`，局域网内其他设备访问不到。
 
@@ -13,6 +13,7 @@ macOS 日常维护工具箱 —— 把零碎的维护操作收拢到一个本地
 | **总览** | 一键体检：Homebrew / Git / Rime / 代理等环境状态一览；旁边还有 **MacKit 自身更新** 按钮（有新版本时高亮） |
 | **Homebrew 管家** | 列出可升级的软件包并逐项选择「代理 / 直连」升级；搜索并安装 Formula（命令行工具 / 库）与 Cask 应用；卸载 formula / cask / tap；本机没装 Homebrew 时可一键安装 |
 | **DeepSeek Harness** | 一键安装 / 更新 `@deepseek-ai/dsh`；**插件市场 dshmarket 是独立的一个按钮**（需要 pnpm，会自动装；装过即锁定不重复安装） |
+| **音乐下载** | 输入关键词跨 57 个音源搜索、勾选后批量下载到本地，也可粘贴歌单 / 专辑链接批量解析。Python 依赖**按需**装到 `~/.mackit/py`，不用时一键卸载（见下文「音乐下载」） |
 | **系统初始化** | 把代理别名写进 shell 配置、设置 Git 全局项、把 GitHub Token 存进 macOS 钥匙串、配置代理端口 |
 | **Rime 输入法** | 安装 / 更新 rime-ice 词库，切换皮肤与布局，启用万象语法模型，写入配置 |
 | **应用解隔离** | 批量去掉 App 上的 quarantine 属性（解决"打不开 / 已损坏"） |
@@ -25,7 +26,7 @@ macOS 日常维护工具箱 —— 把零碎的维护操作收拢到一个本地
   - 已装 Homebrew：`brew install node`
   - 没装：到 <https://nodejs.org> 下载安装包
 
-不需要联网（除了下载软件本身），也不需要安装任何依赖。
+除「音乐下载」模块外，不需要联网，也不需要安装任何依赖；音乐模块首次使用时需联网装一次 Python 依赖（见下文）。
 
 ## 快速开始
 
@@ -121,7 +122,8 @@ git pull --ff-only                      # 只做快进合并
 | `runtime.json` | 当前服务的端口与进程号 |
 | `logs/` | 各次任务的执行日志（保留最近 50 个任务 / 30 天；权限 600，与配置同口径） |
 | `history/` | 任务历史（保留最近 10 次） |
-| `cache/` | Homebrew 环境快照（30 秒）、Formula / Cask 搜索索引（24 小时）、DSH 最新版本与 MacKit 自更新检查（12 小时 / 10 分钟） |
+| `cache/` | Homebrew 环境快照（30 秒）、Formula / Cask 搜索索引（24 小时）、DSH 最新版本与 MacKit 自更新检查（12 小时 / 10 分钟）、音乐搜索快照 |
+| `py/` | **可选**：音乐模块的隔离 Python 环境（`venv/`）与 pip 缓存（`cache/`）。没用过音乐模块时不存在；随「卸载音频环境」整体删除 |
 | `server.out` | 服务启动日志 |
 | `app-launch.log` | 从启动台 / Dock 每次启动的记录（退出码 + 输出），启动出问题时看它 |
 | `webdav.json` | WebDAV 备份凭据（明文，权限 600） |
@@ -151,6 +153,31 @@ git pull --ff-only                      # 只做快进合并
 - 插件装在 `~/.dsh/profiles/web`（dsh 自己的 profile 目录，与 `~/.mackit/` 互不相干）；装好后在 dsh web 的 **Settings → Plugin Market** 里管理插件。
 - `dsh web` 是长驻服务，MacKit **不代跑、也不提供启动入口**：装完后自己在终端执行 `dsh web`，再用浏览器打开它打印的地址。
 - npm 全局目录不可写时（例如官网 pkg 装的 Node），界面会提前拦下并给出替代方案（改用 Homebrew 的 Node，或 `npm config set prefix ~/.npm-global`），**不会偷偷提权用 sudo**。
+
+## 音乐下载（可选模块）
+
+侧边栏的 **音乐下载** 模块：输入关键词 → 跨 **57 个音源**（QQ音乐 / 网易云 / 酷狗 / YouTube Music / 喜马拉雅…）搜索 → 勾选后批量下载到本地；也可以粘贴歌单 / 专辑 / 频道链接批量解析，再按同样的方式勾选下载。
+
+它是**唯一**打破「零依赖」承诺的模块，因此被刻意隔离：
+
+- **依赖装在哪**：独立虚拟环境 `~/.mackit/py/venv`（pip 缓存在 `~/.mackit/py/cache`）。**全程不使用 sudo、不写系统目录、不碰系统自带的 python3**；下载的音乐文件默认落在 `~/Music/MacKit`，可随时改目录，并支持**一键在 Finder 打开**（目录不存在会自动创建）。
+- **首次使用**：页面会显示「未就绪」，点「安装音频环境」→ 弹确认框列出即将执行的命令、体积与许可 → 确认后自动执行：
+  ```bash
+  python3.12 -m venv ~/.mackit/py/venv
+  ~/.mackit/py/venv/bin/pip install -U pip musicdl
+  ~/.mackit/py/venv/bin/python -c "import musicdl"
+  ```
+  需要 Python 3.12+。若本机没有，页面会引导你到「Homebrew 管家」安装 `python@3.12`（`brew install python@3.12`），**不代装、不提权**。
+- **体积 / 耗时**：约 **300–500 MB**（另需 ≥ 1.5 GB 可用磁盘），数分钟，**需要联网**（从 PyPI 下载）。
+- **可逆**：随时可在本页点「卸载音频环境」删除 `~/.mackit/py`（**已下载的音乐文件不会被删除**），之后也可再次安装。
+- **不破坏其余模块**：未安装时音乐模块只显示引导页；后端对 Python 的探测是**懒加载**的，7 个既有模块的启动与运行完全不依赖它。
+- **并发**：音乐下载走独立的并行通道，**不会阻塞** Homebrew 升级等其它任务（两者可同时进行）。
+
+### 许可与合规
+
+- 音乐模块调用的是开源项目 [**musicdl**](https://pypi.org/project/musicdl/)，采用 **PolyForm Noncommercial License 1.0.0** —— **仅限非商业用途**。请在使用前自行确认并遵守其条款。
+- 本仓库**不 vendor（不打包）** `musicdl` 及其任何依赖的源码，只在运行时按需安装到用户目录。
+- 部分音源（Spotify / TIDAL / Apple Music 等 DRM 源）依赖额外解密组件，已在界面标注 ⚠️ 且**默认不勾选**；本模块**不代用户绕过付费 / 会员限制，也不内嵌任何账号凭据**。
 
 ## 卸载
 

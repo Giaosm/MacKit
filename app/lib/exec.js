@@ -12,6 +12,8 @@
  */
 
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import * as paths from './paths.js';
 import * as store from './store.js';
 
@@ -90,9 +92,8 @@ const MAX_CAPTURE = 4_000_000;
 
 /**
  * 命令白名单：逻辑名 → 固定路径。
- * ★ 白名单即本表的键集（2026-09-18 合并）：原先另有一份平行的 `WHITELIST` 数组需与
- *   本表手工同步，漏改一处就会出现「名字合法但查不到路径」的空档。
- *   node / npm / pnpm / dsh 供 DeepSeek Harness 模块安装与自检使用（2026-09-19 新增）。
+ * ★ 白名单即本表的键集（不另设平行数组，避免两处手工同步漏改）。
+ *   node / npm / pnpm / dsh 供 DeepSeek Harness 模块安装与自检使用。
  */
 const BIN_MAP = Object.freeze({
   brew: paths.BREW_BIN,
@@ -120,20 +121,34 @@ const ABSOLUTE_ALLOWED = Object.freeze([
   paths.SQUIRREL_BIN,
   `${paths.PLUM_DIR}/rime-install`,
   paths.BASH_BIN,
+  // 音乐模块 venv 内的解释器（创建 venv / 执行 bridge.py 都用它）；同一 venv 的 pip
+  // 走 resolveBin 的 PY_DIR 前缀放行，无需在此重复登记。
+  paths.MUSIC_VENV_PY,
+  // 音乐模块「在 Finder 打开下载目录」：只调用 `open <目录>`（参数数组，不拼 shell）。
+  paths.OPEN_BIN,
 ]);
+
+/** 允许的裸 python 解释器文件名（音乐模块用；只认 python3 / python3.12，不含 python）。 */
+const PY_BASENAME_RE = /^python3(\.12)?$/;
 
 // ---------------------------------------------------------------------------
 // 存活子进程登记（进程退出前的强制回收）
 // ---------------------------------------------------------------------------
 /**
- * 当前存活的子进程集合（spawn 成功即登记，关闭即注销）。
+ * 当前存活的子进程 → 所属 lane 的映射（spawn 成功即登记，关闭即注销）。
  *
  * 为什么要登记：正常取消走 AbortSignal → SIGTERM →（3s）→ SIGKILL，靠 exec 内部的
  * 兜底定时器完成。但**进程准备退出时**（server.js 的 gracefulShutdown）不能只依赖它：
  * `process.exit` 会直接丢掉尚未触发的定时器，把忽略 SIGTERM 的子进程留成孤儿。
  * 登记句柄后，退出路径可以显式补一刀，见 {@link killAllNow}。
+ *
+ * 为什么带 lane（设计 §5.1）：音乐模块的下载走独立并行通道（lane），其**搜索子进程**
+ * 用的是 `music-search` lane。取消音乐下载时必须只杀 `music` lane 的子进程，绝不能
+ * 误伤正在跑的搜索子进程（见 {@link killLaneNow}）。
+ *
+ * @type {Map<import('node:child_process').ChildProcess, string>}
  */
-const LIVE_CHILDREN = new Set();
+const LIVE_CHILDREN = new Map();
 
 /**
  * 立即对全部存活子进程**整组**发信号（默认 SIGKILL），用于进程退出前的强制回收。
@@ -146,7 +161,7 @@ const LIVE_CHILDREN = new Set();
  */
 export function killAllNow(signal = 'SIGKILL') {
   let n = 0;
-  for (const child of Array.from(LIVE_CHILDREN)) {
+  for (const child of Array.from(LIVE_CHILDREN.keys())) {
     const pid = child.pid;
     try {
       // 优先对进程组发信号（spawn 时 detached:true → 子进程自成进程组），
@@ -161,12 +176,113 @@ export function killAllNow(signal = 'SIGKILL') {
   return n;
 }
 
+/**
+ * 只对指定 lane 的存活子进程**整组**发信号（默认 SIGKILL）。
+ *
+ * 用途：取消「音乐下载通道」的全部下载子进程时，**不得**连带杀掉 `music-search`
+ * lane 上正在运行的搜索子进程（设计 §5.1 明确点名的隐患）。
+ *
+ * @param {string} lane 目标 lane 名（'default' | 'music' | 'music-search' | …）
+ * @param {NodeJS.Signals} [signal='SIGKILL']
+ * @returns {number} 实际尝试发信号的子进程数
+ */
+export function killLaneNow(lane, signal = 'SIGKILL') {
+  let n = 0;
+  for (const [child, childLane] of Array.from(LIVE_CHILDREN.entries())) {
+    if (childLane !== lane) continue;
+    const pid = child.pid;
+    try {
+      if (pid) process.kill(-pid, signal);
+      else child.kill(signal);
+      n += 1;
+    } catch {
+      try { child.kill(signal); n += 1; } catch { /* 进程已退出 */ }
+    }
+  }
+  return n;
+}
+
+/**
+ * 是否存在存活子进程（任意 lane）。
+ *
+ * 供 server.js 的优雅退出兜底判断：音乐**搜索会话**用 exec.run 直接起 bridge.py
+ * （lane 'music-search'），**不经过 runner**，因此 `runner.isBusy()` / `activeTaskIds()`
+ * 看不见它。若只凭 runner 状态决定是否补杀，会在「只有搜索在跑、没有任何任务」时
+ * 整段回收被跳过 → Python 子进程变孤儿（见 server.js gracefulShutdown）。
+ *
+ * @returns {boolean}
+ */
+export function hasLiveChildren() {
+  return LIVE_CHILDREN.size > 0;
+}
+
 // ---------------------------------------------------------------------------
 // 解析与校验
 // ---------------------------------------------------------------------------
 
 /**
+ * p 是否位于 dir 内（含 dir 自身）；参数非法一律 false。
+ * @param {string} p
+ * @param {string} dir
+ * @returns {boolean}
+ */
+function withinDir(p, dir) {
+  if (typeof p !== 'string' || !p || typeof dir !== 'string' || !dir) return false;
+  const d = dir.endsWith(path.sep) ? dir.slice(0, -1) : dir;
+  return p === d || p.startsWith(d + path.sep);
+}
+
+/** realpath（解析符号链接）；路径不存在时回落原值，绝不抛。 */
+function realPathOr(p) {
+  try { return fs.realpathSync(p); } catch { return p; }
+}
+
+/**
+ * 解释器目录白名单：`~/.mackit/py` + `PY312_CANDIDATES` 各自目录 + 宿主 PATH 目录。
+ * 这些目录来自固定表与宿主 PATH 扫描，**不由用户输入决定**，是「解释器只可能来自哪里」的边界。
+ *
+ * ★ 按当前 `process.env.PATH` 记忆化：PATH 未变时复用，变了就重算。
+ *   （不能只缓存一次——测试 / 运行期可能改写 PATH；paths.findPython312 每次都读实时 PATH，
+ *    这里必须与它保持一致，否则会与「探测到的候选」失配。）
+ * @type {string[]|null}
+ */
+let interpreterDirs = null;
+let interpreterDirsPath = null;
+function trustedInterpreterPath(p) {
+  if (!p) return false;
+  const pathEnv = String(process.env.PATH || '');
+  if (interpreterDirs === null || interpreterDirsPath !== pathEnv) {
+    const set = new Set([paths.PY_DIR]);
+    for (const c of paths.PY312_CANDIDATES) set.add(path.dirname(c));
+    for (const d of pathEnv.split(path.delimiter)) {
+      if (d) set.add(path.resolve(d));
+    }
+    interpreterDirs = [...set];
+    interpreterDirsPath = pathEnv;
+  }
+  return interpreterDirs.some((d) => withinDir(p, d));
+}
+
+/**
  * 判断并解析可执行文件路径；不在白名单则抛 CMD_NOT_ALLOWED。
+ *
+ * 绝对路径放行分三层（设计 §5.1；2026-09-19 按 QA 反馈收紧）：
+ *   1) ABSOLUTE_ALLOWED 精确匹配（含音乐 venv 的解释器 / Squirrel / rime-install / bash）；
+ *   2) `~/.mackit/py/**` 前缀放行（覆盖 venv 内 `bin/python`、`bin/pip`）——
+ *      ★ 先 `path.resolve` 归一化（消解 `..` / `.` / 相对段）**再**比较，避免
+ *        `~/.mackit/py/../../evil.sh` 这类「字符串前缀命中、实际落在目录外」的绕过；
+ *      ★ 判定用 `withinDir(resolved) || withinDir(real)` 的**「或」语义，这是有意为之**：
+ *        必须放行「PY_DIR 内的软链指向外部」，因为真实 venv 的 `bin/python` 就是这种形态
+ *        （指向 /opt/homebrew/bin/python3.12 这类基础解释器）；收紧成「与」会把正常 venv 一并拒掉。
+ *        ⟹ 本层**不防御「PY_DIR 内被植入软链」这一威胁**：该威胁的前提是攻击者已取得用户级
+ *        写权限，早已越过本应用的安全边界。真正兜底的是「`bin` 参数永不由 HTTP 入参 /
+ *        配置 / 任务 params 决定」（见 app/test/resolvebin.test.js 的绊线断言）。
+ *        realpath 仅在路径存在时参与判断，不存在时回落到归一化结果、不抛。
+ *   3) 解释器文件名 `python3` / `python3.12` —— **仅当**其归一化（或 realpath）路径落在
+ *      「受信任解释器目录」内（`~/.mackit/py`、`PY312_CANDIDATES` 各自目录、宿主 PATH 目录）。
+ *      即解释器只可能来自 PY312 固定候选或宿主 PATH，**不再是「任意目录下名叫 python3 即放行」**。
+ *      第 3 层依旧不引入「任意命令」口子：受信任目录来自固定表 + 宿主 PATH，不由用户输入决定。
+ *
  * @param {string} name 逻辑名（brew/git/...）或允许的绝对路径
  * @returns {string} 实际可执行文件路径
  */
@@ -177,6 +293,20 @@ function resolveBin(name) {
   // 绝对路径：仅允许白名单内的绝对可执行
   if (name.includes('/')) {
     if (ABSOLUTE_ALLOWED.includes(name)) return name;
+
+    // 归一化 + realpath（存在时）：后续所有前缀/目录判断都基于归一化结果，杜绝 `..` 绕过
+    const resolved = path.resolve(name);
+    const real = realPathOr(resolved);
+
+    // 层 2：~/.mackit/py/** 前缀放行（venv 内的 python / pip）
+    if (withinDir(resolved, paths.PY_DIR) || withinDir(real, paths.PY_DIR)) return name;
+
+    // 层 3：解释器文件名，但必须落在受信任解释器目录内
+    const base = path.basename(name);
+    if (PY_BASENAME_RE.test(base)
+      && (trustedInterpreterPath(resolved) || trustedInterpreterPath(real))) {
+      return name;
+    }
     throw new AppError(ERR.CMD_NOT_ALLOWED, `不允许的命令路径：${name}`);
   }
   const fixed = BIN_MAP[name];
@@ -345,6 +475,9 @@ export function run(bin, args, opts = {}) {
   const binPath = resolveBin(bin);
   const argsArr = Array.isArray(args) ? args.slice() : [];
   const env = buildEnv(opts);
+  // lane 标记（设计 §5.1）：缺省一律落 'default'，使未传 lane 的调用（现有 7 个模块）
+  // 与改动前完全等价；killLaneNow 只按本字段精确匹配目标通道。
+  const laneName = (typeof opts.lane === 'string' && opts.lane) || 'default';
   const timeoutMs = typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0
     ? opts.timeoutMs
     : DEFAULT_TIMEOUT_MS;
@@ -369,7 +502,7 @@ export function run(bin, args, opts = {}) {
         detached: true,
         stdio: [opts.stdin !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       });
-      LIVE_CHILDREN.add(child);
+      LIVE_CHILDREN.set(child, laneName);
     } catch (err) {
       reject(new AppError(ERR.CMD_FAILED, `无法启动命令 ${bin}`, String(err && err.message)));
       return;
@@ -470,11 +603,10 @@ export function run(bin, args, opts = {}) {
       if (killTimer.unref) killTimer.unref();
     };
 
-    // 超时
+    // 超时 / 取消都归到 doKill（SIGTERM → 宽限期 → SIGKILL）
     const timeoutTimer = setTimeout(() => doKill('timeout'), timeoutMs);
     if (timeoutTimer.unref) timeoutTimer.unref();
 
-    // 取消
     const onAbort = () => doKill('cancel');
     if (opts.signal) {
       if (opts.signal.aborted) onAbort();
@@ -485,7 +617,7 @@ export function run(bin, args, opts = {}) {
       clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
-      LIVE_CHILDREN.delete(child); // 结束即注销，killAllNow 不会误伤已退出的进程
+      LIVE_CHILDREN.delete(child); // 结束即注销（Map.delete 与旧 Set.delete 语义一致），killAllNow / killLaneNow 不会误伤已退出的进程
     };
 
     const finish = (code, signal) => {
@@ -520,8 +652,7 @@ export function run(bin, args, opts = {}) {
 /**
  * 执行并吞掉异常，返回统一的「子进程退出码」结构。
  *
- * 供「只读探测 / 尽力而为」场景使用（原先 env.runQuiet、sysinit.safeGit、
- * backup.runGit 各写了一份逐字相同的 try/catch，2026-09-18 收敛到这里）。
+ * 供「只读探测 / 尽力而为」场景使用（env / sysinit / backup 的同类兜底已收敛到这里）。
  *
  * ★ 失败一律回落数字 `-1`，绝不把 AppError 的字符串语义码（如 CMD_NOT_ALLOWED）
  *   塞进 `code`：下游全部按「子进程退出码」用它（`res.code !== 0`），
@@ -653,4 +784,31 @@ export async function osascriptAdmin(shellCmd, opts = {}) {
     stderr: res.stderr,
     cancelled: res.code === -128,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 在 Finder 打开目录
+// ---------------------------------------------------------------------------
+
+/**
+ * 在 Finder 中打开一个目录（音乐模块 P0-6「在 Finder 打开下载目录」）。
+ *
+ * 语义等价于 `open <dir>`：把（用户可控的）目录以**参数数组**原样交给 `/usr/bin/open`
+ * —— 与 {@link osascriptAdmin} 同类，是本层对某个具体工具的语义封装，**集中保证**
+ * 「绝不拼 shell 字符串」（exec 层一律 `shell:false`，无注入面）。
+ *
+ * 之所以做成 exec 层语义封装而非在模块内直接 `run(paths.OPEN_BIN, …)`：让 `bin` 常量
+ * 统一收敛在唯一的子进程出口（exec.js），模块侧只表达「打开目录」的意图。
+ *
+ * ★ 参数用 `['--', target]`：加终止符后，任何以 `-` 开头的路径（用户若把目录命名为
+ *   `-backup`）都会被 `open` 当普通路径而非选项（macOS 的 `open` 基于 getopt，支持 `--`）。
+ *
+ * @param {string} dir 目标目录（调用方需确保其存在）
+ * @param {{timeoutMs?:number, signal?:AbortSignal, lane?:string}} [opts]
+ * @returns {Promise<import('./exec.js').RunResult>}
+ */
+export function openInFinder(dir, opts = {}) {
+  const target = String(dir == null ? '' : dir);
+  if (!target) return Promise.reject(new AppError(ERR.PARSE_FAILED, '目录为空'));
+  return run(paths.OPEN_BIN, ['--', target], { noMirror: true, ...opts });
 }

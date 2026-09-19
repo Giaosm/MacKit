@@ -80,7 +80,6 @@ function buildBasicAuth(username, password) {
   return 'Basic ' + Buffer.from(`${u}:${p}`, 'utf8').toString('base64');
 }
 
-/** 两位补零。 */
 function pad2(n) { return String(n).padStart(2, '0'); }
 
 /**
@@ -256,12 +255,10 @@ function pick(block, local) {
   return selfClose.test(block) ? '' : null;
 }
 
-/** 安全取 URL 的 pathname。 */
 function safePathname(url) {
   try { return new URL(url).pathname; } catch { return ''; }
 }
 
-/** 从绝对 URL 取末段文件名（解码）。 */
 function extractName(absUrl) {
   try {
     const segs = new URL(absUrl).pathname.split('/').filter(Boolean);

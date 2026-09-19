@@ -104,9 +104,7 @@ const RESOLVE_ORDER = Object.freeze([
 // ---------------------------------------------------------------------------
 // 小工具
 // ---------------------------------------------------------------------------
-// 统一实现见 lib/paths.js（2026-09-16 收敛 6 份重复）
 const readTextSafe = paths.readTextSafe;
-// 写文本文件：统一实现见 lib/paths.js 的 writeText（2026-09-19 收敛 sysinit/rime/brew 三份）
 const writeTextSafe = paths.writeText;
 function escapeRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
@@ -530,9 +528,8 @@ function mergeGrammarPatch(text) {
 
 /**
  * 为方案启用万象语法模型。
- * ★ 2026-09-19 起改为**合并写入**：此前直接整文件覆盖 ${schema}.custom.yaml，
- *   而 rime_ice.custom.yaml 正是用户最常放自定义补丁的文件 —— 一覆盖就没了
- *   （「移除」侧本来就有护栏，两边态度不一致）。
+ * ★ 必须合并写入：${schema}.custom.yaml（尤其 rime_ice.custom.yaml）是用户最常放
+ *   自定义补丁的文件，整文件覆盖会把用户补丁一并抹掉。
  */
 function applyGrammarPatch(ctx, schema) {
   const p = grammarCustomPath(schema);
@@ -590,7 +587,13 @@ function grammarDownloadStep() {
         try { fs.unlinkSync(tmp); } catch { /* 忽略 */ }
         throw new AppError(ERR.NET_UNREACHABLE, `模型下载失败（curl 退出码 ${res.code}），可稍后重试`);
       }
-      fs.renameSync(tmp, target);
+      // 常驻进程 rename 可能被 macOS 拒（EPERM，见 store.js writeJsonSafe 同款注释）→ 降级复制
+      try {
+        fs.renameSync(tmp, target);
+      } catch (err) {
+        if (err && err.code === 'EPERM') { fs.copyFileSync(tmp, target); fs.unlinkSync(tmp); }
+        else { throw err; }
+      }
       ctx.log('ok', `模型已就位：${target}`);
     },
   };

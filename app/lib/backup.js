@@ -33,15 +33,11 @@ import * as webdav from './webdav.js';
 const { ERR, AppError } = exec;
 const { DAV_ERR } = webdav;
 
-/** Git 键白名单唯一事实源见 lib/git.js（2026-09-18 前是与 sysinit.js 各写一份） */
 const GIT_KEYS = git.GIT_KEYS;
 
 // ------------------------------ 工具 ------------------------------
-// 统一实现见 lib/paths.js（2026-09-16 收敛 6 份重复）
 const readTextSafe = paths.readTextSafe;
 
-// Git 执行与钥匙串凭据读写统一在 lib/git.js
-// （2026-09-18 收敛：本文件原先的 runGit / readGithubCredential 与 sysinit、env 是同一批逻辑）
 const runGit = git.run;
 
 // ------------------------------ 导出（收集） ------------------------------

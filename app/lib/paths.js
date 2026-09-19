@@ -27,9 +27,7 @@ export const WEB_DIR = path.join(APP_DIR, 'web');
 // ---------------------------------------------------------------------------
 // 用户家目录与 ~/.mackit 数据目录
 // ---------------------------------------------------------------------------
-/** 用户家目录 */
 export const HOME = os.homedir();
-/** ~/.mackit */
 const MACKIT_DIR = path.join(HOME, '.mackit');
 /** ~/.mackit/config.json（MacKit 专属配置） */
 export const CONFIG_JSON = path.join(MACKIT_DIR, 'config.json');
@@ -151,8 +149,6 @@ export function exists(p) {
 
 /**
  * 读文本文件，失败返回 null（不抛错）。
- * 原先 store / brew / env / rime / sysinit / backup 各写了一份逐字相同的实现，
- * 2026-09-16 统一到这里（与上面的 exists() 同类：都是无副作用的文件辅助）。
  * @param {string} p
  * @returns {string|null}
  */
@@ -163,9 +159,7 @@ export function readTextSafe(p) {
 /**
  * 构造带 `code` 的错误（形态与 exec.js 的 AppError 一致）。
  *
- * ★ 为什么在这里而不是 import exec.js：exec.js → paths.js 已经是一条依赖边，
- *   反向再 import 会形成循环。store.js 此前也是同一手法（各写一份 mkErr），
- *   2026-09-19 收敛到这里，全项目只保留这一份。
+ * ★ 在这里而不是 import exec.js：exec.js → paths.js 已是一条依赖边，反向 import 会成环。
  * @param {string} code 取值与 exec.ERR 对齐（如 'IO_ERROR'）
  * @param {string} message 面向用户的中文短语
  * @param {string} [detail] 技术细节
@@ -178,11 +172,7 @@ export function mkCodedError(code, message, detail) {
 }
 
 /**
- * 写文本文件；失败抛 `IO_ERROR`。
- *
- * 原先 sysinit.writeText / rime.writeTextSafe / brew 的内联写法各有一份（消息都叫
- * 「写入失败：${p}」），backup 里还有一处裸 writeFileSync（不包错误码，会被上层报成
- * 502 命令失败）。2026-09-19 统一到这里。
+ * 写文本文件；失败抛 `IO_ERROR`（裸 fs 错误没有 code，会被上层报成 502 命令失败）。
  * @param {string} p
  * @param {string} text
  */
@@ -193,8 +183,6 @@ export function writeText(p, text) {
 
 /**
  * 取字符串末尾 n 行（错误摘要用）。
- * 「`(stderr||'').trim().split('\n').slice(-3).join('\n')`」这个惯用法原先在 exec(2 处)、
- * brew(3 处)、dsh(1 处) 各写了一遍，2026-09-19 收敛到这里。
  * @param {string} text
  * @param {number} [n=3]
  * @returns {string}
@@ -205,9 +193,6 @@ export function tailLines(text, n = 3) {
 
 /**
  * 按行拆分，去掉空行与每行首尾空白（全项目唯一实现）。
- *
- * 原先 brew.js 的 `lineList()` 与 env.js 的 `nonEmptyLines()` 各写了一份逐字相同的实现，
- * 2026-09-18 收敛到这里（与 readTextSafe 同类：都是无副作用的文本辅助）。
  * @param {string} text
  * @returns {string[]}
  */
@@ -264,7 +249,11 @@ export const XATTR_BIN = firstExisting(['/usr/bin/xattr'], '/usr/bin/xattr');
 export const SECURITY_BIN = firstExisting(['/usr/bin/security'], '/usr/bin/security');
 /** osascript 可执行文件（图形授权） */
 export const OSASCRIPT_BIN = firstExisting(['/usr/bin/osascript'], '/usr/bin/osascript');
-/** curl 可执行文件 */
+/**
+ * open 可执行文件（音乐模块「在 Finder 打开下载目录」用）。
+ * 只用于 `open <目录>`：以参数数组形式调用，绝不把（用户可控的）路径拼进 shell 字符串。
+ */
+export const OPEN_BIN = firstExisting(['/usr/bin/open'], '/usr/bin/open');
 export const CURL_BIN = firstExisting(['/usr/bin/curl'], '/usr/bin/curl');
 /**
  * bash 可执行文件：仅用于执行 Homebrew 官方安装脚本（install.sh 需要 bash 解释器）。
@@ -329,6 +318,72 @@ export const EXEC_PATH = (() => {
   }
   return out;
 })();
+
+// ---------------------------------------------------------------------------
+// 音乐模块 · Python 环境路径（第 8 模块「音乐下载」）
+//
+// 全部常量集中在此，其它文件不得自拼（设计文档 §9）。Python 依赖被隔离在用户目录下
+// 的独立虚拟环境里按需安装，绝不触碰系统 python3、不写系统目录、不 sudo；
+// 未安装时其余 7 个模块 100% 照常工作。本文件只做「存在性探测」（fs.existsSync），
+// 绝不执行 python、不联网 —— 真正确认可用性的执行探针在 lib/music/env.js。
+// ---------------------------------------------------------------------------
+/** ~/.mackit/py（音乐模块 Python 运行数据的根；删除即完全回滚） */
+export const PY_DIR = path.join(MACKIT_DIR, 'py');
+/** ~/.mackit/py/venv（独立虚拟环境） */
+export const MUSIC_VENV = path.join(PY_DIR, 'venv');
+/** venv 内解释器（exec 白名单精确放行；被 spawn 的绝对路径） */
+export const MUSIC_VENV_PY = path.join(MUSIC_VENV, 'bin', 'python');
+/** venv 内 pip（先执行 `-U pip musicdl` 的入口） */
+export const MUSIC_VENV_PIP = path.join(MUSIC_VENV, 'bin', 'pip');
+/** ~/.mackit/py/cache（PIP_CACHE_DIR，避免污染用户全局 pip 缓存） */
+export const MUSIC_PIP_CACHE = path.join(PY_DIR, 'cache');
+/** 桥接脚本（全项目唯一 import musicdl 的文件） */
+export const MUSIC_BRIDGE = path.join(APP_DIR, 'lib', 'music', 'bridge.py');
+/** ~/.mackit/cache/music/search（搜索结果快照 search-<id>.json） */
+export const MUSIC_SEARCH_CACHE_DIR = path.join(CACHE_DIR, 'music', 'search');
+/** 默认下载目录 ~/Music/MacKit */
+export const MUSIC_DEFAULT_DIR = path.join(HOME, 'Music', 'MacKit');
+/** 建 venv 用的 python3.12 固定候选（Homebrew 两代前缀；exec 白名单精确放行） */
+export const PY312_CANDIDATES = Object.freeze([
+  '/opt/homebrew/bin/python3.12',
+  '/usr/local/bin/python3.12',
+]);
+
+/**
+ * 探测可用于创建 venv 的 Python 3.12 解释器（纯存在性检查，不执行、不联网）。
+ *
+ * 顺序（设计 §6.1）：Homebrew 两代前缀 → `~/.mackit/py/<name>/bin/python3`（历史 venv）→
+ * 宿主 PATH 里的 `python3.12` → 最后 `python3`。本函数只回答「路径是否存在」，
+ * `version` 一律为 null；真正的版本号由 lib/music/env.js 用执行探针填充并校验 >= 3.12。
+ *
+ * @returns {{found:boolean, version:string|null, path:string|null,
+ *            candidates:Array<{path:string, version:string|null}>}}
+ */
+export function findPython312() {
+  const seen = new Set();
+  /** @type {Array<{path:string, version:string|null}>} */
+  const candidates = [];
+  const push = (p) => {
+    if (typeof p === 'string' && p.length > 0 && !seen.has(p)) {
+      seen.add(p);
+      candidates.push({ path: p, version: null });
+    }
+  };
+
+  for (const p of PY312_CANDIDATES) push(p);
+  // 历史 venv：~/.mackit/py/<name>/bin/python3（用户此前手动建的虚拟环境）
+  try {
+    for (const name of fs.readdirSync(PY_DIR)) push(path.join(PY_DIR, name, 'bin', 'python3'));
+  } catch { /* PY_DIR 不存在：忽略 */ }
+  // 宿主 PATH 里的 python3.12，最后再兜一层裸 python3（版本是否达标交给 env.js 判定）
+  for (const dir of pathDirs()) push(path.join(dir, 'python3.12'));
+  push(firstOnPath('python3'));
+
+  for (const c of candidates) {
+    if (exists(c.path)) return { found: true, version: null, path: c.path, candidates };
+  }
+  return { found: false, version: null, path: null, candidates };
+}
 
 /** 目录权限是否已在本进程内收紧过 */
 let dirModeFixed = false;

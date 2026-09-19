@@ -33,14 +33,11 @@ const { ERR, AppError } = exec;
 const BREW_ENV = Object.freeze({ HOMEBREW_NO_AUTO_UPDATE: '1', HOMEBREW_NO_ENV_HINTS: '1' });
 /** 核心 Tap（卸载需加强警告） */
 const CORE_TAPS = Object.freeze(['homebrew/core', 'homebrew/cask']);
-/** 升级类超时 1800s */
 const UPGRADE_TIMEOUT = 1_800_000;
 
 // ------------------------------ 小工具 ------------------------------
-// 统一实现见 lib/paths.js（2026-09-18 收敛 brew.lineList / env.nonEmptyLines 两份重复）
 const lineList = paths.lines;
 
-/** 读取 MacKit 配置（默认通道 / 自动降级）。 */
 function cfg() {
   try { return store.readMackit(); } catch { return { defaultChannel: 'auto', autoFallback: true }; }
 }
@@ -172,7 +169,6 @@ async function queryInfo(params) {
 
 /** 直连执行并吞异常（只读查询用，无 task signal）。 */
 function safeRun(bin, args, opts = {}) {
-  // 兜底逻辑在 exec.runSafe（2026-09-19 收敛：此前这里又抄了一遍逐字相同的 try/catch）
   return exec.runSafe(bin, args, { env: BREW_ENV, timeoutMs: 120_000, ...opts });
 }
 
@@ -203,7 +199,6 @@ const CASK_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._@/-]*$/;
 const FORMULA_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._@/+-]*$/;
 /** 合法 Tap 名（owner/repo 或自定义源，防注入；untap 用）。 */
 const TAP_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
-/** 取该类别的合法名称校验正则。 */
 function tokenRe(kind) { return kind === 'formula' ? FORMULA_TOKEN_RE : CASK_TOKEN_RE; }
 
 /**
@@ -343,7 +338,6 @@ async function queryPackageSearch(params) {
 
 const INDEX_TTL_MS = 24 * 60 * 60 * 1000;
 
-/** 某类别索引的磁盘缓存路径。 */
 function indexPath(kind) { return path.join(paths.CACHE_DIR, KIND_SPEC[normKind(kind)].cacheFile); }
 
 /** 某类别在「当前镜像源」下的全量元数据 API 地址（与 exec.MIRROR_REMOTES 同一套映射）。 */
@@ -553,7 +547,6 @@ function shellenvTarget() {
   return { rcFile: paths.SHELL_RC, kind: paths.SHELL_KIND };
 }
 
-// 统一实现见 lib/paths.js（2026-09-16 收敛 6 份重复）
 const readTextSafe = paths.readTextSafe;
 
 /**

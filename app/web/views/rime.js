@@ -18,7 +18,6 @@
  */
 
 // 联网策略固定为「代理优先」：后端 netPolicy 缺省 proxy_first，失败自动降级直连，前端不再提供通道选择。
-/** Squirrel 皮肤来源标签 */
 const SOURCE_LABEL = { squirrel: 'squirrel.yaml', build: 'build/squirrel.yaml', degraded: '降级（仅名称）' };
 
 export default {
