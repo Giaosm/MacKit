@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import * as paths from './paths.js';
 import * as env from './env.js';
 import * as exec from './exec.js';
+import { parseRimeAppearance } from './rime-appearance.js';
 
 const { ERR, AppError } = exec;
 
@@ -105,10 +106,8 @@ const RESOLVE_ORDER = Object.freeze([
 // ---------------------------------------------------------------------------
 // 统一实现见 lib/paths.js（2026-09-16 收敛 6 份重复）
 const readTextSafe = paths.readTextSafe;
-function writeTextSafe(p, text) {
-  try { fs.writeFileSync(p, text, 'utf8'); return true; }
-  catch (err) { throw new AppError(ERR.IO_ERROR, `写入失败：${p}`, String(err && err.message)); }
-}
+// 写文本文件：统一实现见 lib/paths.js 的 writeText（2026-09-19 收敛 sysinit/rime/brew 三份）
+const writeTextSafe = paths.writeText;
 function escapeRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 /** 剥离值两侧引号并 trim。 */
@@ -165,9 +164,11 @@ function normalizeColor(raw) {
 // ---------------------------------------------------------------------------
 
 /**
- * 解析 squirrel.yaml 的 `preset_color_schemes:` 段，得到 id → { name, colors }。
+ * 解析 squirrel.yaml 的 `preset_color_schemes:` 段，得到 id → { colors }。
+ * ★ name 不再解析：唯一调用方 readSkins 一律用 SKIN_NAMES（本文件头注明的唯一事实源），
+ *   解析出来的 name 是死数据（2026-09-19 删）。
  * @param {string} text
- * @returns {Map<string, {name:string, colors:(Object|null)}>}
+ * @returns {Map<string, {colors:(Object|null)}>}
  */
 function parseSquirrelSchemes(text) {
   const map = new Map();
@@ -177,7 +178,7 @@ function parseSquirrelSchemes(text) {
 
   const flush = () => {
     if (!cur) return;
-    map.set(cur.id, { name: cur.name || cur.id, colors: resolveColors(cur.raw) });
+    map.set(cur.id, { colors: resolveColors(cur.raw) });
     cur = null;
   };
 
@@ -195,16 +196,15 @@ function parseSquirrelSchemes(text) {
     const mField = /^ {4,}([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/.exec(line);
     if (mField) { if (cur) applyField(cur, mField[1], mField[2]); continue; }
     const mScheme = /^ {2}([A-Za-z0-9_]+):/.exec(line);
-    if (mScheme) { flush(); cur = { id: mScheme[1], name: mScheme[1], raw: {} }; continue; }
+    if (mScheme) { flush(); cur = { id: mScheme[1], raw: {} }; continue; }
   }
   flush();
   return map;
 }
 
-/** 把一个字段写入当前方案（name 单独处理，颜色字段进 raw）。 */
+/** 把一个颜色字段写入当前方案（name 不解析，见 parseSquirrelSchemes 注释）。 */
 function applyField(cur, key, rawValue) {
   const value = stripInlineComment(rawValue);
-  if (key === 'name') { const n = unquote(value); if (n) cur.name = n; return; }
   if (Object.prototype.hasOwnProperty.call(COLOR_FIELDS, key)) cur.raw[key] = value;
 }
 
@@ -274,13 +274,8 @@ function patchYaml(text, key, value) {
 
 /** 读取当前外观（skin / layout / orientation）。 */
 function readCurrentAppearance() {
-  const text = readTextSafe(paths.RIME_CUSTOM);
-  const get = (re) => { const m = text ? re.exec(text) : null; return m ? m[1] : null; };
-  return {
-    skin: get(/style\/color_scheme\b["']?\s*:\s*["']?([\w-]+)/),
-    layout: get(/style\/candidate_list_layout["']?\s*:\s*["']?([\w-]+)/),
-    orientation: get(/style\/text_orientation["']?\s*:\s*["']?([\w-]+)/),
-  };
+  // 与 /api/rime/status 的状态卡同源（lib/rime-appearance.js，跳过注释行）
+  return parseRimeAppearance(readTextSafe(paths.RIME_CUSTOM));
 }
 
 /**
@@ -482,18 +477,76 @@ function requireGrammarModel(ctx) {
   ctx.log('ok', `万象模型已就位：${grammarModelPath()}`);
 }
 
-/** 各方案当前是否已应用语法补丁（${schema}.custom.yaml 存在且含 grammar:）。 */
+/** 各方案当前是否已应用语法补丁（按行判定 grammar:，注释里的不算）。 */
 function readGrammarApplied() {
   return SCHEME_IDS.filter((s) => {
-    try { return fs.readFileSync(grammarCustomPath(s), 'utf8').includes('grammar:'); } catch { return false; }
+    const text = readTextSafe(grammarCustomPath(s));
+    if (text === null) return false;
+    return text.split(/\r?\n/).some((line) => {
+      const t = line.trim();
+      return t !== '' && !t.startsWith('#') && /^grammar\s*:/.test(t);
+    });
   });
 }
 
-/** 为方案启用万象：写入/覆盖 ${schema}.custom.yaml。 */
+/** 语法补丁里由 MacKit 管理的键（合并 / 移除时用来定位）。 */
+const GRAMMAR_KEYS = ['grammar', 'translator/contextual_suggestions', 'translator/max_homophones'];
+
+/**
+ * 把语法补丁**合并**进已有的 ${schema}.custom.yaml —— 不覆盖用户自己的 patch。
+ *
+ * 语义：其它键原样保留；只把 MacKit 管的那几个键替换成最新值；没有 `patch:` 行就补一个。
+ * 幂等：重复执行结果一致。
+ * @param {string} text 现有文件内容
+ * @returns {string} 合并后的内容
+ */
+function mergeGrammarPatch(text) {
+  const block = GRAMMAR_PATCH_TEXT.split('\n').filter((l) => l.trim() !== '' && l.trim() !== 'patch:');
+  const lines = String(text == null ? '' : text).split('\n');
+  while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
+
+  // 1) 摘掉旧的 grammar 块（含缩进更深的子行）与两个 translator 键
+  const out = [];
+  let inGrammarBlock = false;
+  for (const line of lines) {
+    if (inGrammarBlock) {
+      if (line.trim() === '' || /^\s{4,}/.test(line)) continue;
+      inGrammarBlock = false;
+    }
+    const m = /^\s*([A-Za-z_][\w/-]*)\s*:/.exec(line);
+    if (m && GRAMMAR_KEYS.includes(m[1])) {
+      if (m[1] === 'grammar') inGrammarBlock = true;
+      continue;
+    }
+    out.push(line);
+  }
+  // 2) 定位（或补上）顶层 patch: 行
+  let patchIdx = out.findIndex((l) => /^patch:\s*$/.test(l));
+  if (patchIdx < 0) { out.push('patch:'); patchIdx = out.length - 1; }
+  // 3) 插入我们管理的块
+  out.splice(patchIdx + 1, 0, ...block);
+  return `${out.join('\n')}\n`;
+}
+
+/**
+ * 为方案启用万象语法模型。
+ * ★ 2026-09-19 起改为**合并写入**：此前直接整文件覆盖 ${schema}.custom.yaml，
+ *   而 rime_ice.custom.yaml 正是用户最常放自定义补丁的文件 —— 一覆盖就没了
+ *   （「移除」侧本来就有护栏，两边态度不一致）。
+ */
 function applyGrammarPatch(ctx, schema) {
   const p = grammarCustomPath(schema);
-  writeTextSafe(p, GRAMMAR_PATCH_TEXT);
-  ctx.log('ok', `已为 ${schema} 启用万象语法模型`);
+  const existing = readTextSafe(p);
+  if (existing === null || existing.trim() === '') {
+    paths.writeText(p, GRAMMAR_PATCH_TEXT);
+    ctx.log('ok', `已为 ${schema} 启用万象语法模型`);
+    return;
+  }
+  const merged = mergeGrammarPatch(existing);
+  if (merged === existing) { ctx.log('ok', `${schema} 的语法模型配置已是最新，无需改动`); return; }
+  paths.writeText(p, merged);
+  ctx.log('ok', `已把语法补丁合并进 ${schema}.custom.yaml（你原有的 patch 内容已保留）`);
+  ctx.log('info', `  ${p}`);
 }
 
 /** removeGrammarPatch 的安全护栏：文件除语法补丁外不得含其他配置（注释行忽略）。 */
@@ -508,14 +561,17 @@ const GRAMMAR_PATCH_LINES = new Set([
 function removeGrammarPatch(ctx, schema) {
   const p = grammarCustomPath(schema);
   if (!paths.exists(p)) { ctx.log('info', `${schema} 未启用语法模型，无需移除`); return; }
-  const foreign = fs.readFileSync(p, 'utf8')
+  const text = readTextSafe(p);
+  if (text === null) { ctx.log('info', `${schema} 未启用语法模型，无需移除`); return; }
+  const foreign = text
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#') && !GRAMMAR_PATCH_LINES.has(l));
   if (foreign.length) {
     throw new AppError(ERR.IO_ERROR, `${schema}.custom.yaml 含语法补丁之外的配置，为避免误删请手动处理：${p}`, foreign.slice(0, 3).join(' | '));
   }
-  fs.unlinkSync(p);
+  try { fs.unlinkSync(p); }
+  catch (err) { throw new AppError(ERR.IO_ERROR, `删除 ${p} 失败`, String(err && err.message)); }
   ctx.log('ok', `已移除 ${schema} 的万象语法模型补丁（重新部署后生效）`);
 }
 
@@ -722,7 +778,6 @@ async function queryAppearance() {
     currentSchema: readCurrentSchema(),
     schemes: SCHEME_IDS.map((id, i) => ({ id, name: SCHEME_NAMES[i] })),
     layouts: LAYOUTS.map((l) => ({ ...l })),
-    skinSource: readSkins().source,
     grammarModels: readGrammarModels(),
     grammarApplied: readGrammarApplied(),
   };

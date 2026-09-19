@@ -75,7 +75,7 @@ export default {
       nodes.push(el('div', { class: 'row section' }, [
         el('span', { class: 'muted', text: '生效命令：' }),
         el('code', { class: 'mono', text: src || '—' }),
-        el('button', { class: 'btn btn--sm', type: 'button', text: '复制', on: { click: () => copy(src, '已复制生效命令') } }),
+        el('button', { class: 'btn btn--sm', type: 'button', text: '复制', on: { click: () => ui.copy(src, '已复制生效命令') } }),
       ]));
       return ui.card('① 代理别名（proxy / unproxy）', el('div', {}, nodes), { light: al.matchesExpected ? 'ok' : 'warn' });
     }
@@ -95,7 +95,7 @@ export default {
           ui.diffView(p.diff || []),
         ]),
       });
-      if (ok) await ctx.runTask('sysinit', 'apply_alias', { mode }, { confirm: true });
+      if (ok) { try { await ctx.runTask('sysinit', 'apply_alias', { mode }, { confirm: true }); } catch { /* runTask 内部已 toast */ } }
     }
 
     // ============================ ② Git 全局配置 ============================
@@ -140,7 +140,7 @@ export default {
           el('p', { class: 'muted', text: `跳过 ${st.gitInputs.size - changes.length} 项（值未变化）` }),
         ]),
       });
-      if (ok) await ctx.runTask('sysinit', 'apply_git_config', { changes }, { confirm: true });
+      if (ok) { try { await ctx.runTask('sysinit', 'apply_git_config', { changes }, { confirm: true }); } catch { /* runTask 内部已 toast */ } }
     }
 
     // ============================ ③ GitHub 凭据 ============================
@@ -168,8 +168,9 @@ export default {
               ]),
             });
             if (!ok) return;
-            await ctx.runTask('sysinit', 'store_token', { username, token }, { confirm: true });
-            st.tokenInput.value = ''; // 提交后立即清空，绝不回显 / 不落浏览器本地存储
+            try { await ctx.runTask('sysinit', 'store_token', { username, token }, { confirm: true }); }
+            catch { /* runTask 内部已 toast */ }
+            finally { st.tokenInput.value = ''; /* 提交后立即清空，绝不回显 / 不落浏览器本地存储 */ }
           },
         },
       });
@@ -188,26 +189,30 @@ export default {
     function portSection(pp) {
       const httpI = el('input', { type: 'number', min: '1', max: '65535', value: String(pp.http == null ? '' : pp.http), style: 'max-width:140px' });
       const socksI = el('input', { type: 'number', min: '1', max: '65535', value: String(pp.socks5 == null ? '' : pp.socks5), style: 'max-width:140px' });
+      // 持久提示条（本卡片内的固定节点）：保存后只改它的文字与显隐，绝不整页 render()
+      // —— 整页重建会走 gitSection()，把用户已填但未应用的 Git 用户名/邮箱静默清空。
+      const hint = el('div', { class: 'warn-box section' });
+      const setHint = (text) => { st.portHint = text || ''; hint.textContent = text || ''; hint.hidden = !text; };
+      setHint(st.portHint);
       const btn = el('button', {
         class: 'btn btn--primary', type: 'button', text: '保存端口',
         on: {
           click: async () => {
-            const okInt = (v) => /^[0-9]+$/.test(v) && Number(v) >= 1 && Number(v) <= 65535;
-            const bad = !okInt(httpI.value.trim()) || !okInt(socksI.value.trim());
-            const h = okInt(httpI.value.trim()) ? Number(httpI.value) : pp.http;
-            const s = okInt(socksI.value.trim()) ? Number(socksI.value) : pp.socks5;
+            const bad = !ui.portOk(httpI.value.trim()) || !ui.portOk(socksI.value.trim());
+            const h = ui.portOk(httpI.value.trim()) ? Number(httpI.value) : pp.http;
+            const s = ui.portOk(socksI.value.trim()) ? Number(socksI.value) : pp.socks5;
             if (bad) ui.toast('warn', '非法端口输入已忽略并保持原值（需 1–65535 的整数）');
-            st.portHint = '';
-            await ctx.runTask('sysinit', 'set_proxy_ports', { httpPort: h, socksPort: s });
+            setHint('');
+            try { await ctx.runTask('sysinit', 'set_proxy_ports', { httpPort: h, socksPort: s }); }
+            catch { /* runTask 内部已 toast */ }
             // 保存后仅展示提示，绝不自动调用 apply_git_config
             try {
               const e = await ctx.refreshEnv(true);
               const gp = e.git && e.git.httpProxy;
               const want = `http://127.0.0.1:${h}`;
-              if (gp && gp !== want) st.portHint = `Git 全局代理仍为 ${gp}，如需同步请在下方 Git 配置中修改`;
-              else if (!gp) st.portHint = `Git 全局代理未设置；如需使用请在下方 Git 配置中设为 ${want}`;
+              if (gp && gp !== want) setHint(`Git 全局代理仍为 ${gp}，如需同步请在下方 Git 配置中修改`);
+              else if (!gp) setHint(`Git 全局代理未设置；如需使用请在下方 Git 配置中设为 ${want}`);
             } catch { /* 体检失败忽略 */ }
-            render();
           },
         },
       });
@@ -216,19 +221,14 @@ export default {
         el('div', { class: 'field__row section' }, [el('span', { class: 'muted', style: 'width:120px', text: 'SOCKS5 端口' }), socksI]),
         el('div', { class: 'muted', text: '非纯数字或超出 1–65535 的输入将被忽略并保持原值。' }),
         el('div', { class: 'row section' }, [btn]),
-        st.portHint ? el('div', { class: 'warn-box section', text: st.portHint }) : null,
+        hint,
       ]));
     }
 
-    // ============================ 工具 ============================
-    async function copy(text, msg) {
-      if (!text) return;
-      try { await navigator.clipboard.writeText(text); ui.toast('ok', msg || '已复制'); }
-      catch { ui.toast('warn', '复制失败，请手动选择'); }
-    }
-
     // 任务结束后刷新状态（别名 / Git / Token 状态可能变化）
-    ctx.on('done', (t) => { if (t && t.module === 'sysinit') load(); });
+    // ★ set_proxy_ports 除外：端口卡自己就地更新提示，整页 load() 会按服务端值重建 Git
+    //   输入框 —— 用户「已填但未点应用」的用户名/邮箱会被静默丢弃（2026-09-19 修）。
+    ctx.on('done', (t) => { if (t && t.module === 'sysinit' && t.action !== 'set_proxy_ports') load(); });
 
     load();
   },

@@ -26,14 +26,9 @@ const GIT_KEYS = git.GIT_KEYS;
 // ------------------------------ 工具 ------------------------------
 // 统一实现见 lib/paths.js（2026-09-16 收敛 6 份重复）
 const readText = paths.readTextSafe;
-/**
- * 写文本文件。★ 必须把失败包成带 code 的 AppError：裸 fs 错误没有 code，
- * 会一路落到 server.statusForCode 的 default 分支，把「磁盘写失败」报成 502 命令失败。
- */
-function writeText(p, text) {
-  try { fs.writeFileSync(p, text, 'utf8'); }
-  catch (err) { throw new AppError(ERR.IO_ERROR, `写入失败：${p}`, String(err && err.message)); }
-}
+// 写文本文件：统一实现见 lib/paths.js 的 writeText（失败抛 code=IO_ERROR，
+// 裸 fs 错误没有 code 会被 server 报成 502 命令失败）。2026-09-19 收敛三份重复实现。
+const writeText = paths.writeText;
 
 /** 生成首次运行的占位建议值：一律不含任何姓氏/邮箱/GitHub ID 字面量。 */
 function suggestions(port) {
@@ -300,7 +295,8 @@ const actions = {
         // 非纯数字输入一律忽略、保持原值
         const httpPort = /^[0-9]+$/.test(String(params.httpPort)) ? Number(params.httpPort) : cur.httpPort;
         const socks5Port = /^[0-9]+$/.test(String(params.socksPort)) ? Number(params.socksPort) : cur.socksPort;
-        store.writeBrewgo({ httpPort, socksPort: socks5Port, mirror: cur.mirror });
+        // 不传 mirror：本次只改端口，MIRROR 行原样保留（含自定义的枚举外镜像）
+        store.writeBrewgo({ httpPort, socksPort: socks5Port });
         ctx.log('ok', `已保存到 ~/.brewgo_config：HTTP=${httpPort}, SOCKS5=${socks5Port}`);
         // 不自动改 Git 代理，仅提示
         const gp = await git.config('http.proxy');

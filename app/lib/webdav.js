@@ -130,6 +130,24 @@ function ensureTrailingSlash(u) {
 }
 
 /**
+ * URL 里是否内嵌了 userinfo（形如 `https://user:pass@host/`）。
+ *
+ * 这些凭据在本模块**不会被使用**（request() 只取 hostname / port / pathname，
+ * 认证一律走 Authorization 头），但 backup.js 会把整个 url 打进任务日志、
+ * publicWebdav() 还会把它回填到设置弹窗 —— 所以写入口要直接拒绝。
+ * @param {unknown} raw
+ * @returns {boolean}
+ */
+export function urlHasCredentials(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s.includes('@')) return false;
+  try {
+    const u = new URL(s);
+    return !!(u.username || u.password);
+  } catch { return false; }
+}
+
+/**
  * 把用户填写的 WebDAV 地址解析为绝对 URL（纯函数）。
  *
  * 为什么必须包一层：`new URL()` 对非法输入抛的是裸 `TypeError`（无 `code`），
@@ -152,6 +170,10 @@ function parseDavUrl(raw, label = 'WebDAV 地址') {
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') {
     throw new AppError(DAV_ERR.CONFIG, `${label}仅支持 http / https`);
+  }
+  if (urlHasCredentials(s)) {
+    throw new AppError(DAV_ERR.CONFIG, `${label}里不要写账号密码`,
+      '请把它们填到「用户名」/「密码」栏：URL 里的 userinfo 不参与认证，还会被写进任务日志');
   }
   return u;
 }
@@ -422,11 +444,10 @@ function request(url, opts = {}) {
 
     let settled = false;
     let req = null;
-    let timer = null;
 
+    // 超时由下面 req.setTimeout 的 socket 级超时承担；这里此前还有一个从未被赋值的
+    // `timer` 与 clearTimeout 分支，属死代码，2026-09-19 删除。
     const cleanup = () => {
-      if (timer) clearTimeout(timer);
-      timer = null;
       if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
     };
     const settle = (fn) => {
@@ -513,17 +534,14 @@ export function remoteDirUrl(cfg) {
 }
 
 /**
- * 探测远程目录是否可访问（PROPFIND Depth:0）。
- * @param {{url?:string}} cfg
- * @param {{signal?:AbortSignal, timeoutMs?:number}} [opts]
- * @returns {Promise<{ok:true}>}
+ * 对同一目录发一次 PROPFIND（`depth` 为 '0' 探连接 / '1' 列目录）。
+ * 两处此前是逐字重复的请求块（只差 Depth 一行），2026-09-19 收敛到这里。
  */
-export async function testConnection(cfg, opts = {}) {
-  const dirUrl = remoteDirUrl(cfg);
-  const res = await request(dirUrl, {
+function propfind(dirUrl, depth, cfg, opts = {}) {
+  return request(dirUrl, {
     method: 'PROPFIND',
     headers: {
-      Depth: '0',
+      Depth: String(depth),
       'Content-Type': 'application/xml; charset=utf-8',
       'Content-Length': Buffer.byteLength(PROPFIND_BODY),
     },
@@ -531,6 +549,17 @@ export async function testConnection(cfg, opts = {}) {
     timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT,
     ...cfgAuth(cfg, opts),
   });
+}
+
+/**
+ * 探测远程目录是否可访问（PROPFIND Depth:0）。
+ * @param {{url?:string}} cfg
+ * @param {{signal?:AbortSignal, timeoutMs?:number}} [opts]
+ * @returns {Promise<{ok:true}>}
+ */
+export async function testConnection(cfg, opts = {}) {
+  const dirUrl = remoteDirUrl(cfg);
+  const res = await propfind(dirUrl, '0', cfg, opts);
   assertOk(res, [200, 207]);
   return { ok: true };
 }
@@ -543,17 +572,7 @@ export async function testConnection(cfg, opts = {}) {
  */
 export async function listBackups(cfg, opts = {}) {
   const dirUrl = remoteDirUrl(cfg);
-  const res = await request(dirUrl, {
-    method: 'PROPFIND',
-    headers: {
-      Depth: '1',
-      'Content-Type': 'application/xml; charset=utf-8',
-      'Content-Length': Buffer.byteLength(PROPFIND_BODY),
-    },
-    body: PROPFIND_BODY,
-    timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT,
-    ...cfgAuth(cfg, opts),
-  });
+  const res = await propfind(dirUrl, '1', cfg, opts);
   assertOk(res, [200, 207]);
   const items = parsePropfind(res.body.toString('utf8'), dirUrl);
   return { count: items.length, items };

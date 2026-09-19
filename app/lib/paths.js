@@ -101,6 +101,35 @@ export const PLUM_DIR = path.join(HOME, 'plum');
 export const SQUIRREL_BIN = '/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel';
 
 // ---------------------------------------------------------------------------
+// DeepSeek Harness（dsh）
+// ---------------------------------------------------------------------------
+/** DSH 宿主包名（npm install -g @deepseek-ai/dsh） */
+export const DSH_PACKAGE = '@deepseek-ai/dsh';
+/** 插件市场包名（dsh plugin --profile web add dshmarket） */
+export const DSH_MARKET_PACKAGE = 'dshmarket';
+/** DSH 主 profile 名（dsh web 用的就是它） */
+export const DSH_WEB_PROFILE = 'web';
+/** DSH_HOME：环境变量可覆盖，默认 ~/.dsh（dsh 自身就是这么定的） */
+export const DSH_HOME = (() => {
+  const fromEnv = String(process.env.DSH_HOME || '').trim();
+  return fromEnv !== '' ? fromEnv : path.join(HOME, '.dsh');
+})();
+/** <DSH_HOME>/profiles */
+export const DSH_PROFILES_DIR = path.join(DSH_HOME, 'profiles');
+/** <DSH_HOME>/profiles/web —— web profile 目录 */
+export const DSH_WEB_PROFILE_DIR = path.join(DSH_PROFILES_DIR, DSH_WEB_PROFILE);
+/** web profile 的 package.json（插件依赖 / bundles 的事实源） */
+export const DSH_WEB_MANIFEST = path.join(DSH_WEB_PROFILE_DIR, 'package.json');
+
+// ---------------------------------------------------------------------------
+// MacKit 自身（自更新用）
+// ---------------------------------------------------------------------------
+/** 仓库根目录 = app/ 的上一级；README 推荐的就是 git clone，所以 .git 通常在这里 */
+export const REPO_DIR = path.resolve(APP_DIR, '..');
+/** .git 路径（worktree / submodule 里可能是文件，exists() 两种情况都能判） */
+export const GIT_DIR = path.join(REPO_DIR, '.git');
+
+// ---------------------------------------------------------------------------
 // 可执行文件路径探测
 //
 // 说明：这里只做「存在性探测」并给出确定路径；真正的子进程调用在 lib/exec.js。
@@ -132,6 +161,49 @@ export function readTextSafe(p) {
 }
 
 /**
+ * 构造带 `code` 的错误（形态与 exec.js 的 AppError 一致）。
+ *
+ * ★ 为什么在这里而不是 import exec.js：exec.js → paths.js 已经是一条依赖边，
+ *   反向再 import 会形成循环。store.js 此前也是同一手法（各写一份 mkErr），
+ *   2026-09-19 收敛到这里，全项目只保留这一份。
+ * @param {string} code 取值与 exec.ERR 对齐（如 'IO_ERROR'）
+ * @param {string} message 面向用户的中文短语
+ * @param {string} [detail] 技术细节
+ */
+export function mkCodedError(code, message, detail) {
+  const err = new Error(message);
+  err.code = code;
+  if (detail) err.detail = detail;
+  return err;
+}
+
+/**
+ * 写文本文件；失败抛 `IO_ERROR`。
+ *
+ * 原先 sysinit.writeText / rime.writeTextSafe / brew 的内联写法各有一份（消息都叫
+ * 「写入失败：${p}」），backup 里还有一处裸 writeFileSync（不包错误码，会被上层报成
+ * 502 命令失败）。2026-09-19 统一到这里。
+ * @param {string} p
+ * @param {string} text
+ */
+export function writeText(p, text) {
+  try { fs.writeFileSync(p, text, 'utf8'); }
+  catch (err) { throw mkCodedError('IO_ERROR', `写入失败：${p}`, String(err && err.message)); }
+}
+
+/**
+ * 取字符串末尾 n 行（错误摘要用）。
+ * 「`(stderr||'').trim().split('\n').slice(-3).join('\n')`」这个惯用法原先在 exec(2 处)、
+ * brew(3 处)、dsh(1 处) 各写了一遍，2026-09-19 收敛到这里。
+ * @param {string} text
+ * @param {number} [n=3]
+ * @returns {string}
+ */
+export function tailLines(text, n = 3) {
+  return String(text || '').trim().split('\n').slice(-n).join('\n');
+}
+
+/**
  * 按行拆分，去掉空行与每行首尾空白（全项目唯一实现）。
  *
  * 原先 brew.js 的 `lineList()` 与 env.js 的 `nonEmptyLines()` 各写了一份逐字相同的实现，
@@ -154,6 +226,27 @@ function firstExisting(candidates, fallback) {
     if (c && exists(c)) return c;
   }
   return fallback;
+}
+
+/**
+ * 宿主 PATH 里的目录列表（仅用于「定位工具」，绝不把它整体注入子进程 PATH）。
+ * @returns {string[]}
+ */
+function pathDirs() {
+  return String(process.env.PATH || '').split(':').filter((d) => d.length > 0);
+}
+
+/**
+ * 在宿主 PATH 里找到第一个存在的可执行文件（npm / pnpm / dsh 的兜底探测）。
+ * @param {string} name 裸命令名
+ * @returns {string|null}
+ */
+function firstOnPath(name) {
+  for (const dir of pathDirs()) {
+    const p = path.join(dir, name);
+    if (exists(p)) return p;
+  }
+  return null;
 }
 
 /** Homebrew 安装前缀：Apple Silicon 默认 /opt/homebrew，Intel 默认 /usr/local。 */
@@ -183,23 +276,80 @@ export const BASH_BIN = firstExisting(['/bin/bash', '/usr/local/bin/bash'], '/bi
  * 代码内自引用则回落到当前进程的 execPath。
  */
 export const NODE_BIN = firstExisting(
-  ['/opt/homebrew/bin/node'],
+  ['/opt/homebrew/bin/node', '/usr/local/bin/node', ...pathDirs().map((d) => path.join(d, 'node'))],
   process.execPath
 );
 
 /**
- * PATH 前置段（子进程注入用）。
- * 现实是 brew 在 /opt/homebrew/bin；exec.js 会把它拼到 PATH 最前。
+ * npm / pnpm / dsh 可执行文件（DeepSeek Harness 模块用）。
+ * 探测顺序：Homebrew 两代前缀 → 官网 pkg 的 /usr/local → pnpm 独立安装目录 →
+ * 宿主 PATH 里实际能找到的那一个（覆盖 nvm / fnm / volta 等）。
+ * 都找不到时回落到确定路径，交给调用方按「不存在」处理（exec 层会把 spawn 失败报出来）。
  */
-export const PATH_PREFIX = ['/opt/homebrew/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+export const NPM_BIN = firstExisting(
+  [`${BREW_PREFIX}/bin/npm`, '/opt/homebrew/bin/npm', '/usr/local/bin/npm'],
+  firstOnPath('npm') || `${BREW_PREFIX}/bin/npm`
+);
+/** pnpm（插件市场的前置；也可能来自 brew install pnpm 或独立安装脚本） */
+export const PNPM_BIN = firstExisting(
+  [`${BREW_PREFIX}/bin/pnpm`, '/opt/homebrew/bin/pnpm', '/usr/local/bin/pnpm',
+    path.join(HOME, 'Library', 'pnpm', 'pnpm'), path.join(HOME, '.local', 'share', 'pnpm', 'pnpm')],
+  firstOnPath('pnpm') || `${BREW_PREFIX}/bin/pnpm`
+);
+/** dsh（DeepSeek Harness 宿主；npm install -g 后落在全局前缀的 bin 下） */
+export const DSH_BIN = firstExisting(
+  [`${BREW_PREFIX}/bin/dsh`, '/opt/homebrew/bin/dsh', '/usr/local/bin/dsh',
+    path.join(HOME, '.local', 'bin', 'dsh'), path.join(HOME, 'Library', 'pnpm', 'dsh')],
+  firstOnPath('dsh') || `${BREW_PREFIX}/bin/dsh`
+);
+
+/**
+ * PATH 前置段（子进程注入用）。
+ * 现实是 brew 在 /opt/homebrew/bin（Apple Silicon）或 /usr/local/bin（Intel），
+ * 官网 pkg 装的 Node 也在 /usr/local/bin；exec.js 会把它拼到 PATH 最前。
+ */
+export const PATH_PREFIX = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+
+/**
+ * 实际注入子进程的 PATH（exec.js 用这一个）。
+ *
+ * 在固定的 PATH_PREFIX 之后追加「上面探测到的各工具自己所在目录」：宿主 PATH 仍然
+ * 完全不被继承（这是 2026-09-16 的教训，见 exec.buildEnv），但 nvm / fnm / 自定义
+ * 前缀装的 node / npm / pnpm / dsh 也能被子进程找到 —— 否则 `#!/usr/bin/env node`
+ * 这类 shebang 会因为 PATH 里没有 node 而失败。
+ * 去重且保持顺序：PATH_PREFIX 里已有的目录不会被重复追加。
+ */
+export const EXEC_PATH = (() => {
+  const dirs = [NODE_BIN, NPM_BIN, PNPM_BIN, DSH_BIN, BREW_BIN, GIT_BIN]
+    .map((bin) => path.dirname(bin));
+  const seen = new Set();
+  const out = [];
+  for (const d of [...PATH_PREFIX, ...dirs]) {
+    if (!seen.has(d)) { seen.add(d); out.push(d); }
+  }
+  return out;
+})();
+
+/** 目录权限是否已在本进程内收紧过 */
+let dirModeFixed = false;
 
 /**
  * 幂等创建 MacKit 数据目录：MACKIT_DIR / LOGS_DIR / HISTORY_DIR / CACHE_DIR。
- * 已存在则不报错；创建失败抛出 IO_ERROR 语义的异常由调用方处理。
+ *
+ * 权限收紧到 0700（2026-09-19）：目录里放的是任务日志（可能含 WebDAV 地址、包名、
+ * 本机路径）与缓存，此前用默认 mode 建成 0755，同机其他用户可读；config.json /
+ * webdav.json / history 早就单独 chmod 600 了，目录与日志属于漏网。
+ * chmod 只在进程内做一次：ensureDirs 会被 appendLog 每写一行日志调用，
+ * 每次都 chmod 4 个目录是白白的系统调用。
  */
 export function ensureDirs() {
   for (const dir of [MACKIT_DIR, LOGS_DIR, HISTORY_DIR, CACHE_DIR]) {
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+  if (dirModeFixed) return;
+  dirModeFixed = true;
+  for (const dir of [MACKIT_DIR, LOGS_DIR, HISTORY_DIR, CACHE_DIR]) {
+    try { fs.chmodSync(dir, 0o700); } catch { /* 目录可能不属于自己（历史遗留），不致命 */ }
   }
 }
 
@@ -211,3 +361,58 @@ export const LOOPBACK = '127.0.0.1';
 
 /** 代理主机 */
 export const PROXY_HOST = '127.0.0.1';
+
+// ---------------------------------------------------------------------------
+// DeepSeek Harness · profile 清单读取（纯 fs，无子进程，供 dsh 模块与 env 体检共用）
+// ---------------------------------------------------------------------------
+
+/**
+ * 读取 web profile 的 package.json。
+ * @returns {any|null} 解析失败 / 文件不存在一律 null
+ */
+export function readDshWebManifest() {
+  const text = readTextSafe(DSH_WEB_MANIFEST);
+  if (text === null) return null;
+  try {
+    const obj = JSON.parse(text);
+    return obj && typeof obj === 'object' ? obj : null;
+  } catch { return null; }
+}
+
+/**
+ * 插件市场（dshmarket）在 web profile 里的安装状态。
+ *
+ * 「已装」以 node_modules/<包名>/package.json 的 version 为准（pnpm 装完即存在）；
+ * 「已登记」看 profile 清单的 dsh.profile.bundles —— dsh 的 plugin 命令会在 pnpm
+ * 成功后把声明了 dsh.bundle 的依赖补进 bundles，两者都齐才真正作为一层生效。
+ *
+ * @returns {{installed:boolean, declared:boolean, version:string|null, bundles:string[],
+ *            profileDir:string, manifest:string}}
+ */
+export function readDshMarketState() {
+  const manifest = readDshWebManifest();
+  const declared = !!(manifest && manifest.dependencies
+    && Object.prototype.hasOwnProperty.call(manifest.dependencies, DSH_MARKET_PACKAGE));
+  const bundleList = manifest && manifest.dsh && manifest.dsh.profile
+    && Array.isArray(manifest.dsh.profile.bundles) ? manifest.dsh.profile.bundles : [];
+  const bundles = bundleList.filter((b) => typeof b === 'string');
+
+  const pkgDir = path.join(DSH_WEB_PROFILE_DIR, 'node_modules', ...DSH_MARKET_PACKAGE.split('/'));
+  let version = null;
+  const pkgText = readTextSafe(path.join(pkgDir, 'package.json'));
+  if (pkgText !== null) {
+    try {
+      const pkg = JSON.parse(pkgText);
+      if (pkg && typeof pkg.version === 'string') version = pkg.version;
+    } catch { /* 版本读不到不影响「已安装」判定 */ }
+  }
+
+  return {
+    installed: version !== null || exists(pkgDir),
+    declared,
+    version,
+    bundles,
+    profileDir: DSH_WEB_PROFILE_DIR,
+    manifest: DSH_WEB_MANIFEST,
+  };
+}

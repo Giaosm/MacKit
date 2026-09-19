@@ -9,15 +9,14 @@
  *      配置迁移的唯一入口是「备份中心」的 WebDAV 备份，见 lib/backup.js。）
  *
  * 本文件只使用 node:fs / node:path，不引入 child_process，也不引入 exec.js（避免循环依赖）；
- * 因此错误码以字面量给出（取值与 exec.js 的 ERR 一致）。
+ * 因此错误码以字面量给出（取值与 exec.js 的 ERR 一致），统一经 paths.mkCodedError 构造
+ * （2026-09-19 起全项目只有那一份实现）。
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import * as paths from './paths.js';
 
-// 与 exec.js 的 ERR 取值一致（此处不 import exec.js，避免 exec → store → exec 循环）
-const E_IO = 'IO_ERROR';
 
 /** MacKit 配置默认值 */
 const MACKIT_DEFAULTS = Object.freeze({ defaultChannel: 'auto', autoFallback: true, autoCleanup: true, lastCheckedAt: null, version: 1 });
@@ -31,14 +30,6 @@ const LOG_KEEP_DAYS = 30;
 const HISTORY_KEEP = 10;
 
 // ---------------------------- 通用工具 ----------------------------
-/** 构造带 code 的 Error（形态与 exec.js 的 AppError 兼容）。 */
-function mkErr(code, message, detail) {
-  const err = new Error(message);
-  err.code = code;
-  if (detail) err.detail = detail;
-  return err;
-}
-
 function safeStat(p) { try { return fs.statSync(p); } catch { return null; } }
 // 统一实现见 lib/paths.js（2026-09-16 收敛 6 份重复）
 const readTextSafe = paths.readTextSafe;
@@ -62,19 +53,18 @@ function writeJsonSafe(p, obj) {
     return true;
   } catch (err) {
     try { fs.rmSync(tmp, { force: true }); } catch { /* 清理失败不影响报错 */ }
-    throw mkErr(E_IO, '写入 JSON 文件失败', `${p}: ${err && err.message}`);
+    throw paths.mkCodedError(E_IO, '写入 JSON 文件失败', `${p}: ${err && err.message}`);
   }
 }
 /**
- * 列出目录下的文件。
+ * 列出目录下的文件（跳过点文件与 .tmp 临时文件）。
  * @param {string} dir 目录
  * @param {string|null} ext 扩展名过滤（如 '.json'），null 表示不过滤
- * @param {boolean} [includeDot=false] 是否包含点文件（如 .zshrc）；默认 false，保持既有调用方语义不变
  */
-function listFiles(dir, ext, includeDot = false) {
+function listFiles(dir, ext) {
   try {
     return fs.readdirSync(dir)
-      .filter((n) => (includeDot ? true : !n.startsWith('.')))
+      .filter((n) => !n.startsWith('.'))
       .filter((n) => (ext ? n.endsWith(ext) : true))
       .map((n) => path.join(dir, n));
   } catch { return []; }
@@ -82,9 +72,20 @@ function listFiles(dir, ext, includeDot = false) {
 
 // ---------------------- ~/.brewgo_config（事实源，格式不变） ----------------------
 
+/**
+ * 去掉值后面的行尾注释（`7897 # http` → `7897`）。
+ * 与 writeBrewgo 的 trailingComment 配对：写入时保留注释，读取时必须能跳过它，
+ * 否则 MacKit 自己写出来的 `PORT=7897 # http` 会解析失败并静默回落默认值。
+ */
+function stripValueComment(v) {
+  const s = String(v == null ? '' : v);
+  const i = s.indexOf('#');
+  return (i < 0 ? s : s.slice(0, i)).trim();
+}
+
 /** 读取 brewgo 配置（容错：跳过空行与注释、端口须纯数字、MIRROR 须在枚举内）。 */
 export function readBrewgo() {
-  const result = { httpPort: 7897, socksPort: 7897, mirror: 'official', hadMirrorKey: false, exists: false };
+  const result = { httpPort: 7897, socksPort: 7897, mirror: 'official', mirrorRaw: null, hadMirrorKey: false, exists: false };
   const text = readTextSafe(paths.BREWGO_CONFIG);
   if (text === null) return result;
   result.exists = true;
@@ -94,7 +95,7 @@ export function readBrewgo() {
     const eq = line.indexOf('=');
     if (eq < 0) continue;
     const key = line.slice(0, eq).trim();
-    const value = line.slice(eq + 1).trim();
+    const value = stripValueComment(line.slice(eq + 1));
     if (key === 'PROXY_HTTP_PORT' || key === 'PROXY_SOCKS5_PORT') {
       if (/^[0-9]+$/.test(value)) {
         const n = Number.parseInt(value, 10);
@@ -104,18 +105,35 @@ export function readBrewgo() {
       }
     } else if (key === 'MIRROR') {
       result.hadMirrorKey = true;
+      // 原值一并带出：枚举外的自定义镜像（如自建源）不再被静默丢弃 —— 保存端口时
+      // 若调用方没显式给 mirror，writeBrewgo 会原样保留那一行（见 writeBrewgo 注释）。
+      result.mirrorRaw = value;
       if (MIRROR_IDS.includes(value)) result.mirror = value;
     }
   }
   return result;
 }
 
-/** 校验并归一化 brewgo 写入值。 */
+/**
+ * 校验并归一化 brewgo 写入值。
+ * `mirror` 缺省（undefined）= **本次不改写 MIRROR 行**；只有界面上显式选了镜像才传值。
+ * （2026-09-19 修：此前一律回落 'official' 并整行写回，用户在文件里自定义的镜像值
+ *   只要改一次端口就会被静默改成 official。）
+ */
 function normalizeBrewgoInput(v) {
   const httpPort = Number.isInteger(v.httpPort) && v.httpPort >= 1 && v.httpPort <= 65535 ? v.httpPort : 7897;
   const socksPort = Number.isInteger(v.socksPort) && v.socksPort >= 1 && v.socksPort <= 65535 ? v.socksPort : 7897;
-  const mirror = MIRROR_IDS.includes(v.mirror) ? v.mirror : 'official';
+  const mirror = MIRROR_IDS.includes(v.mirror) ? v.mirror : null;
   return { httpPort, socksPort, mirror };
+}
+
+/**
+ * 取出 `KEY=值 # 注释` 里的行尾注释（含前导空格）；没有则返回空串。
+ * 用于原地改值时保留用户写的注释（值只可能是端口号 / 镜像 id，不会含 #）。
+ */
+function trailingComment(rest) {
+  const i = String(rest || '').indexOf('#');
+  return i < 0 ? '' : ` ${String(rest).slice(i).trim()}`;
 }
 
 /**
@@ -131,8 +149,8 @@ export function writeBrewgo(v) {
   const wants = new Map([
     ['PROXY_HTTP_PORT', String(httpPort)],
     ['PROXY_SOCKS5_PORT', String(socksPort)],
-    ['MIRROR', mirror],
   ]);
+  if (mirror) wants.set('MIRROR', mirror);   // 缺省时不动 MIRROR 行
   const foundKeys = new Set();
 
   let lines;
@@ -145,9 +163,10 @@ export function writeBrewgo(v) {
 
   const out = [];
   for (const line of lines) {
-    const m = /^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(line);
+    const m = /^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/.exec(line);
     if (m && wants.has(m[2])) {
-      out.push(`${m[2]}=${wants.get(m[2])}`);
+      // 只换值，行尾注释原样保留（此前整行重写会把 `PORT=7897 # http` 的注释吞掉）
+      out.push(`${m[2]}=${wants.get(m[2])}${trailingComment(m[3])}`);
       foundKeys.add(m[2]);
     } else {
       out.push(line);
@@ -160,7 +179,7 @@ export function writeBrewgo(v) {
   try {
     fs.writeFileSync(target, out.join('\n') + '\n', 'utf8');
   } catch (err) {
-    throw mkErr(E_IO, '写入 ~/.brewgo_config 失败', String(err && err.message));
+    throw paths.mkCodedError(E_IO, '写入 ~/.brewgo_config 失败', String(err && err.message));
   }
   return { httpPort, socksPort, mirror };
 }
@@ -218,12 +237,35 @@ const WEBDAV_DEFAULTS = Object.freeze({ url: '', username: '', password: '', all
 export function readWebdav() {
   const raw = readJsonSafe(paths.WEBDAV_JSON, {}) || {};
   return {
-    url: typeof raw.url === 'string' ? raw.url.trim() : WEBDAV_DEFAULTS.url,
+    url: stripUrlCredentials(typeof raw.url === 'string' ? raw.url.trim() : WEBDAV_DEFAULTS.url),
     username: typeof raw.username === 'string' ? raw.username : WEBDAV_DEFAULTS.username,
     password: typeof raw.password === 'string' ? raw.password : WEBDAV_DEFAULTS.password,
     allowInsecureTLS: raw.allowInsecureTLS === true,
     version: 1,
   };
+}
+
+/**
+ * 去掉 URL 里内嵌的 userinfo（`https://user:pass@host/dav` → `https://host/dav`）。
+ *
+ * ★ 为什么要在读的时候就剥掉：WebDAV 认证走独立的用户名/密码字段，URL 里的 userinfo
+ *   **根本不参与认证**（lib/webdav.js 发请求只取 hostname/port/pathname），但 backup.js
+ *   会把整个 url 打进任务日志、publicWebdav() 还会把它回填到设置弹窗 —— 等于把密码
+ *   明文写进 ~/.mackit/logs/*.log 并显示在界面上。写入口（lib/webdav.js 的 parseDavUrl
+ *   与 /api/webdav/config）会直接拒绝这种写法并提示填到密码栏；这里是对历史遗留值的兜底。
+ * @param {string} raw
+ * @returns {string}
+ */
+function stripUrlCredentials(raw) {
+  const s = String(raw || '');
+  if (!s.includes('@')) return s;
+  try {
+    const u = new URL(s);
+    if (!u.username && !u.password) return s;
+    u.username = '';
+    u.password = '';
+    return u.toString();
+  } catch { return s; }
 }
 
 /**
@@ -269,7 +311,11 @@ export function logFilePath(taskId) { return path.join(paths.LOGS_DIR, `${taskId
 /** 追加一行日志（逐行 JSON）。 */
 export function appendLog(taskId, line) {
   paths.ensureDirs();
-  try { fs.appendFileSync(logFilePath(taskId), JSON.stringify(line) + '\n', 'utf8'); } catch { /* 日志写失败不阻断任务 */ }
+  // mode 只在**创建**时生效：日志里可能含 WebDAV 地址、包名、本机路径，
+  // 与 config.json / webdav.json / history 同口径收紧到仅本人可读。
+  try {
+    fs.appendFileSync(logFilePath(taskId), JSON.stringify(line) + '\n', { encoding: 'utf8', mode: 0o600 });
+  } catch { /* 日志写失败不阻断任务 */ }
 }
 
 /** 读取某任务日志（跳过损坏行，按 seq 升序）。 */
@@ -382,7 +428,10 @@ function pruneByPolicy(dir, ext, keepCount = LOG_KEEP_TASKS) {
   const files = listFiles(dir, ext);
   if (files.length === 0) return;
   const cutoff = Date.now() - LOG_KEEP_DAYS * 24 * 60 * 60 * 1000;
-  const withStat = files.map((f) => ({ f, m: safeStat(f)?.mtimeMs || 0 }));
+  // stat 失败（权限 / 竞态）时**跳过该文件**，而不是把 mtime 当 0 直接归入「超 30 天」删除
+  const withStat = files
+    .map((f) => ({ f, m: safeStat(f)?.mtimeMs ?? null }))
+    .filter((x) => x.m !== null);
   const remain = [];
   for (const item of withStat) {
     if (item.m < cutoff) {

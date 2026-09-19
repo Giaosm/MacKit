@@ -67,7 +67,7 @@ async function runPolicy(ctx, policy, desc, args, opts = {}) {
     const channel = policy === 'proxy_first' ? 'proxy' : 'direct';
     ctx.log('info', `尝试${channel === 'proxy' ? '代理' : '直连'}执行: ${desc} ...`);
     const res = await ctx.exec.run('brew', args, { ...common, channel });
-    if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, `${desc}失败`, (res.stderr || '').trim().split('\n').slice(-3).join('\n'));
+    if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, `${desc}失败`, paths.tailLines(res.stderr));
     ctx.setChannel(channel);
     ctx.log('ok', `${desc} 成功 (使用${channel === 'proxy' ? '代理' : '直连'})`);
     return { ...res, channel };
@@ -86,7 +86,8 @@ async function runPolicy(ctx, policy, desc, args, opts = {}) {
 function finalizeBatch(task, { log }) {
   const steps = Array.isArray(task.steps) ? task.steps : [];
   // 收尾清理步骤（id='autoclean'）不参与软件包计数；计数口径见 runner.countSteps（唯一实现）
-  const counts = countSteps(steps.filter((s) => s.id !== 'autoclean'));
+  // autoclean 是收尾清理、noop 是「没选中任何项」的占位步骤，都不计入成功数
+  const counts = countSteps(steps.filter((s) => s.id !== 'autoclean' && s.id !== 'noop'));
   const autoCleanRan = steps.some((s) => s.id === 'autoclean' && s.status === 'ok');
   const { ok, fail, skip } = counts;
   task.counts = { ok, fail, skip }; // 回写修正后的计数（供 UI / 历史读取）
@@ -170,12 +171,9 @@ async function queryInfo(params) {
 }
 
 /** 直连执行并吞异常（只读查询用，无 task signal）。 */
-async function safeRun(bin, args, opts = {}) {
-  try {
-    return await exec.run(bin, args, { env: BREW_ENV, timeoutMs: 120_000, ...opts });
-  } catch (err) {
-    return { code: -1, stdout: '', stderr: (err && err.message) || String(err) };
-  }
+function safeRun(bin, args, opts = {}) {
+  // 兜底逻辑在 exec.runSafe（2026-09-19 收敛：此前这里又抄了一遍逐字相同的 try/catch）
+  return exec.runSafe(bin, args, { env: BREW_ENV, timeoutMs: 120_000, ...opts });
 }
 
 // ------------------------------ 软件包搜索（Cask / Formula 共用） ------------------------------
@@ -203,6 +201,8 @@ const SEARCH_LIMIT = 30;
 const CASK_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._@/-]*$/;
 /** 合法 Formula 名：比 cask 多一个 `+`（如 libc++）。 */
 const FORMULA_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._@/+-]*$/;
+/** 合法 Tap 名（owner/repo 或自定义源，防注入；untap 用）。 */
+const TAP_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 /** 取该类别的合法名称校验正则。 */
 function tokenRe(kind) { return kind === 'formula' ? FORMULA_TOKEN_RE : CASK_TOKEN_RE; }
 
@@ -303,10 +303,12 @@ async function queryPackageSearch(params) {
   if (!q) return { kind, query: q, results: [], total: 0, limit: SEARCH_LIMIT, indexedAt: null };
   let tokens = null;
   let indexedAt = null;
+  let indexTotal = null;   // 索引路径下的「全部命中数」（searchIndex 的 items 已被截到 limit）
   try {
     const idx = await ensureIndex(kind);
     const hits = searchIndex(idx.items, q, SEARCH_LIMIT);
     tokens = hits.items.map((c) => c.t);
+    indexTotal = hits.total;
     indexedAt = idx.builtAt;
   } catch (err) {
     if (err instanceof AppError && (err.code === ERR.CANCELLED || err.code === ERR.TIMEOUT)) throw err;
@@ -319,11 +321,13 @@ async function queryPackageSearch(params) {
     if (tokens.length === 0) {
       const errText = (res.stderr || '').trim();
       if (!(res.code === 0 || /no (available )?(formulae or casks|formula|cask)/i.test(errText) || errText === '')) {
-        throw new AppError(ERR.CMD_FAILED, `${spec.label} 搜索失败`, errText.split('\n').slice(-3).join('\n'));
+        throw new AppError(ERR.CMD_FAILED, `${spec.label} 搜索失败`, paths.tailLines(errText));
       }
     }
   }
-  const total = tokens.length;
+  // ★ total 必须是「全部命中数」：searchIndex 已把 items 截到 limit，若用 tokens.length
+  //   则 total 恒 ≤30，前端「共 N 个匹配，显示前 30 个」永远不会出现（2026-09-19 修）。
+  const total = indexTotal === null ? tokens.length : indexTotal;
   const shown = tokens.slice(0, SEARCH_LIMIT).filter((t) => re.test(t));
   if (shown.length === 0) return { kind, query: q, results: [], total: 0, limit: SEARCH_LIMIT, indexedAt };
   const info = await safeRun('brew', ['info', spec.brewFlag, '--json=v2', ...shown]);
@@ -347,8 +351,10 @@ function indexApiUrl(kind) {
   const spec = KIND_SPEC[normKind(kind)];
   let mirror = 'official';
   try { mirror = store.readBrewgo().mirror || 'official'; } catch { /* ignore */ }
-  const remote = exec.MIRROR_REMOTES[mirror];
-  if (remote) return `${remote.replace(/\/brew\.git$/, '')}/homebrew-bottles/api/${spec.apiFile}`;
+  // ★ 用显式的 API 域名表：从 brew.git 远端「剥掉 /brew.git 再拼 /homebrew-bottles/api」
+  //   对 ustc/aliyun 恰好成立，但 tuna/tencent 的远端多一层 /git/homebrew → 实测 404。
+  const api = exec.mirrorApiDomain(mirror);
+  if (api) return `${api}/${spec.apiFile}`;
   return `https://formulae.brew.sh/api/${spec.apiFile}`;
 }
 
@@ -566,11 +572,13 @@ function shellenvStep() {
       } else {
         // 等效官方 Next steps 的前两条命令（echo >> rc；echo '<line>' >> rc）
         const block = buildShellenvBlock(text, line);
-        try {
-          fs.writeFileSync(rcFile, block, 'utf8');
-        } catch (err) {
-          throw new AppError(ERR.IO_ERROR, `写入 ${rcFile} 失败`, String(err && err.message));
+        // readTextSafe 对所有读取异常都返回 null，与「文件不存在」不可区分：若把读失败
+        // 当成空文件再整文件写回，用户的 shell 配置会被替换成只剩这一行（2026-09-19 加固）。
+        if (text === '' && paths.exists(rcFile)) {
+          throw new AppError(ERR.IO_ERROR, `无法读取 ${rcFile}，已中止以免覆盖你的配置`,
+            '请检查该文件的权限 / 是否为悬空软链接后重试');
         }
+        paths.writeText(rcFile, block);
         ctx.log('ok', `已向 ${rcFile}（${kind}）追加环境配置`);
         if (text !== '') ctx.log('info', `  补空行分隔（等效官方 echo >> ${rcFile}）`);
         ctx.log('info', '  # Added by MacKit (Homebrew)');
@@ -599,10 +607,17 @@ async function downloadInstallScript(ctx) {
   for (const url of INSTALL_SCRIPT_URLS) {
     try {
       ctx.log('info', `下载官方安装脚本：${url}`);
-      await ctx.exec.run('curl', ['-fsSL', '--max-time', '120', '-o', target, url], {
+      const res = await ctx.exec.run('curl', ['-fsSL', '--max-time', '120', '-o', target, url], {
         timeoutMs: 150_000, channel: 'proxy',
         onLine: (line, stream) => { if (line.trim()) ctx.log(stream === 'stderr' ? 'warn' : 'info', line); },
       });
+      if (res.code !== 0) {
+        // curl 默认不删失败输出：超时中断留下的半截脚本可能仍然 >5KB 并通过下面的校验
+        try { fs.rmSync(target, { force: true }); } catch { /* ignore */ }
+        lastErr = new AppError(ERR.CMD_FAILED, '安装脚本下载失败', paths.tailLines(res.stderr));
+        ctx.log('warn', '该地址下载失败，尝试下一个…');
+        continue;
+      }
       const text = readTextSafe(target) || '';
       if (text.includes('#!/bin/bash') && text.length >= INSTALL_SCRIPT_MIN_BYTES) {
         ctx.log('ok', `脚本已就绪（${text.length} 字节）`);
@@ -667,7 +682,7 @@ function homebrewInstallSteps() {
         }
         if (!paths.exists(paths.BREW_BIN)) {
           throw new AppError(ERR.CMD_FAILED, '安装脚本已结束但未检测到 brew',
-            (res.stderr || '').trim().split('\n').slice(-3).join('\n'));
+            paths.tailLines(res.stderr));
         }
         ctx.log('ok', `Homebrew 安装完成：${paths.BREW_BIN}`);
         const ver = await safeCtx(ctx, ['--version']);
@@ -721,7 +736,6 @@ const actions = {
   /** brew 本体更新（proxy_first） */
   brew_update: {
     title: '更新 Homebrew 本体',
-    channelPolicy: 'proxy_first',
     steps: () => [{
       id: 'brew_update', title: '更新 Homebrew 本体', channelPolicy: 'proxy_first', timeoutMs: UPGRADE_TIMEOUT,
       run: async (ctx) => { await runPolicy(ctx, 'proxy_first', 'Homebrew 更新', ['update']); },
@@ -746,6 +760,10 @@ const actions = {
             if (mode === 'skip') {
               ctx.log('warn', `已跳过 ${it.name}`);
               throw Object.assign(new AppError('SKIP', `已跳过 ${it.name}`), { code: 'SKIP' });
+            }
+            if (!tokenRe(kind).test(it.name)) {
+              ctx.log('error', `名称不合法（含 brew 选项或非法字符），已跳过：${it.name}`);
+              throw Object.assign(new AppError('SKIP', `名称不合法：${it.name}`), { code: 'SKIP' });
             }
             const args = ['upgrade'];
             if (kind === 'cask') args.push('--cask');
@@ -862,7 +880,10 @@ const actions = {
 function batchUninstallSteps(names, kind) {
   const isTap = kind === 'tap';
   const spec = isTap ? null : KIND_SPEC[normKind(kind)];
-  const list = Array.isArray(names) ? names.filter((n) => typeof n === 'string' && n) : [];
+  // ★ 与安装侧同口径校验（名称最终会作为 spawn 参数）：此前卸载/untap 只判「非空字符串」，
+  //   `--zap` 之类的值会被 brew 当成选项解释（2026-09-19 补齐）。
+  const nameRe = isTap ? TAP_NAME_RE : tokenRe(spec.kind);
+  const list = Array.isArray(names) ? names.filter((n) => typeof n === 'string' && nameRe.test(n)) : [];
   if (list.length === 0) {
     const what = isTap ? '软件源' : spec.label;
     return [{ id: 'noop', title: '无可卸载项', run: async (ctx) => { ctx.log('warn', `未选择任何${what}`); } }];

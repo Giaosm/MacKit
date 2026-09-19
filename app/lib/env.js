@@ -17,6 +17,7 @@ import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
 import * as git from './git.js';
+import { parseRimeAppearance } from './rime-appearance.js';
 
 /** 快照缓存时长 */
 const CACHE_TTL_MS = 30_000;
@@ -384,18 +385,11 @@ function rimeSnapshot() {
   const mainSchemaExists = paths.exists(paths.RIME_MAIN_SCHEMA);
   const squirrelDeployable = paths.exists(paths.SQUIRREL_BIN);
 
-  let currentSkin = null;
-  let currentLayout = null;
-  let currentOrientation = null;
-  const custom = readTextSafe(paths.RIME_CUSTOM);
-  if (custom) {
-    const skin = custom.match(/style\/color_scheme\b["']?\s*:\s*["']?([\w-]+)/);
-    const layout = custom.match(/style\/candidate_list_layout["']?\s*:\s*["']?([\w-]+)/);
-    const orient = custom.match(/style\/text_orientation["']?\s*:\s*["']?([\w-]+)/);
-    currentSkin = skin ? skin[1] : null;
-    currentLayout = layout ? layout[1] : null;
-    currentOrientation = orient ? orient[1] : null;
-  }
+  // 与 rime.js 的「应用外观」预览同源（lib/rime-appearance.js，跳过注释行）
+  const appearance = parseRimeAppearance(readTextSafe(paths.RIME_CUSTOM));
+  const currentSkin = appearance.skin;
+  const currentLayout = appearance.layout;
+  const currentOrientation = appearance.orientation;
 
   return {
     status: (dirExists && mainSchemaExists && squirrelDeployable) ? 'ok' : 'warn',
@@ -507,7 +501,10 @@ async function buildSnapshot(gen) {
 
   // 构建期间配置被改过（invalidate 提升 generation）→ 结果已过期，不写缓存，
   // 让下一次请求自然重算；否则会把旧配置的快照重新喂给 30s 内的所有调用方。
-  if (gen === generation) store.setCached(CACHE_KEY, result);
+  // 缓存写失败绝不能拖垮体检本身：快照是算出来的、缓存只是加速。
+  // （此前未包裹：~/.mackit/cache 不可写时整个 /api/env 直接报 IO_ERROR，
+  //   而 store.getCached / 其它 3 处 setCached 都是静默兜底的。）
+  if (gen === generation) { try { store.setCached(CACHE_KEY, result); } catch { /* ignore */ } }
   return result;
 }
 

@@ -2,7 +2,8 @@
  * MacKit · 执行层（唯一子进程出口）
  *
  *   - 一律 spawn(bin, argsArray, { shell:false })：绝不启用 shell 选项、绝不拼接命令行字符串
- *   - 命令白名单：brew / git / xattr / security / osascript / curl（+ 绝对路径的 Squirrel）
+ *   - 命令白名单：brew / git / xattr / security / osascript / curl / node / npm / pnpm / dsh
+ *     （+ 绝对路径的 Squirrel）
  *   - 环境变量注入：代理（channel）与 Homebrew 镜像源；PATH 完全固定（不继承宿主）
  *   - 流式 stdout/stderr 逐行回调、超时、AbortSignal 取消（SIGTERM→3s→SIGKILL）
  *   - osascript 管理员授权封装（退出码 -128 = 用户取消）
@@ -91,6 +92,7 @@ const MAX_CAPTURE = 4_000_000;
  * 命令白名单：逻辑名 → 固定路径。
  * ★ 白名单即本表的键集（2026-09-18 合并）：原先另有一份平行的 `WHITELIST` 数组需与
  *   本表手工同步，漏改一处就会出现「名字合法但查不到路径」的空档。
+ *   node / npm / pnpm / dsh 供 DeepSeek Harness 模块安装与自检使用（2026-09-19 新增）。
  */
 const BIN_MAP = Object.freeze({
   brew: paths.BREW_BIN,
@@ -99,6 +101,10 @@ const BIN_MAP = Object.freeze({
   security: paths.SECURITY_BIN,
   osascript: paths.OSASCRIPT_BIN,
   curl: paths.CURL_BIN,
+  node: paths.NODE_BIN,
+  npm: paths.NPM_BIN,
+  pnpm: paths.PNPM_BIN,
+  dsh: paths.DSH_BIN,
 });
 
 /**
@@ -232,12 +238,42 @@ export const MIRROR_REMOTES = Object.freeze({
   tencent: 'http://mirrors.cloud.tencent.com/git/homebrew/brew.git',
 });
 
+/**
+ * 镜像源 → Homebrew **API / Bottles** 域名（2026-09-19 修正）。
+ *
+ * ★ 为什么必须单独列表：此前的推导是「把 brew.git 远端末尾的 /brew.git 去掉，
+ *   再拼 /homebrew-bottles/api」。这对 ustc（`.../brew.git`）和 aliyun
+ *   （`.../homebrew/brew.git`）恰好成立，但 tuna / tencent 的远端多一层
+ *   `/git/homebrew`，拼出来是 `.../git/homebrew/homebrew-bottles/api` —— 实测 404
+ *   （正确的 `.../homebrew-bottles/api/cask.json` 实测 206）。后果有两处：
+ *     · brew.js 的中文搜索索引必然下载失败，静默退化成只认英文的 `brew search`；
+ *     · 这里注入给 brew 本体的 HOMEBREW_API_DOMAIN / HOMEBREW_BOTTLE_DOMAIN 也是错的。
+ *   所以官方 API 域名一律显式维护，不再从 git 远端猜。
+ */
+export const MIRROR_API_DOMAINS = Object.freeze({
+  tuna: 'https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api',
+  ustc: 'https://mirrors.ustc.edu.cn/homebrew-bottles/api',
+  aliyun: 'https://mirrors.aliyun.com/homebrew/homebrew-bottles/api',
+  tencent: 'http://mirrors.cloud.tencent.com/homebrew-bottles/api',
+});
+
+/**
+ * 取某镜像源的 API 域名（`official` / 未知值 → null，表示用官方 formulae.brew.sh）。
+ * @param {string} mirror
+ * @returns {string|null}
+ */
+export function mirrorApiDomain(mirror) {
+  return MIRROR_API_DOMAINS[mirror] || null;
+}
+
 function applyMirrorEnv(env, mirror) {
   const brew = MIRROR_REMOTES[mirror];
-  if (brew) {
+  const api = mirrorApiDomain(mirror);
+  if (brew && api) {
     env.HOMEBREW_BREW_GIT_REMOTE = brew;
-    env.HOMEBREW_API_DOMAIN = `${brew.replace(/\/brew\.git$/, '')}/homebrew-bottles/api`;
-    env.HOMEBREW_BOTTLE_DOMAIN = `${brew.replace(/\/brew\.git$/, '')}/homebrew-bottles`;
+    env.HOMEBREW_API_DOMAIN = api;
+    // Bottle 域名 = API 域名去掉结尾的 /api（四个镜像都是这个形态，实测可用）
+    env.HOMEBREW_BOTTLE_DOMAIN = api.replace(/\/api$/, '');
   } else {
     delete env.HOMEBREW_BREW_GIT_REMOTE;
     delete env.HOMEBREW_API_DOMAIN;
@@ -261,7 +297,9 @@ function buildEnv(opts) {
   // 每个非交互 bash 的 PATH 最顶），劫持 plum 配方管道里的 sed，导致 patch_files
   // 类配方（切换方案/语法模型补丁）把 YAML 正文当 bash 命令执行而全部失败。
   // MacKit 子进程只需要 PATH_PREFIX 内的工具（brew/git/curl/sed 等），全部显式固定。
-  env.PATH = paths.PATH_PREFIX.join(':');
+  // paths.EXEC_PATH = PATH_PREFIX + 各工具（node/npm/pnpm/dsh…）实际所在目录，
+  // 这样 nvm / 自定义前缀装的 Node 也能被 `#!/usr/bin/env node` 这类 shebang 找到。
+  env.PATH = paths.EXEC_PATH.join(':');
   // 剥离会向子 shell 注入行为的变量：BASH_ENV 会被每个非交互 bash source；
   // BASH_FUNC_* 是 bash 导出函数（同名命令会被函数拦截）。
   delete env.BASH_ENV;
@@ -339,6 +377,13 @@ export function run(bin, args, opts = {}) {
 
     /** @type {{stdout:string, stderr:string}} */
     const cap = { stdout: '', stderr: '' };
+    /**
+     * 单行累计上限：`makeLineReader.buf` 只在遇到 `\n` 时才吐出，命令若输出大量
+     * **不含换行**的内容（例如 \r 结尾的进度条、二进制转储），buf 会一直涨。
+     * 实测灌 24MB 无换行输出 → onLine 收到 25MB 的「一行」、进程堆涨约 394MB
+     * （字符串反复 += / slice 的放大）。超过上限就截断成一行发出去并清空。
+     */
+    const LINE_MAX = 64 * 1024;
     let settled = false;
     let killedByUs = false;
     let killReason = null; // 'cancel' | 'timeout' | null
@@ -354,6 +399,11 @@ export function run(bin, args, opts = {}) {
     // 逐行回调（保留残余，结束时 flush）
     const makeLineReader = (which) => {
       let buf = '';
+      /** 把一行交给回调（回调异常不影响执行）。 */
+      const emitLine = (line) => {
+        if (!opts.onLine) return;
+        try { opts.onLine(line, which); } catch { /* 回调异常不影响执行 */ }
+      };
       return {
         push(chunk) {
           buf += chunk;
@@ -361,19 +411,19 @@ export function run(bin, args, opts = {}) {
           while ((idx = buf.indexOf('\n')) >= 0) {
             const line = buf.slice(0, idx).replace(/\r$/, '');
             buf = buf.slice(idx + 1);
-            if (opts.onLine) {
-              try { opts.onLine(line, which); } catch { /* 回调异常不影响执行 */ }
-            }
+            emitLine(line);
+          }
+          // 超长且始终没有换行 → 截断发一行，避免 buf 无界增长（见 LINE_MAX 注释）
+          if (buf.length > LINE_MAX) {
+            emitLine(`${buf.slice(0, LINE_MAX)} …（本行超过 ${LINE_MAX / 1024}KB，已截断）`);
+            buf = '';
           }
         },
         flush() {
-          if (buf.length > 0) {
-            const line = buf.replace(/\r$/, '');
-            buf = '';
-            if (opts.onLine) {
-              try { opts.onLine(line, which); } catch { /* ignore */ }
-            }
-          }
+          if (buf.length === 0) return;
+          const line = buf.replace(/\r$/, '');
+          buf = '';
+          emitLine(line.length > LINE_MAX ? `${line.slice(0, LINE_MAX)} …（本行已截断）` : line);
         },
       };
     };
@@ -387,6 +437,12 @@ export function run(bin, args, opts = {}) {
 
     // stdin
     if (opts.stdin !== undefined && child.stdin) {
+      // ★ 必须挂 error 监听：`write()` 的失败（EPIPE —— 子进程先退出、管道读端已关）
+      //   是**异步**經由 'error' 事件抛出的，外层 try/catch 只兜得住同步异常；
+      //   没有监听器时它会变成 uncaughtException，在常驻服务里等于整个进程退出。
+      //   当前调用方都只写几十~几百字节（落在管道缓冲内，实测 300 次不触发），
+      //   但这是明确的健壮性缺口，一行兜住。
+      child.stdin.on('error', () => { /* 子进程没读 stdin 就退出：忽略 */ });
       try {
         child.stdin.write(opts.stdin);
         child.stdin.end();
@@ -444,7 +500,7 @@ export function run(bin, args, opts = {}) {
         reject(new AppError(
           ERR.TIMEOUT,
           `命令超时（>${Math.round(timeoutMs / 1000)}s）`,
-          cap.stderr.trim().split('\n').slice(-5).join('\n') || undefined
+          paths.tailLines(cap.stderr, 5) || undefined
         ));
       } else {
         resolve({ code: code === null ? -1 : code, signal: signal || null, stdout: cap.stdout, stderr: cap.stderr });
@@ -528,7 +584,7 @@ export async function runWithChannel(policy, desc, bin, args, opts = {}) {
         return { ...res, channel };
       }
       lastCode = res.code;
-      lastDetail = (res.stderr || res.stdout || '').trim().split('\n').slice(-3).join('\n');
+      lastDetail = paths.tailLines(res.stderr || res.stdout);
       if (opts.onAttempt) {
         try { opts.onAttempt(channel, 'fail'); } catch { /* ignore */ }
       }

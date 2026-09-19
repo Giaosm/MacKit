@@ -25,7 +25,7 @@ import * as store from './lib/store.js';
 import * as runner from './lib/runner.js';
 import * as env from './lib/env.js';
 import { AppError, ERR, toErrObj } from './lib/exec.js';
-import { DAV_ERR } from './lib/webdav.js';
+import { DAV_ERR, urlHasCredentials } from './lib/webdav.js';
 import { parseReqUrl } from './lib/requrl.js';
 
 /** 版本号（读取 package.json，失败回落）。 */
@@ -40,7 +40,7 @@ const VERSION = readVersion();
 function log(...args) { console.log('[MacKit]', ...args); } // 被启动器重定向到 ~/.mackit/server.out
 
 // ------------------------------ 功能模块注册表（动态接入） ------------------------------
-const MODULE_FILES = Object.freeze({ brew: 'brew.js', sysinit: 'sysinit.js', rime: 'rime.js', unseal: 'unseal.js', backup: 'backup.js' });
+const MODULE_FILES = Object.freeze({ brew: 'brew.js', sysinit: 'sysinit.js', rime: 'rime.js', unseal: 'unseal.js', backup: 'backup.js', dsh: 'dsh.js', selfupdate: 'selfupdate.js' });
 const registry = new Map();
 
 async function loadModules() {
@@ -261,7 +261,9 @@ async function handleApi(req, res, url) {
       store.writeBrewgo({
         httpPort: body.proxy && Number.isInteger(body.proxy.httpPort) ? body.proxy.httpPort : cur.httpPort,
         socksPort: body.proxy && Number.isInteger(body.proxy.socksPort) ? body.proxy.socksPort : cur.socksPort,
-        mirror: typeof body.mirror === 'string' ? body.mirror : cur.mirror,
+        // 未显式给 mirror 时传 undefined → writeBrewgo 不改写 MIRROR 行
+        // （此前回落 cur.mirror，会把用户自定义的枚举外镜像静默改成 official）
+        mirror: typeof body.mirror === 'string' ? body.mirror : undefined,
       });
     }
     if (body.defaultChannel !== undefined || body.autoFallback !== undefined || body.autoCleanup !== undefined || body.lastCheckedAt !== undefined) {
@@ -321,6 +323,15 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  // DeepSeek Harness（安装状态 / 版本探测；安装本身走任务流 POST /api/tasks）
+  if (method === 'GET' && pathname === '/api/dsh/status') { ok(res, await queryModule('dsh', 'status', {})); return; }
+
+  // MacKit 自身更新状态（force=1 绕过 10 分钟缓存，强制 fetch 一次）
+  if (method === 'GET' && pathname === '/api/selfupdate/status') {
+    ok(res, await queryModule('selfupdate', 'status', { force: url.searchParams.get('force') === '1' }));
+    return;
+  }
+
   // 解隔离预检
   if (method === 'GET' && pathname === '/api/unseal/precheck') {
     const raw = url.searchParams.get('paths') || '';
@@ -337,6 +348,11 @@ async function handleApi(req, res, url) {
   }
   if (method === 'PUT' && pathname === '/api/webdav/config') {
     const body = await readBody(req);
+    // URL 里内嵌的 userinfo 不参与认证，却会被写进日志 / 回显前端 → 直接拒绝
+    if (urlHasCredentials(body.url)) {
+      throw new AppError(ERR.PARSE_FAILED, 'WebDAV 地址里不要写账号密码',
+        '请把用户名 / 密码填到下面的对应输入框（URL 里的 userinfo 不参与认证）');
+    }
     // password 缺省（未传）→ 保持原密码；显式传 '' → 清空（见 store.writeWebdav）
     store.writeWebdav({
       url: body.url,

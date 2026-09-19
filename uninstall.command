@@ -24,6 +24,10 @@
 # ============================================================================
 
 set -u
+# 说明：本脚本与 install.command 之间有几段逐字相同的代码（bundle id 校验、LSREGISTER 路径、
+# 图标缓存清理、runtime.json 读取）。这是**有意**的：两个双击脚本必须各自独立可跑，
+# 不 source 任何外部文件（历史上曾因外部依赖缺失而无法卸载）。改动其一请同步另一个。
+
 
 SYSTEM_APPS="/Applications"
 EXPECT_BUNDLE_ID="local.mackit.launcher"

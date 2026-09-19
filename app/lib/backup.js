@@ -125,7 +125,7 @@ function applyRimeFiles(ctx, files) {
       continue;
     }
     if (typeof f.text !== 'string') continue;
-    fs.writeFileSync(`${paths.RIME_DIR}/${f.name}`, f.text, 'utf8');
+    paths.writeText(`${paths.RIME_DIR}/${f.name}`, f.text);
     ctx.log('ok', `已写入 Rime 配置：${f.name}`);
   }
 }
@@ -211,7 +211,6 @@ function applyPayloadSteps(getPayload, params) {
     {
       id: 'deploy', title: '重新部署输入法',
       run: async (ctx) => {
-        if (params.deploy === false) { ctx.log('info', '已跳过重新部署（按导入选项）'); return; }
         const { data } = validatePayload(getPayload());
         const hasRime = data.rime && Array.isArray(data.rime.files) && data.rime.files.length > 0;
         if (!hasRime) { ctx.log('info', '无 Rime 配置变更，跳过部署'); return; }
@@ -234,7 +233,7 @@ async function webdavList() {
   return {
     configured: true,
     count,
-    items: items.map((it) => ({ name: it.name, url: it.url, lastModified: it.lastModified, size: it.size })),
+    items: items.map((it) => ({ name: it.name, lastModified: it.lastModified, size: it.size })),
   };
 }
 

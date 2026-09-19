@@ -28,6 +28,10 @@
 # ============================================================================
 
 set -u
+# 说明：本脚本与 uninstall.command 之间有几段逐字相同的代码（bundle id 校验、LSREGISTER 路径、
+# 图标缓存清理、runtime.json 读取）。这是**有意**的：两个双击脚本必须各自独立可跑，
+# 不 source 任何外部文件（历史上曾因外部依赖缺失而无法卸载）。改动其一请同步另一个。
+
 
 SYSTEM_APPS="/Applications"
 REPO_DIR="$(cd "$(dirname "${0}")" && pwd)"
@@ -166,9 +170,19 @@ dialog() {
 
 # 统一收尾：记日志 + 出错弹窗（弹不出来才退回终端），然后带着原退出码退出。
 finish() {
-  local code="${1}" out="${2}" detail=""
+  local code="${1}" out="${2}" detail="" size=0
 
   mkdir -p "$(dirname "${LAUNCH_LOG}")" 2>/dev/null || true
+
+  # 日志轮转：超过 1MB 就先归档成 app-launch.log.1（覆盖旧归档）再继续追加，
+  # 免得每次启动都往里塞、无限增长。stat 读不到就按 0 处理，不能因此挡了启动。
+  if [ -f "${LAUNCH_LOG}" ]; then
+    size="$(stat -f%z "${LAUNCH_LOG}" 2>/dev/null || echo 0)"
+    if [ "${size:-0}" -gt 1048576 ] 2>/dev/null; then
+      mv -f "${LAUNCH_LOG}" "${LAUNCH_LOG}.1" 2>/dev/null || true
+    fi
+  fi
+
   {
     echo "=== $(date '+%Y-%m-%d %H:%M:%S') 退出码=${code} ==="
     if [ -s "${out}" ]; then cat "${out}"; fi
@@ -199,7 +213,9 @@ if [ ! -x "${LAUNCHER}" ]; then
   chmod +x "${LAUNCHER}" 2>/dev/null || true
 fi
 
-OUT="$(mktemp -t mackit-launch)"
+# 这里没有 install.command 的 die（本文件是独立脚本），所以失败时直接报错退出。
+# 必须检查：mktemp 失败时 OUT 为空，`> ""` 只会静默失败，日志与失败弹窗全都会丢。
+OUT="$(mktemp -t mackit-launch)" || { echo "❌ 无法创建临时文件" >&2; exit 1; }
 "${LAUNCHER}" > "${OUT}" 2>&1
 finish "$?" "${OUT}"
 SHELL

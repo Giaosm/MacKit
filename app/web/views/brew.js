@@ -24,19 +24,6 @@ const MIRRORS = [
 const CORE_TAPS = ['homebrew/core', 'homebrew/cask'];
 const CHANNEL_LABEL = { direct: '直连', proxy: '代理', direct_first: '直连优先', proxy_first: '代理优先', auto: '自动' };
 
-// 本视图挂载期间产生的延时器（如 Cask 搜索防抖）登记表：
-// 放在模块作用域是因为 unmount() 是 mount() 的兄弟方法，看不到 mount 的局部变量；
-// 同一时刻只会有一个本视图实例存活，mount 时重建、unmount 时整体清理。
-let pendingTimers = null;
-
-// 当前**面板**注册的事件订阅（解绑器）登记表。放模块作用域的理由同上
-// （renderPanel / unmount 都要用）。
-// 为什么必须显式回收：app.js 的 ctx.on 只在**视图卸载**时统一解绑（makeCtx 把解绑器
-// 压进视图级 subs），而本视图的标签切换并不重挂视图 → 不回收就会累积：
-// 切 N 轮 = N 份 'done' / 'task' 订阅，一个任务完成事件被触发 N 次
-// （表现为重复请求 /api/brew/outdated、提示重复弹出）。
-let panelSubs = null;
-
 export default {
   id: 'brew',
   title: 'Homebrew 管家',
@@ -62,8 +49,12 @@ export default {
     let env = null;
     let envBusy = false;
     let config = null;
-    pendingTimers = new Set();  // 本次挂载的延时器登记表（模块级变量，unmount 需要访问）
-    panelSubs = [];             // 本次挂载的面板级订阅登记表（同上）
+    // 本实例的延时器（Cask 搜索防抖）与**面板级**订阅（解绑器）登记表。
+    // 必须是 mount 局部变量：unmount() 是 mount() 的兄弟方法、看不到这里，而路由 teardown
+    // 已按实例回收订阅；若放模块作用域，旧实例晚执行的清理会误杀新实例的订阅与延时器。
+    // （面板级订阅也经 ctx.on 压进了视图级 subs，这里额外登记只为「切换面板时主动解绑」。）
+    const pendingTimers = new Set();
+    const panelSubs = [];
 
     // ---------------- 环境卡 ----------------
     function renderEnv() {
@@ -109,7 +100,7 @@ export default {
           el('div', { class: 'warn-box', text: '⚠ 安装过程需要管理员权限，会弹出 1 次系统密码框；密码只交给 sudo，MacKit 不读取、不保存。安装耗时取决于网络（通常几分钟）。' }),
         ]);
         if (await ui.confirmDialog({ title: '确认安装 Homebrew？', body, confirmLabel: '开始安装' })) {
-          await ctx.runTask('brew', 'install_homebrew', {}, { confirm: true });
+          try { await ctx.runTask('brew', 'install_homebrew', {}, { confirm: true }); } catch { /* runTask 内部已 toast */ }
           loadEnv(true);
         }
       });
@@ -136,7 +127,7 @@ export default {
           el('p', { class: 'muted', text: `写完新开终端即可生效；想让当前终端立刻生效，可执行：source ${rc}` }),
         ]);
         if (await ui.confirmDialog({ title: '确认配置 Homebrew 环境变量？', body, confirmLabel: '写入配置' })) {
-          await ctx.runTask('brew', 'setup_shellenv', {}, { confirm: true });
+          try { await ctx.runTask('brew', 'setup_shellenv', {}, { confirm: true }); } catch { /* runTask 内部已 toast */ }
           loadEnv(true);
         }
       });
@@ -217,6 +208,13 @@ export default {
       async function load() {
         host.innerHTML = ''; host.append(el('div', { class: 'view-loading', text: '正在检查可更新项…' }));
         try { data = await api('GET', '/api/brew/outdated'); } catch (err) { host.innerHTML = ''; host.append(el('div', { class: 'err-box', text: `检查失败：${err.message || err}` })); return; }
+        // 形状兜底：后端契约是 { formulae, casks, counts, checkedAt }，缺字段时按空处理，
+        // 避免后端演进 / 代理层返回异形 JSON 时把整个面板炸成白屏（2026-09-19）。
+        data = {
+          formulae: [], casks: [], counts: { formula: 0, cask: 0 }, checkedAt: null,
+          ...(data || {}),
+          counts: { formula: 0, cask: 0, ...((data && data.counts) || {}) },
+        };
         decisions.clear();
         draw();
       }
@@ -289,7 +287,7 @@ export default {
         host.innerHTML = '';
         topBar.innerHTML = '';
         topBar.append(
-          el('button', { class: 'btn btn--primary', type: 'button', text: '⬆ 更新 Homebrew 本体（代理优先）', on: { click: () => ctx.runTask('brew', 'brew_update') } }),
+          el('button', { class: 'btn btn--primary', type: 'button', text: '⬆ 更新 Homebrew 本体（代理优先）', on: { click: () => { ctx.runTask('brew', 'brew_update').catch(() => {}); } } }),
           el('button', { class: 'btn', type: 'button', text: '⟳ 重新检查', on: { click: load } }),
           el('span', { class: 'grow' }),
           searchI,
@@ -302,7 +300,7 @@ export default {
         const items = allItems().map((it) => ({ name: it.name, kind: it.kind, mode: decisions.get(keyOf(it)) || 'skip' }));
         if (!items.length) return ui.toast('warn', '无任何可更新项');
         if (!items.some((it) => it.mode !== 'skip')) return ui.toast('warn', '请先选择要升级的项目');
-        ctx.runTask('brew', 'upgrade_one_by_one', { items });
+        ctx.runTask('brew', 'upgrade_one_by_one', { items }).catch(() => {});
       }
 
       box.append(host);
@@ -341,21 +339,25 @@ export default {
             : '⚠ 卸载将删除应用及其数据，且不可撤销。' }),
         ]);
         const action = kind === 'formula' ? 'uninstall_formulae' : 'uninstall_casks';
-        if (await ui.confirmDialog({ title: `确认卸载 ${PKG_LABEL[kind]}（${rows.length} 个）`, body, confirmLabel: '确认卸载' })) await ctx.runTask('brew', action, { names: rows.map((r) => r.name) }, { confirm: true });
+        if (await ui.confirmDialog({ title: `确认卸载 ${PKG_LABEL[kind]}（${rows.length} 个）`, body, confirmLabel: '确认卸载' })) {
+          try { await ctx.runTask('brew', action, { names: rows.map((r) => r.name) }, { confirm: true }); } catch { /* runTask 内部已 toast */ }
+        }
       }
       async function uninstallTaps() {
         const checked = Array.from(host.querySelectorAll('input[type=checkbox][data-tap]:checked')).map((c) => c.dataset.tap);
         if (!checked.length) return ui.toast('warn', '请先勾选要卸载的 Tap 软件源');
         const core = checked.filter((t) => CORE_TAPS.includes(t));
         const body = el('div', {}, [el('p', { text: '将卸载：' }), el('ul', {}, checked.map((t) => el('li', { text: t }))), core.length ? el('div', { class: 'err-box', text: `⚠ ${core.join('、')} 为 Homebrew 核心软件源，卸载后需通过 brew tap 重新安装。` }) : null]);
-        if (await ui.confirmDialog({ title: `确认卸载 Tap 软件源（${checked.length} 个）`, body, confirmLabel: '确认卸载' })) await ctx.runTask('brew', 'uninstall_taps', { names: checked }, { confirm: true });
+        if (await ui.confirmDialog({ title: `确认卸载 Tap 软件源（${checked.length} 个）`, body, confirmLabel: '确认卸载' })) {
+          try { await ctx.runTask('brew', 'uninstall_taps', { names: checked }, { confirm: true }); } catch { /* runTask 内部已 toast */ }
+        }
       }
       function draw() {
         host.innerHTML = '';
         if (kind === 'tap') {
           const taps = installed.taps || [];
           if (!taps.length) { host.append(ui.card('Tap 软件源', ui.empty({ icon: 'ℹ', title: '未检测到自定义 Tap 软件源', text: 'Homebrew 7 默认不再显式列出 core / cask 等内置源，属正常现象。', actions: [{ label: '重新检测', onClick: load }] }))); return; }
-          const list = el('div', { class: 'filelist' }, taps.map((t) => el('li', {}, [el('label', { class: 'check' }, [el('input', { type: 'checkbox', dataset: { tap: t } }), el('span', { text: t, class: CORE_TAPS.includes(t) ? 'dot-warn' : '' })])])));
+          const list = el('ul', { class: 'filelist' }, taps.map((t) => el('li', {}, [el('label', { class: 'check' }, [el('input', { type: 'checkbox', dataset: { tap: t } }), el('span', { text: t, class: CORE_TAPS.includes(t) ? 'dot-warn' : '' })])])));
           host.append(ui.card('Tap 软件源', el('div', {}, [list, el('div', { class: 'row section' }, [el('button', { class: 'btn btn--danger', type: 'button', text: '卸载选中', on: { click: uninstallTaps } })])])));
           return;
         }
@@ -454,7 +456,7 @@ export default {
       function install(name, mode, k) {
         // runTask 内部有「任务运行中」互斥 + 自动打开日志抽屉，失败会 toast
         const action = k === 'formula' ? 'install_formulae' : 'install_casks';
-        ctx.runTask('brew', action, { items: [{ name, mode }] });
+        ctx.runTask('brew', action, { items: [{ name, mode }] }).catch(() => {});
       }
 
       function resultRow(r, k) {
@@ -481,7 +483,7 @@ export default {
         if (timer) { clearTimeout(timer); pendingTimers.delete(timer); timer = null; }
         if (!q) { seq += 1; status.textContent = ''; showHint(); return; }
         // 防抖：停止输入 400ms 后再搜（延时器登记到 pendingTimers，便于 unmount 清理）
-        timer = setTimeout(() => { pendingTimers.delete(timer); timer = null; runSearch(); }, 400);
+        timer = setTimeout(() => { pendingTimers.delete(timer); timer = null; if (!root.isConnected) return; runSearch(); }, 400);
         pendingTimers.add(timer);
       });
 
@@ -533,7 +535,7 @@ export default {
         const cleanCard = ui.card('🧹 缓存清理', el('div', { class: 'card__rows' }, [
           el('label', { class: 'check' }, [autoChk, el('span', { text: '升级完成后自动清理缓存（brew cleanup --prune=all）' })]),
           el('div', { class: 'muted', text: '开启后，逐项升级任务结束时会自动执行一次清理（失败仅记日志，不影响升级结果）；关闭后需手动点击下方按钮。' }),
-          el('div', { class: 'row section' }, [el('button', { class: 'btn', type: 'button', text: '🧹 立即清理缓存', on: { click: () => ctx.runTask('brew', 'cleanup') } })]),
+          el('div', { class: 'row section' }, [el('button', { class: 'btn', type: 'button', text: '🧹 立即清理缓存', on: { click: () => { ctx.runTask('brew', 'cleanup').catch(() => {}); } } })]),
         ]));
 
         host.append(el('div', { class: 'grid grid--2' }, [portCard, chCard]), mirrorCard, cleanCard, hintBox);
@@ -543,8 +545,7 @@ export default {
       }
       async function savePorts(httpI, socksI) {
         const cur = config.brewgo || {};
-        const re = /^[0-9]+$/;
-        const ok = (v) => re.test(v) && Number(v) >= 1 && Number(v) <= 65535;
+        const ok = ui.portOk;
         const http = ok(httpI.value.trim()) ? Number(httpI.value) : cur.httpPort;
         const socks = ok(socksI.value.trim()) ? Number(socksI.value) : cur.socksPort;
         if (http === cur.httpPort && socks === cur.socksPort) ui.toast('warn', '端口未变化或输入非法，已保持原值');
@@ -589,15 +590,17 @@ export default {
     renderTabs(); loadEnv(false);
     // 无条件首屏渲染（active 默认 'upgrade'）——不可依赖 active 判断，否则会整片空白。
     renderPanel();
-    (async () => { try { config = await api('GET', '/api/config'); } catch { config = null; } if (active === 'settings') renderPanel(); })();
+    (async () => {
+      try { config = await api('GET', '/api/config'); } catch { config = null; }
+      // ★ 卸载后不要再 renderPanel()：那会在已分离的 DOM 上重新注册面板订阅
+      //   （新解绑器进不了已遍历完的视图级 subs，事件总线会一直持有这些闭包）。
+      if (!root.isConnected) return;
+      if (active === 'settings') renderPanel();
+    })();
   },
 
   unmount() {
-    // 订阅由 app.js 统一回收；这里清理本视图自己的延时器与面板级订阅。
-    // 面板级订阅虽然也在 app.js 的视图级 subs 里，但「自己开的自己关」更稳：
-    // 不依赖宿主实现，重复解绑也是安全的（off 只是 Set.delete）。
-    if (panelSubs) { for (const u of panelSubs) { try { u(); } catch { /* 已解绑 */ } } panelSubs.length = 0; }
-    for (const t of pendingTimers) clearTimeout(t);
-    pendingTimers.clear();
+    // 本实例的订阅（含面板级）由 app.js 在路由 teardown 时按实例统一回收；
+    // 延时器回调用 root.isConnected 守卫兜底，故此处无需（也无法）操作 mount 局部变量。
   },
 };

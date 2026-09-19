@@ -24,21 +24,6 @@
  */
 
 /**
- * 可读化字节数（本文件唯一实现；views/backups.js 已无同名副本）。
- * @param {number|null|undefined} bytes
- * @returns {string}
- */
-function humanSize(bytes) {
-  if (bytes === null || bytes === undefined) return '—';
-  const b = Number(bytes);
-  if (!Number.isFinite(b) || b < 0) return '—';
-  if (b < 1024) return `${b} B`;
-  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
-  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(2)} MB`;
-  return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
-
-/**
  * 构建「WebDAV 备份」区块（与页面其它卡同一视觉体系）。
  * 布局：说明行 + [备份] [查看记录] … [配置 WEBDAV]。
  * @param {object} ctx 视图上下文（el / ui / api / runTask / fmtRel / fmtDateTime / …）
@@ -174,7 +159,7 @@ function openRecordsModal(ctx) {
     const ts = Number(it.lastModified) || 0;
     const full = ctx.fmtDateTime(ts);
     const nameEl = el('div', { class: 'mono', text: it.name, title: full });
-    const metaEl = el('div', { class: 'muted', text: [full, humanSize(it.size)].join(' · ') });
+    const metaEl = el('div', { class: 'muted', text: [full, ctx.fmtSize(it.size)].join(' · ') });
     const restoreBtn = el('button', {
       class: 'btn btn--sm', type: 'button', text: '恢复',
       on: { click: () => doRestore(it) },
@@ -204,13 +189,17 @@ function openRecordsModal(ctx) {
       ]),
     });
     if (!ok) return;
-    const t = await ctx.runTask('backup', 'webdav_restore', { name: it.name }, { confirm: true });
-    if (t === null) return; // 已有任务在运行，runTask 内部已 toast
-    if (t.status === 'ok') ui.toast('ok', `已从 WebDAV 恢复「${it.name}」`);
-    else if (t.status === 'cancelled') ui.toast('warn', '恢复已取消');
-    else ui.toast('err', '恢复失败，请查看日志');
-    // 记录弹窗已被危险确认顶掉（同屏单例）→ 重新打开，拉取最新列表与统计行
-    openRecordsModal(ctx);
+    try {
+      const t = await ctx.runTask('backup', 'webdav_restore', { name: it.name }, { confirm: true });
+      if (t === null) return; // 已有任务在运行，runTask 内部已 toast（finally 仍会重开记录弹窗）
+      if (t.status === 'ok') ui.toast('ok', `已从 WebDAV 恢复「${it.name}」`);
+      else if (t.status === 'cancelled') ui.toast('warn', '恢复已取消');
+      else ui.toast('err', '恢复失败，请查看日志');
+    } catch { /* runTask 内部已 toast */ }
+    finally {
+      // 记录弹窗已被危险确认顶掉（同屏单例）→ 无论如何都重新打开，拉取最新列表与统计行
+      openRecordsModal(ctx);
+    }
   }
 
   /** 删除：危险确认 → 任务流 → 任务结束后重开记录弹窗刷新列表与统计行。 */
@@ -224,13 +213,17 @@ function openRecordsModal(ctx) {
       ]),
     });
     if (!ok) return;
-    const t = await ctx.runTask('backup', 'webdav_delete', { name: it.name }, { confirm: true });
-    if (t === null) return; // 已有任务在运行，runTask 内部已 toast
-    if (t.status === 'ok') ui.toast('ok', `已删除「${it.name}」`);
-    else if (t.status === 'cancelled') ui.toast('warn', '删除已取消');
-    else ui.toast('err', '删除失败，请查看日志');
-    // 记录弹窗已被危险确认顶掉（同屏单例）→ 重新打开，拉取最新列表与统计行
-    openRecordsModal(ctx);
+    try {
+      const t = await ctx.runTask('backup', 'webdav_delete', { name: it.name }, { confirm: true });
+      if (t === null) return; // 已有任务在运行，runTask 内部已 toast（finally 仍会重开记录弹窗）
+      if (t.status === 'ok') ui.toast('ok', `已删除「${it.name}」`);
+      else if (t.status === 'cancelled') ui.toast('warn', '删除已取消');
+      else ui.toast('err', '删除失败，请查看日志');
+    } catch { /* runTask 内部已 toast */ }
+    finally {
+      // 记录弹窗已被危险确认顶掉（同屏单例）→ 无论如何都重新打开，拉取最新列表与统计行
+      openRecordsModal(ctx);
+    }
   }
 
   ui.modal({ title: 'WebDAV 备份记录', body });

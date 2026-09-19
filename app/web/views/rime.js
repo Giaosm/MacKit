@@ -96,7 +96,7 @@ export default {
       });
       return ui.card('📚 词库', el('div', {}, [
         el('div', { class: 'row' }, [
-          el('button', { class: 'btn btn--primary', type: 'button', text: '安装 / 更新词库', on: { click: () => ctx.runTask('rime', 'install_or_update', {}) } }),
+          el('button', { class: 'btn btn--primary', type: 'button', text: '安装 / 更新词库', on: { click: () => { ctx.runTask('rime', 'install_or_update', {}).catch(() => {}); } } }),
           checkBtn,
           el('span', { class: 'muted', text: installed
             ? '已检测到本地安装：点击将更新词库并重新部署（官方同一条命令）。'
@@ -143,10 +143,10 @@ export default {
       const modelBtn = el('button', {
         class: 'btn btn--primary', type: 'button',
         text: wanxiang ? '⟳ 更新万象模型' : '⬇ 安装万象模型',
-        on: { click: () => ctx.runTask('rime', 'install_grammar', {}) },
+        on: { click: () => { ctx.runTask('rime', 'install_grammar', {}).catch(() => {}); } },
       });
       const modelLine = wanxiang
-        ? el('span', { class: 'muted', text: `已安装 ${wanxiang.name}（${fmtSize(wanxiang.size)}）——点击将重新下载最新版覆盖（约 400MB，代理优先）。` })
+        ? el('span', { class: 'muted', text: `已安装 ${wanxiang.name}（${ctx.fmtSize(wanxiang.size)}）——点击将重新下载最新版覆盖（约 400MB，代理优先）。` })
         : el('span', { class: 'muted', text: '未安装。模型是独立共享文件，下载一次即可供所有方案启用。' });
 
       const sel = el('select', { style: 'max-width:220px', on: { change: (e) => { S.grammarScheme = e.target.value; render(); } } },
@@ -189,7 +189,7 @@ export default {
         ]),
       });
       if (!ok) return;
-      await ctx.runTask('rime', 'apply_grammar', { schema: S.grammarScheme }, { confirm: true });
+      try { await ctx.runTask('rime', 'apply_grammar', { schema: S.grammarScheme }, { confirm: true }); } catch { /* runTask 内部已 toast */ }
     }
 
     /** 从所选方案移除万象（二次确认）。 */
@@ -203,14 +203,7 @@ export default {
         ]),
       });
       if (!ok) return;
-      await ctx.runTask('rime', 'remove_grammar', { schema: S.grammarScheme }, { confirm: true });
-    }
-
-    /** 字节数 → 人类可读（MB/GB，一位小数）。 */
-    function fmtSize(n) {
-      if (!Number.isFinite(n) || n <= 0) return '—';
-      if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
-      return `${Math.max(1, Math.round(n / 1024 ** 2))} MB`;
+      try { await ctx.runTask('rime', 'remove_grammar', { schema: S.grammarScheme }, { confirm: true }); } catch { /* runTask 内部已 toast */ }
     }
 
     // ============================ 皮肤网格（22 款） ============================
@@ -294,7 +287,7 @@ export default {
           ui.diffView(buildPreview(skin, layoutDef)),
         ]),
       });
-      if (ok) await ctx.runTask('rime', 'apply_appearance', { skin, layout: S.layoutIdx }, { confirm: true });
+      if (ok) { try { await ctx.runTask('rime', 'apply_appearance', { skin, layout: S.layoutIdx }, { confirm: true }); } catch { /* runTask 内部已 toast */ } }
     }
 
     /** 由「确定性 patch 语义 + 当前值」构造 diff 预览（无独立 preview 端点）。 */
@@ -327,7 +320,18 @@ export default {
     }
     const layoutGlyph = (l) => (l.layout === 'stacked' ? '▭' : '▬') + (l.orientation === 'vertical' ? ' ⇅ 竖排' : ' ⇆ 横排');
 
-    ctx.on('done', (t) => { if (t && t.module === 'rime') load(); });
+    // 任务结束后刷新状态。
+    // ★ install_or_update 成功时还要**作废并复检**上游结论：「⬆ 上游词库有新更新」是按
+    //   本地词库文件 mtime 与上游提交时间比的，更新完不重算就会一直挂着，只有手动再点一次
+    //   「检查词库更新」才消失（2026-09-19 修）。复检前先把结论清空，这样即使复检失败
+    //   （离线）也不会把旧结论留在页面上。
+    ctx.on('done', async (t) => {
+      if (!t || t.module !== 'rime') return;
+      const justUpdated = t.action === 'install_or_update' && t.status === 'ok';
+      if (justUpdated) S.upstream = null;
+      await load();
+      if (justUpdated) checkUpstream();
+    });
 
     load();
   },

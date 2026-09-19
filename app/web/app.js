@@ -1,7 +1,7 @@
 /**
  * MacKit · 前端外壳（无框架）
  *
- *   - 单页 + 哈希路由（#/dashboard|#/brew|#/sysinit|#/rime|#/unseal|#/backups）
+ *   - 单页 + 哈希路由（#/dashboard|#/brew|#/dsh|#/sysinit|#/rime|#/unseal|#/backups）
  *   - 视图注册表：每个 web/views/*.js 默认导出 { id, title, mount(root, ctx), unmount?() }
  *     （侧边栏图标由本文件 NAV 提供，视图不自带 icon）
  *   - 状态单一来源在后端：本文件只做订阅/渲染，不推断任务状态
@@ -30,12 +30,15 @@ const ICON = {
   ime: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h1M11 9h1M15 9h2"/><path d="M7 13h10"/></svg>',
   lock: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>',
   backups: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
+  // DeepSeek Harness：终端窗口（dsh web / plugin 都从命令行来）
+  dsh: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>',
 };
 
 /** 侧边栏导航（外壳自身定义；视图可自带 title 覆盖）。 */
 const NAV = [
   { id: 'dashboard', title: '总览', icon: ICON.home },
   { id: 'brew', title: 'Homebrew 管家', icon: ICON.beer },
+  { id: 'dsh', title: 'DeepSeek Harness', icon: ICON.dsh },
   { id: 'sysinit', title: '系统初始化', icon: ICON.gear },
   { id: 'rime', title: 'Rime 输入法', icon: ICON.ime },
   { id: 'unseal', title: '应用解隔离', icon: ICON.lock },
@@ -44,11 +47,12 @@ const NAV = [
 
 /**
  * ★ 视图注册表：加一行即可挂载一个新视图。
- * 6 个视图（dashboard / brew / sysinit / rime / unseal / backups）均已实现；对应文件缺失时会安全降级为"开发中"提示。
+ * 7 个视图（dashboard / brew / dsh / sysinit / rime / unseal / backups）均已实现；对应文件缺失时会安全降级为"开发中"提示。
  */
 const VIEW_MODULES = {
   dashboard: () => import('./views/dashboard.js'),
   brew: () => import('./views/brew.js'),
+  dsh: () => import('./views/dsh.js'),
   sysinit: () => import('./views/sysinit.js'),
   rime: () => import('./views/rime.js'),
   unseal: () => import('./views/unseal.js'),
@@ -70,8 +74,8 @@ const dom = {
 
 // ============================== 全局状态（仅缓存，非事实源） ==============================
 const state = {
-  env: null, config: null, task: null,
-  running: false, currentTaskId: null, port: null, history: [],
+  task: null,
+  running: false, currentTaskId: null, history: [],
   view: null, viewInstance: null,
 };
 
@@ -115,6 +119,16 @@ function el(tag, props = {}, children = []) {
 }
 const fmtTime = (ms) => { try { return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false }); } catch { return ''; } };
 const fmtDateTime = (ms) => { try { return new Date(ms).toLocaleString('zh-CN', { hour12: false }); } catch { return ''; } };
+/** 字节数 → 人类可读（B / KB / MB / GB）；null / 非有限 / 负数 → '—'。 */
+function fmtSize(bytes) {
+  if (bytes === null || bytes === undefined) return '—';
+  const b = Number(bytes);
+  if (!Number.isFinite(b) || b < 0) return '—';
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(2)} MB`;
+  return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
 
 // ============================== API 客户端 ==============================
 /**
@@ -142,6 +156,16 @@ function toast(level, text) {
   dom.toastHost.append(node);
   setTimeout(() => { node.style.opacity = '0'; setTimeout(() => node.remove(), 200); }, TOAST_MS);
 }
+
+/** 共享剪贴板：空文本忽略；成功 toast('ok', okMsg) / 失败 toast('warn', …)。 */
+async function copyText(text, okMsg = '已复制') {
+  if (!text) return;
+  try { await navigator.clipboard.writeText(text); toast('ok', okMsg); }
+  catch { toast('warn', '复制失败，请手动选择'); }
+}
+
+/** 端口字符串校验：纯数字且 1–65535。 */
+const portOk = (v) => /^[0-9]+$/.test(v) && Number(v) >= 1 && Number(v) <= 65535;
 
 /**
  * 当前打开的弹窗关闭器。同屏只允许一个弹窗：
@@ -242,7 +266,7 @@ function card(title, content, { light = null, extra = null } = {}) {
  * 返回 { el, setRows(rows), getSelected(), getSelectedRows() }。
  */
 function dataTable(cfg) {
-  const { columns = [], rows = [], rowKey = (r, i) => String(i), selectable = false, searchable = false, searchPlaceholder = '搜索…', emptyText = '无数据', onChange } = cfg;
+  const { columns = [], rows = [], rowKey = (r, i) => String(i), selectable = false, searchable = false, searchPlaceholder = '搜索…', emptyText = '无数据' } = cfg;
   const selected = new Set();
   let items = [];
   const filter = { q: '' };
@@ -267,7 +291,7 @@ function dataTable(cfg) {
     if (vis.length === 0) tbody.append(el('tr', {}, [el('td', { colspan: String(columns.length + (selectable ? 1 : 0)), class: 'muted', text: emptyText })]));
     for (const it of vis) {
       const tr = el('tr');
-      if (selectable) tr.append(el('td', {}, [el('input', { type: 'checkbox', checked: selected.has(it.key), on: { change: (e) => { if (e.target.checked) selected.add(it.key); else selected.delete(it.key); syncHead(); if (onChange) onChange(getSelected()); } } })]));
+      if (selectable) tr.append(el('td', {}, [el('input', { type: 'checkbox', checked: selected.has(it.key), on: { change: (e) => { if (e.target.checked) selected.add(it.key); else selected.delete(it.key); syncHead(); } } })]));
       for (const c of columns) {
         const v = c.render ? c.render(it.row) : String(it.row[c.key] == null ? '' : it.row[c.key]);
         tr.append(el('td', {}, [v && v.nodeType ? v : String(v)]));
@@ -278,7 +302,7 @@ function dataTable(cfg) {
     countEl.textContent = selectable ? `已选 ${selected.size} / 共 ${vis.length}` : `共 ${vis.length}`;
   }
   function setRows(r) { items = (r || []).map((row, i) => ({ row, key: String(rowKey(row, i)) })); selected.clear(); render(); }
-  if (headCb) headCb.addEventListener('change', (e) => { for (const it of visible()) { if (e.target.checked) selected.add(it.key); else selected.delete(it.key); } render(); if (onChange) onChange(getSelected()); });
+  if (headCb) headCb.addEventListener('change', (e) => { for (const it of visible()) { if (e.target.checked) selected.add(it.key); else selected.delete(it.key); } render(); });
   setRows(rows);
   return { el: el('div', {}, [toolbar, el('div', { class: 'table__scroll' }, [table])]), setRows, getSelected, getSelectedRows };
 }
@@ -331,7 +355,7 @@ async function openLogFile() {
       el('div', { class: 'diff' }, [el('div', { class: 'diff__line', text: path || '（当前无任务）' })]),
     ]),
     actions: [
-      { label: '复制路径', kind: 'primary', onClick: async (c) => { try { await navigator.clipboard.writeText(path); toast('ok', '日志路径已复制'); } catch { toast('warn', '复制失败，请手动选择'); } c(null); } },
+      { label: '复制路径', kind: 'primary', onClick: async (c) => { await copyText(path, '日志路径已复制'); c(null); } },
       { label: '关闭', kind: 'ghost' },
     ],
   });
@@ -475,6 +499,10 @@ function startRelTimer() {
   relTimer = setInterval(() => { if (!document.hidden) refreshRelTimes(); }, REL_TICK_MS);
 }
 async function showHistory(h) {
+  if (state.running) {
+    toast('warn', '有任务正在运行，日志抽屉正跟随实时任务；结束后再查看历史');
+    return;
+  }
   clearLogs(); openLogDrawer(); setLogTaskLabel(`${h.startedAt ? fmtDateTime(h.startedAt) + ' · ' : ''}${h.title} · ${{ ok: '已完成', fail: '失败', cancelled: '已取消' }[h.status] || h.status}`);
   try {
     const rec = await api('GET', `/api/history/${encodeURIComponent(h.id)}`);
@@ -499,7 +527,6 @@ async function pollHealth() {
     // 聚焦已打开同一地址的标签）。页面自己不会醒，这里推一把重载回正常界面。
     // 地址栏里的 hash 会保留，视图不丢。
     if (!dom.shutdownVeil.hidden) { location.reload(); return; }
-    state.port = d.port;
     if (d.port && d.port !== DEFAULT_PORT) setService('warn', `服务运行中 · 127.0.0.1:${d.port}（${DEFAULT_PORT} 被占用，已顺延）`);
     else setService('ok', `服务运行中 · 127.0.0.1:${d.port || DEFAULT_PORT}`);
   } catch (err) {
@@ -590,14 +617,14 @@ function makeCtx(subs) {
     runTask,
     on: (ev, fn) => { const u = on(ev, fn); subs.push(u); return u; },
     refreshEnv: refreshEnv,
-    fmtTime, fmtDateTime, fmtRel,
-    ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, kv, card },
+    fmtTime, fmtDateTime, fmtRel, fmtSize,
+    ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, kv, card, copy: copyText, portOk },
   };
 }
 async function refreshEnv(force) {
   try {
     const e = await api('GET', '/api/env' + (force ? '?force=1' : ''));
-    state.env = e; emit('env', e); return e;
+    emit('env', e); return e;
   } catch (err) { toast('err', err.message || '环境体检失败'); throw err; }
 }
 
@@ -624,7 +651,7 @@ function boot() {
   dom.btnLogClear.addEventListener('click', clearLogs);
   dom.btnLogCopy.addEventListener('click', async () => {
     const text = logOrder.map((l) => `${fmtTime(l.ts)} [${l.level}] ${l.text}`).join('\n');
-    try { await navigator.clipboard.writeText(text); toast('ok', '已复制全部日志'); } catch { toast('warn', '复制失败'); }
+    await copyText(text, '已复制全部日志');
   });
   dom.btnLogOpen.addEventListener('click', openLogFile);
   // 刷新按钮必须有可见反馈（本项目硬性要求，曾出过「点了没反应」）：

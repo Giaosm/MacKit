@@ -69,12 +69,22 @@ export default {
       runPrecheck();
     }
 
+    let precheckSeq = 0; // 竞态保护：连续添加 / 移除时只采用最后一次预检结果
     async function runPrecheck() {
       if (!S.paths.length) { S.items = []; render(); return; }
+      const my = ++precheckSeq;
       pendingBox.innerHTML = '';
       pendingBox.append(el('div', { class: 'view-loading', text: '正在预检…' }));
-      try { S.items = (await api('GET', `/api/unseal/precheck?paths=${encodeURIComponent(S.paths.join('|'))}`)).items || []; }
-      catch (err) { pendingBox.innerHTML = ''; pendingBox.append(el('div', { class: 'err-box', text: `预检失败：${err.message || err}` })); return; }
+      let items;
+      try { items = (await api('GET', `/api/unseal/precheck?paths=${encodeURIComponent(S.paths.join('|'))}`)).items || []; }
+      catch (err) {
+        if (my !== precheckSeq) return;
+        pendingBox.innerHTML = '';
+        pendingBox.append(el('div', { class: 'err-box', text: `预检失败：${err.message || err}` }));
+        return;
+      }
+      if (my !== precheckSeq) return;
+      S.items = items;
       S.selected = new Set(S.items.filter((it) => it.exists && it.hasQuarantine !== false).map((it) => it.path));
       render();
     }
@@ -88,7 +98,7 @@ export default {
         pendingBox.append(ui.card('待处理', ui.empty({ icon: '📥', title: '尚未添加任何路径', text: '拖入 .app / 文件夹，或在上方手工粘贴路径后点击「添加到待处理」。' })));
         return;
       }
-      const list = el('div', { class: 'filelist' }, items.map((it) => {
+      const list = el('ul', { class: 'filelist' }, items.map((it) => {
         const actionable = it.exists && it.hasQuarantine !== false;
         const cb = el('input', {
           type: 'checkbox', checked: S.selected.has(it.path), disabled: !it.exists,
@@ -135,7 +145,7 @@ export default {
       });
       if (!ok) return;
       S.logPaths = [];
-      await ctx.runTask('unseal', 'unseal_paths', { paths });
+      try { await ctx.runTask('unseal', 'unseal_paths', { paths }); } catch { /* runTask 内部已 toast */ }
       renderResult();
     }
 
@@ -165,7 +175,7 @@ export default {
           el('div', { text: '❌ 失败（可复制路径后重试）：' }),
           el('ul', {}, failed.map((s) => el('li', {}, [
             el('span', { class: 'mono', text: pathOf.get(s.id) || s.title }), ' ',
-            el('button', { class: 'btn btn--sm', type: 'button', text: '复制路径', on: { click: () => copy(pathOf.get(s.id) || s.title) } }),
+            el('button', { class: 'btn btn--sm', type: 'button', text: '复制路径', on: { click: () => ui.copy(pathOf.get(s.id) || s.title, '已复制路径') } }),
           ]))),
         ]) : null,
       ])));
@@ -180,12 +190,6 @@ export default {
         else map.set(s.id, S.logPaths[k++] || ttl.replace(/^解隔离\s*/, ''));
       }
       return map;
-    }
-
-    async function copy(text) {
-      if (!text) return;
-      try { await navigator.clipboard.writeText(text); ui.toast('ok', '已复制路径'); }
-      catch { ui.toast('warn', '复制失败，请手动选择'); }
     }
 
     // 捕获逐项完整路径（用于失败项复制）
