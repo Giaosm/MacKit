@@ -223,6 +223,16 @@ SHELL
 chmod +x "${BUNDLE}/Contents/MacOS/MacKit" || die "无法为外壳设置可执行权限。"
 
 # ------------------------------ 6. 换上新外壳 ------------------------------
+# ★ 覆盖安装前先确认 ${TARGET} 是本脚本的产物：同一脚本的「清理旧副本」与
+#   uninstall.command 都用 is_mackit_bundle（repo-path + CFBundleIdentifier）判定，
+#   这里若直接 rm -rf，会把别人的同名 app 静默删掉。
+if [ -e "${TARGET}" ] && ! is_mackit_bundle "${TARGET}"; then
+  die "安装目标已存在，且不是 MacKit 安装脚本生成的 app，已停止安装以免误删：
+   ${TARGET}
+   请先手动移走 / 改名该 app（或确认无用后自行删除），再重跑本脚本。"
+fi
+# 回落目录 ${HOME}/Applications 不一定存在：cp -R 不会自建父目录，必须先建。
+mkdir -p "$(dirname "${TARGET}")" || die "无法创建 ${TARGET%/*}"
 rm -rf "${TARGET}" || die "无法替换 ${TARGET}（可能被占用，退出后重试）。"
 cp -R "${BUNDLE}" "${TARGET}" || die "无法写入 ${TARGET}。"
 

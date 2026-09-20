@@ -146,7 +146,7 @@ export default {
       if (!ok) return;
       S.logPaths = [];
       try { await ctx.runTask('unseal', 'unseal_paths', { paths }); } catch { /* runTask 内部已 toast */ }
-      renderResult();
+      // 结果卡只由 done 订阅（下方 ctx.on('done')）重建一次；此处不再重复 renderResult()。
     }
 
     function renderResult() {
@@ -192,9 +192,14 @@ export default {
       return map;
     }
 
-    // 捕获逐项完整路径（用于失败项复制）
-    ctx.on('log', (line) => { const m = /^正在处理:\s*(.+)$/.exec((line && line.text) || ''); if (m) S.logPaths.push(m[1].trim()); });
-    ctx.on('task', (t) => { if (t && t.module === 'unseal') renderResult(); });
+    // 捕获逐项完整路径（用于失败项复制）；只认本视图任务，避免别的模块日志污染 S.logPaths
+    ctx.on('log', (line) => {
+      if (!ctx.state.task || ctx.state.task.module !== 'unseal') return;
+      const m = /^正在处理:\s*(.+)$/.exec((line && line.text) || '');
+      if (m) S.logPaths.push(m[1].trim());
+    });
+    // 终态结果卡只由 done 重建一次：后端在 done 之前先 emit('task')，两个订阅都调 renderResult
+    // 会让同一终态重复重建结果卡（task 订阅已删）。
     ctx.on('done', (t) => { if (t && t.module === 'unseal') renderResult(); });
 
     render();

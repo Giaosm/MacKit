@@ -31,6 +31,7 @@ import {
   openUpstream,
   buildStreamResponseHeaders,
   buildCoverResponseHeaders,
+  contentTypeForExt,
   parseRangeHeader,
 } from './lib/music/stream.js';
 
@@ -254,15 +255,154 @@ function pipeUpstream(upstream, res, opts) {
 }
 
 /**
+ * 音频缓存文件名的白名单（纵深防御）。
+ *
+ * key 由 `music.js:audioCacheKey()` 生成，形状 `snd-<32hex>.<ext>`。这里再校验一次的原因：
+ * 这个值最终会被 `path.join` 拼成路径、被 `fs.rmSync` / `renameSync` 操作 —— 任何
+ * 上游（bridge.py 的 ext）没洗干净的情况都不该升级成「任意路径删除 / 写入」。
+ * @type {RegExp}
+ */
+const AUDIO_CACHE_KEY_RE = /^snd-[0-9a-f]{32}\.[A-Za-z0-9]{1,8}$/;
+
+/** 解析缓存文件路径；key 非法 / 文件不存在 / 长度为 0 → null。 */
+function audioCachePathIfPresent(cacheKey) {
+  const key = String(cacheKey || '');
+  if (!AUDIO_CACHE_KEY_RE.test(key)) return null;
+  try {
+    const p = path.join(paths.MUSIC_AUDIO_CACHE_DIR, key);
+    const st = fs.statSync(p);
+    if (!st.isFile() || st.size <= 0) return null;
+    return { path: p, size: st.size };
+  } catch { return null; }
+}
+
+/** 原子替换：先删目标再 rename；被 macOS 拒（EPERM，脱离终端的常驻进程常见）则降级为复制。 */
+function promoteFile(tmp, target) {
+  try {
+    fs.rmSync(target, { force: true });
+    fs.renameSync(tmp, target);
+    return true;
+  } catch (err) {
+    if (err && (err.code === 'EPERM' || err.code === 'EXDEV')) {
+      // 与 store.js writeJsonSafe / rime.js 同款降级：这台 macOS 上常驻进程 rename 会被拒。
+      try { fs.copyFileSync(tmp, target); fs.rmSync(tmp, { force: true }); return true; }
+      catch { return false; }
+    }
+    return false;
+  }
+}
+
+/**
+ * 边听边存：整段播放时把上游字节同时写进 `MUSIC_AUDIO_CACHE_DIR/<key>.part`。
+ *
+ * ★ 2026-09-21 重写，修掉三个真实缺陷（此前实测 15 个 `.part` = 401MB 却没有一个成品文件）：
+ *   1) **没有背压**：`cacheStream.write()` 的返回值被忽略，磁盘慢时 Node 会在内存里
+ *      无限堆积上游数据。现在 write 返回 false 时调用方暂停上游，drain 后恢复。
+ *   2) **finish / cleanup 赛跑**：`res.on('close')` 触发的 onCleanup 可能早于
+ *      `end()` 的回调执行，`.part` 刚改名就被删（或反之），成品永远落不下来。
+ *      现在用 `ended` 标记：只要正文收完就不再删 `.part`。
+ *   3) **残片被当成成品**：断流时也会走到 onEnd；现在拿上游声明的 Content-Length 自证，
+ *      长度不符就不提升为缓存（避免播放器拿到截断文件）。
+ *   4) rename EPERM 无降级 → 走 promoteFile 的复制兜底。
+ * @param {string} cacheKey
+ */
+function createAudioCacheWriter(cacheKey) {
+  let stream = null;
+  let partPath = null;
+  let finalPath = '';
+  let written = 0;
+  let ended = false;
+  let finalized = false;
+  const dropPart = () => { if (partPath) { try { fs.rmSync(partPath, { force: true }); } catch { /* ignore */ } } };
+  try {
+    fs.mkdirSync(paths.MUSIC_AUDIO_CACHE_DIR, { recursive: true });
+    finalPath = path.join(paths.MUSIC_AUDIO_CACHE_DIR, cacheKey);
+    partPath = `${finalPath}.part`;
+    stream = fs.createWriteStream(partPath);
+    stream.on('error', () => { try { stream.destroy(); } catch { /* ignore */ } stream = null; });
+  } catch { stream = null; }
+
+  return {
+    /** 是否真的在写（创建流失败 / 出错后为 false）。 */
+    get active() { return !!stream; },
+    /** 写一块数据；返回 false = 缓存侧需背压（调用方应暂停上游，并在 onDrain 后恢复）。 */
+    write(chunk, onDrain) {
+      if (!stream) return true;
+      written += chunk.length;
+      let ok = true;
+      try { ok = stream.write(chunk); } catch { ok = false; }
+      if (ok === false && typeof onDrain === 'function') stream.once('drain', onDrain);
+      return ok;
+    },
+    /** 正文收完 → 校验长度后把 `.part` 提升为正式缓存文件。 */
+    finish(contentLength, onDone) {
+      if (!stream) { if (onDone) onDone(false); return; }
+      ended = true;
+      const s = stream;
+      stream = null;
+      s.end(() => {
+        const declared = Number.parseInt(contentLength, 10);
+        if (Number.isFinite(declared) && declared > 0 && written !== declared) {
+          dropPart(); // 断流残片
+          if (onDone) onDone(false);
+          return;
+        }
+        const ok = promoteFile(partPath, finalPath);
+        finalized = ok;
+        if (!ok) dropPart();
+        if (onDone) onDone(ok);
+      });
+    },
+    /** 结束 / 失败清理：正文没收完才删 `.part`（见上方「赛跑」注释）。 */
+    cleanup() {
+      if (finalized || ended) return;
+      dropPart();
+    },
+  };
+}
+
+/**
+ * 从完整缓存文件直接回放（不打网络）。
+ * @param {import('node:http').ServerResponse} res
+ * @param {{path:string, size:number}} hit
+ * @param {string} ext
+ */
+function serveAudioCache(res, hit, ext) {
+  // 触摸 mtime：pruneAudioCache 是按 mtime 做 LRU 的，命中即说明「最近在用」。
+  try { const now = new Date(); fs.utimesSync(hit.path, now, now); } catch { /* ignore */ }
+  res.writeHead(200, {
+    'Content-Type': contentTypeForExt(ext),
+    'Content-Length': String(hit.size),
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
+  });
+  const rs = fs.createReadStream(hit.path);
+  rs.on('error', () => { try { res.destroy(); } catch { /* ignore */ } });
+  res.on('close', () => { try { rs.destroy(); } catch { /* ignore */ } });
+  rs.pipe(res);
+}
+
+/**
  * 处理 `GET /api/music/stream/:id/:uid`。
  *
  * ★ 成功 = **裸二进制流**（不走 `{ok,data}` 包络）；失败 = JSON 包络。
  * ★ SSRF 口径：url 只来自「快照内 uid 解析结果」（`streamMeta` 查询），路由**绝不接受任何外部 url 入参**。
- * ★ 边听边存：仅整段播放（无 Range 或 Range 从 0 起）才 tee 到 `MUSIC_AUDIO_CACHE_DIR/<key>.part`，结束 rename。
+ * ★ 边听边存：仅整段播放（无 Range 或 Range 从 0 起）才 tee 到 `MUSIC_AUDIO_CACHE_DIR/<key>.part`，
+ *   结束 rename；整段播放**优先命中已有缓存**（不再回源）。
  */
 async function handleMusicStream(req, res, id, uid) {
   const meta = await queryModule('music', 'streamMeta', { id, uid });
   const range = req.headers.range;
+  const parsedRange = parseRangeHeader(range);
+  const isFull = !range || !!(parsedRange && parsedRange.isFull);
+
+  // 边听边存的下半场（2026-09-21 修）：此前只写不读 —— 缓存白占磁盘，二次播放仍回源。
+  // 只在「整段播放」时命中：带 Range 的拖动需要重算 Content-Range，交给上游更稳。
+  if (isFull && meta.cacheKey) {
+    const hit = audioCachePathIfPresent(meta.cacheKey);
+    if (hit) { serveAudioCache(res, hit, meta.ext); return; }
+  }
+
   const up = await openUpstream({
     url: meta.url,
     headers: meta.headers,
@@ -283,39 +423,24 @@ async function handleMusicStream(req, res, id, uid) {
   const built = buildStreamResponseHeaders({ status: up.status, upstreamHeaders: up.headers, ext: meta.ext });
 
   // 边听边存：仅整段播放才缓存（Range 分片不落缓存）。
-  const parsedRange = parseRangeHeader(range);
-  const isFull = !range || !!(parsedRange && parsedRange.isFull);
-  let cacheStream = null;
-  let partPath = null;
-  let finalPath = null;
-  let finalized = false;
-  if (isFull && meta.cacheKey) {
-    try {
-      fs.mkdirSync(paths.MUSIC_AUDIO_CACHE_DIR, { recursive: true });
-      finalPath = path.join(paths.MUSIC_AUDIO_CACHE_DIR, meta.cacheKey);
-      partPath = `${finalPath}.part`;
-      cacheStream = fs.createWriteStream(partPath);
-      cacheStream.on('error', () => { try { cacheStream.destroy(); } catch { /* ignore */ } cacheStream = null; });
-    } catch { cacheStream = null; }
-  }
+  const cache = isFull && meta.cacheKey ? createAudioCacheWriter(meta.cacheKey) : null;
 
   pipeUpstream(up, res, {
     status: built.status,
     headers: built.headers,
-    onData: (chunk) => { if (cacheStream) { try { cacheStream.write(chunk); } catch { /* ignore */ } } },
+    onData: (chunk) => {
+      if (!cache) return;
+      // 缓存写不动了 → 暂停上游（playback 一起慢下来），drain 后恢复；不这样做
+      // 磁盘慢的时候上游字节会在 Node 堆里无限堆积。
+      const ok = cache.write(chunk, () => { try { up.stream.resume(); } catch { /* ignore */ } });
+      if (!ok) { try { up.stream.pause(); } catch { /* ignore */ } }
+    },
     onEnd: () => {
-      if (cacheStream && partPath && finalPath) {
-        cacheStream.end(() => {
-          try { fs.rmSync(finalPath, { force: true }); fs.renameSync(partPath, finalPath); finalized = true; }
-          catch { /* ignore —— 缓存失败不影响播放 */ }
-        });
-      }
+      if (cache) cache.finish(up.headers && up.headers['content-length'], () => { /* 缓存失败不影响播放 */ });
     },
     onCleanup: () => {
-      if (!finalized) {
-        if (cacheStream) { try { cacheStream.destroy(); } catch { /* ignore */ } }
-        if (partPath) { try { fs.rmSync(partPath, { force: true }); } catch { /* ignore */ } }
-      }
+      // 只在「正文没收完」时清 .part：收完后 finish 正在改名，抢着删会把成品删掉。
+      if (cache) cache.cleanup();
     },
   });
 }
@@ -521,7 +646,9 @@ async function handleApi(req, res, url) {
     return;
   }
   // 选择下载目录：osascript 弹系统目录框（只读，不写配置；失败前端回落手输）
+  // ★ 这是**有可见副作用的 GET**，额外要求请求来自 MacKit 界面本身（防跨站弹窗轰炸）。
   if (method === 'GET' && pathname === '/api/music/chooseFolder') {
+    requireUiTriggered(req, '选择下载目录');
     ok(res, await queryModule('music', 'chooseFolder', {}));
     return;
   }
@@ -645,7 +772,9 @@ async function handleApi(req, res, url) {
   const histMatch = /^\/api\/history\/([^/]+)$/.exec(pathname);
   if (method === 'GET' && histMatch) {
     const id = requireTaskId(histMatch[1]);
-    const task = runner.getTask(id) || store.readHistory(id);
+    // getTask 内部已经「内存优先、回落历史」（见 runner.getTask），此前的 `|| store.readHistory(id)`
+    // 是永远走不到的死分支（2026-09-21 收敛为唯一入口）。
+    const task = runner.getTask(id);
     if (!task) throw new AppError(ERR.NOT_FOUND, '未找到该任务');
     ok(res, { task, log: store.readLog(id) });
     return;
@@ -717,6 +846,28 @@ function checkApiOrigin(req) {
   let o;
   try { o = new URL(origin); } catch { throw new AppError(ERR.FORBIDDEN, '来源不被允许'); }
   if (o.host.toLowerCase() !== host.toLowerCase()) throw new AppError(ERR.FORBIDDEN, '来源不被允许');
+}
+
+/**
+ * 要求该请求**确由 MacKit 界面发起**（用于带可见副作用的 GET 路由）。
+ *
+ * ★ 为什么单独要一道闸（2026-09-21 修）：`checkApiOrigin` 刻意「缺 Origin 一律放行」，
+ *   但跨站 `<img src="http://127.0.0.1:18080/api/...">` 这类子资源请求**根本不带 Origin**，
+ *   于是任意网页都能反复触发 `/api/music/chooseFolder`（弹系统目录框）—— 弹窗轰炸 / DoS。
+ *   浏览器会为这类请求带上 `Sec-Fetch-Site`，用它区分：
+ *     · same-origin / none（界面内 fetch、用户在地址栏直接打开）→ 放行；
+ *     · 其它（cross-site / same-site）→ 拒绝。
+ *   完全没有该头的客户端（curl、老浏览器）回落到原来的 Origin 规则，命令行用法不受影响。
+ * @param {import('node:http').IncomingMessage} req
+ * @param {string} what 用于错误文案的动作名
+ */
+function requireUiTriggered(req, what) {
+  const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (site === 'same-origin' || site === 'none') return;
+  if (site) throw new AppError(ERR.FORBIDDEN, `仅允许从 MacKit 界面发起该操作（${what}）`);
+  const origin = req.headers.origin;
+  if (origin === undefined) return;
+  checkApiOrigin(req);
 }
 
 async function handler(req, res) {

@@ -159,9 +159,20 @@ const LIVE_CHILDREN = new Map();
  * @param {NodeJS.Signals} [signal='SIGKILL']
  * @returns {number} 实际尝试发信号的子进程数（0 表示当前无存活子进程）
  */
-export function killAllNow(signal = 'SIGKILL') {
+export function killAllNow(signal = 'SIGKILL') { return killNow(signal, null); }
+
+/**
+ * 对存活子进程发信号（`laneFilter` 为 null 表示所有 lane）。
+ * killAllNow / killLaneNow 此前是两份逐行同构的实现（只差 lane 过滤），
+ * 2026-09-21 收敛到这里以避免漂移。
+ * @param {NodeJS.Signals} signal
+ * @param {string|null} laneFilter
+ * @returns {number}
+ */
+function killNow(signal, laneFilter) {
   let n = 0;
-  for (const child of Array.from(LIVE_CHILDREN.keys())) {
+  for (const [child, childLane] of Array.from(LIVE_CHILDREN.entries())) {
+    if (laneFilter !== null && childLane !== laneFilter) continue;
     const pid = child.pid;
     try {
       // 优先对进程组发信号（spawn 时 detached:true → 子进程自成进程组），
@@ -186,21 +197,7 @@ export function killAllNow(signal = 'SIGKILL') {
  * @param {NodeJS.Signals} [signal='SIGKILL']
  * @returns {number} 实际尝试发信号的子进程数
  */
-export function killLaneNow(lane, signal = 'SIGKILL') {
-  let n = 0;
-  for (const [child, childLane] of Array.from(LIVE_CHILDREN.entries())) {
-    if (childLane !== lane) continue;
-    const pid = child.pid;
-    try {
-      if (pid) process.kill(-pid, signal);
-      else child.kill(signal);
-      n += 1;
-    } catch {
-      try { child.kill(signal); n += 1; } catch { /* 进程已退出 */ }
-    }
-  }
-  return n;
-}
+export function killLaneNow(lane, signal = 'SIGKILL') { return killNow(signal, lane); }
 
 /**
  * 是否存在存活子进程（任意 lane）。
@@ -389,7 +386,7 @@ export const MIRROR_REMOTES = Object.freeze({
  *     · 这里注入给 brew 本体的 HOMEBREW_API_DOMAIN / HOMEBREW_BOTTLE_DOMAIN 也是错的。
  *   所以官方 API 域名一律显式维护，不再从 git 远端猜。
  */
-export const MIRROR_API_DOMAINS = Object.freeze({
+const MIRROR_API_DOMAINS = Object.freeze({
   tuna: 'https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api',
   ustc: 'https://mirrors.ustc.edu.cn/homebrew-bottles/api',
   aliyun: 'https://mirrors.aliyun.com/homebrew/homebrew-bottles/api',
@@ -428,36 +425,46 @@ function applyMirrorEnv(env, mirror) {
 function buildEnv(opts) {
   /** @type {Record<string,string>} */
   const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (typeof v === 'string') env[k] = v;
-  }
-  // PATH 完全固定，不继承宿主环境（2026-09-16 教训）：宿主 PATH 可能包含工具 shim
-  // 目录（如代理工具向 bash 注入的 brokered-bin，且注入脚本会把该目录再次前置到
-  // 每个非交互 bash 的 PATH 最顶），劫持 plum 配方管道里的 sed，导致 patch_files
-  // 类配方（切换方案/语法模型补丁）把 YAML 正文当 bash 命令执行而全部失败。
-  // MacKit 子进程只需要 PATH_PREFIX 内的工具（brew/git/curl/sed 等），全部显式固定。
-  // paths.EXEC_PATH = PATH_PREFIX + 各工具（node/npm/pnpm/dsh…）实际所在目录，
-  // 这样 nvm / 自定义前缀装的 Node 也能被 `#!/usr/bin/env node` 这类 shebang 找到。
-  env.PATH = paths.EXEC_PATH.join(':');
-  // 剥离会向子 shell 注入行为的变量：BASH_ENV 会被每个非交互 bash source；
-  // BASH_FUNC_* 是 bash 导出函数（同名命令会被函数拦截）。
-  delete env.BASH_ENV;
-  delete env.ENV;
-  for (const k of Object.keys(env)) {
-    if (k.startsWith('BASH_FUNC_')) delete env[k];
+  /**
+   * envReplace=true：调用方给出**完整**环境 —— 不继承宿主、不注入镜像/代理。
+   * 目前唯一使用者是音乐模块的播放抓取（stream.js 的 curl 分支）：它的最小环境是刻意的
+   * （见该文件 buildCurlEnv 的注释），退回默认逻辑会把宿主的一堆变量带进去。
+   */
+  const replace = opts.envReplace === true;
+  if (!replace) {
+    for (const [k, v] of Object.entries(process.env)) {
+      if (typeof v === 'string') env[k] = v;
+    }
+    // PATH 完全固定，不继承宿主环境（2026-09-16 教训）：宿主 PATH 可能包含工具 shim
+    // 目录（如代理工具向 bash 注入的 brokered-bin，且注入脚本会把该目录再次前置到
+    // 每个非交互 bash 的 PATH 最顶），劫持 plum 配方管道里的 sed，导致 patch_files
+    // 类配方（切换方案/语法模型补丁）把 YAML 正文当 bash 命令执行而全部失败。
+    // MacKit 子进程只需要 PATH_PREFIX 内的工具（brew/git/curl/sed 等），全部显式固定。
+    // paths.EXEC_PATH = PATH_PREFIX + 各工具（node/npm/pnpm/dsh…）实际所在目录，
+    // 这样 nvm / 自定义前缀装的 Node 也能被 `#!/usr/bin/env node` 这类 shebang 找到。
+    env.PATH = paths.EXEC_PATH.join(':');
+    // 剥离会向子 shell 注入行为的变量：BASH_ENV 会被每个非交互 bash source；
+    // BASH_FUNC_* 是 bash 导出函数（同名命令会被函数拦截）。
+    delete env.BASH_ENV;
+    delete env.ENV;
+    for (const k of Object.keys(env)) {
+      if (k.startsWith('BASH_FUNC_')) delete env[k];
+    }
   }
 
-  const cfg = safeConfig();
+  if (!replace) {
+    const cfg = safeConfig();
 
-  // 镜像源：默认注入
-  if (!opts.noMirror) {
-    applyMirrorEnv(env, opts.mirror || cfg.mirror);
+    // 镜像源：默认注入
+    if (!opts.noMirror) {
+      applyMirrorEnv(env, opts.mirror || cfg.mirror);
+    }
+    // 代理通道：缺省按「直连」处理 —— 显式删除宿主可能存在的代理变量。
+    // 不能因为调用方没传 channel 就把宿主的 http_proxy 悄悄带进子进程：那样
+    // 「直连 / 代理」两种语义就只对显式传 channel 的调用成立（历史上卸载 / cleanup /
+    // git 读取等未传 channel 的路径确实会继承宿主代理）。
+    applyProxyEnv(env, opts.channel === 'proxy' ? 'proxy' : 'direct', cfg);
   }
-  // 代理通道：缺省按「直连」处理 —— 显式删除宿主可能存在的代理变量。
-  // 不能因为调用方没传 channel 就把宿主的 http_proxy 悄悄带进子进程：那样
-  // 「直连 / 代理」两种语义就只对显式传 channel 的调用成立（历史上卸载 / cleanup /
-  // git 读取等未传 channel 的路径确实会继承宿主代理）。
-  applyProxyEnv(env, opts.channel === 'proxy' ? 'proxy' : 'direct', cfg);
   // 显式追加的环境变量优先级最高
   if (opts.env) {
     for (const [k, v] of Object.entries(opts.env)) {
@@ -618,13 +625,16 @@ export function run(bin, args, opts = {}) {
 
     const onAbort = () => doKill('cancel');
     if (opts.signal) {
-      if (opts.signal.aborted) onAbort();
-      else opts.signal.addEventListener('abort', onAbort, { once: true });
+      // executor 开头已对同一 signal 做过 aborted 早退，此处只需挂监听
+      opts.signal.addEventListener('abort', onAbort, { once: true });
     }
 
     const cleanup = () => {
       clearTimeout(timeoutTimer);
-      if (killTimer) clearTimeout(killTimer);
+      // ★ 刻意不取消 killTimer：它负责 SIGTERM 3s 后对整组补 SIGKILL。直接子进程先退出时
+      //   'close' 就到了，若在此取消升级，只把 stdout 关掉的孙进程（如 `cmd >/dev/null &`）
+      //   会被留成孤儿 —— 与本文件「整组回收」的承诺相悖（2026-09-21 修）。
+      //   它是 unref 的；对已退出的 pid 发信号只会被 catch 忽略。
       if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
       LIVE_CHILDREN.delete(child); // 结束即注销（Map.delete 与旧 Set.delete 语义一致），killAllNow / killLaneNow 不会误伤已退出的进程
     };
@@ -659,6 +669,90 @@ export function run(bin, args, opts = {}) {
 }
 
 /**
+ * 启动一个**流式**受控子进程，立即把 child 交回调用方（不缓冲 stdout）。
+ *
+ * ★ 为什么需要它（2026-09-21 修）：音乐模块的在线播放要在 curl 的 stdout 上做「先解析
+ *   最终响应头块、再把剩余字节边到边推给播放器」，`run()` 的「缓冲完再返回」模型做不到。
+ *   此前 stream.js 自己 `import { spawn } from 'node:child_process'` 直接 spawn —— 那
+ *   **绕过了本文件的三条红线**：bin 白名单校验、LIVE_CHILDREN 登记（退出时整组回收）、
+ *   以及统一的 detached + 环境变量策略。播放用的 curl 因此从不被回收，进程退出后成孤儿。
+ *   现在 child_process 只在本文件出现，stream.js 走这个出口。
+ *
+ * 与 `run()` 的差异（有意）：
+ *   · 不捕获取输出、不设 onLine、不解析退出码 —— 调用方自己管流；
+ *   · 同步返回 `{ child, kill, release }`，调用方须在流结束时调用 `release()`
+ *     （或依赖 child 的 close/error —— 两条路径都会自动 release，重复调用无副作用）；
+ *   · 超时 / signal 取消 → 对**整个进程组** SIGTERM → KILL_GRACE_MS → SIGKILL（与 run 同款）。
+ *
+ * @param {string} bin 逻辑名或允许的绝对路径
+ * @param {string[]} args 参数数组（绝不拼接 shell 字符串）
+ * @param {import('./exec.js').RunOpts & {envReplace?:boolean}} [opts]
+ * @returns {{child:import('node:child_process').ChildProcess, kill:() => void, release:() => void}}
+ */
+export function spawnStream(bin, args, opts = {}) {
+  const binPath = resolveBin(bin);
+  const argsArr = Array.isArray(args) ? args.slice() : [];
+  const env = buildEnv(opts);
+  const laneName = (typeof opts.lane === 'string' && opts.lane) || 'default';
+  const timeoutMs = typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0
+    ? opts.timeoutMs
+    : DEFAULT_TIMEOUT_MS;
+
+  if (opts.signal && opts.signal.aborted) throw new AppError(ERR.CANCELLED, '任务已取消');
+
+  let child;
+  try {
+    child = spawn(binPath, argsArr, {
+      cwd: opts.cwd || paths.HOME,
+      env,
+      shell: false,
+      windowsHide: true,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    LIVE_CHILDREN.set(child, laneName);
+  } catch (err) {
+    throw new AppError(ERR.CMD_FAILED, `无法启动命令 ${bin}`, String(err && err.message));
+  }
+
+  /** 整组回收（负 pid → 进程组），与 run() 的 killTree 同款。 */
+  const killTree = (sig) => {
+    const pid = child.pid;
+    if (pid) {
+      try { process.kill(-pid, sig); return; } catch { /* 退回单进程 */ }
+    }
+    try { child.kill(sig); } catch { /* ignore */ }
+  };
+
+  let released = false;
+  let killTimer = null;
+  const kill = () => {
+    if (released) return;
+    killTree('SIGTERM');
+    killTimer = setTimeout(() => killTree('SIGKILL'), KILL_GRACE_MS);
+    if (killTimer.unref) killTimer.unref();
+  };
+
+  const timeoutTimer = setTimeout(kill, timeoutMs);
+  if (timeoutTimer.unref) timeoutTimer.unref();
+  const onAbort = () => kill();
+  if (opts.signal) opts.signal.addEventListener('abort', onAbort, { once: true });
+
+  const release = () => {
+    if (released) return;
+    released = true;
+    clearTimeout(timeoutTimer);
+    if (killTimer) clearTimeout(killTimer); // 与 run() 不同：这里没有「孙进程还活着」的顾虑，调用方已明确结束
+    if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
+    LIVE_CHILDREN.delete(child);
+  };
+  // 自带监听，顺带避免调用方没挂 'error' 时 child 的 'error' 变成 uncaughtException
+  child.on('error', () => release());
+  child.on('close', () => release());
+  return { child, kill, release };
+}
+
+/**
  * 执行并吞掉异常，返回统一的「子进程退出码」结构。
  *
  * 供「只读探测 / 尽力而为」场景使用（env / sysinit / backup 的同类兜底已收敛到这里）。
@@ -689,6 +783,9 @@ export async function runSafe(bin, args, opts = {}) {
 // ---------------------------------------------------------------------------
 // 通道尝试
 // ---------------------------------------------------------------------------
+
+/** 值得换通道重试的错误码（其余一律原样上抛，见 runWithChannel 注释）。 */
+const RETRYABLE_CODES = new Set([ERR.CMD_FAILED, ERR.NET_UNREACHABLE]);
 
 /**
  * 按策略依次尝试通道，成功即返回并可返回命中的通道。
@@ -729,10 +826,10 @@ export async function runWithChannel(policy, desc, bin, args, opts = {}) {
         try { opts.onAttempt(channel, 'fail'); } catch { /* ignore */ }
       }
     } catch (err) {
-      // 取消 / 超时不降级，直接向上抛
-      if (err instanceof AppError && (err.code === ERR.CANCELLED || err.code === ERR.TIMEOUT)) {
-        throw err;
-      }
+      // 只有「命令真的跑失败 / 网络不可达」才值得换通道重试；取消、超时、白名单、解析、
+      // 环境、权限、IO 类错误一律原样上抛 —— 否则错误码会被改写成 CMD_FAILED，还可能
+      // 重复 spawn 子进程（2026-09-21 修）。
+      if (err instanceof AppError && !RETRYABLE_CODES.has(err.code)) throw err;
       lastDetail = err instanceof AppError ? (err.detail || err.message) : String(err);
       if (opts.onAttempt) {
         try { opts.onAttempt(channel, 'fail'); } catch { /* ignore */ }
@@ -782,7 +879,10 @@ export async function osascriptAdmin(shellCmd, opts = {}) {
   const script = `do shell script "${escapeAppleScript(shellCmd)}" with administrator privileges`;
   const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
 
-  const res = await run(paths.OSASCRIPT_BIN, ['-e', script], {
+  // ★ 必须传逻辑名 'osascript'（= BIN_MAP 里的固定路径）：传绝对路径会走 resolveBin 的
+  //   绝对分支，而 /usr/bin/osascript 不在 ABSOLUTE_ALLOWED 里 → 必然抛 CMD_NOT_ALLOWED，
+  //   管理员授权通道从首版起就是坏的（2026-09-21 修）。
+  const res = await run('osascript', ['-e', script], {
     timeoutMs,
     signal: opts.signal,
     noMirror: true, // 授权命令不需要 brew 镜像注入

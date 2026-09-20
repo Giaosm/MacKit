@@ -191,7 +191,7 @@ export default {
       if (!ok) return;
       try { await ctx.runTask('dsh', 'install_dsh', {}, { confirm: true }); }
       catch { /* runTask 内部已提示 */ }
-      load();
+      // 不在此处再 load()：done 订阅已刷新状态，否则一次安装会发两次 /api/dsh/status。
     }
 
     /** 安装插件市场（需要 dsh 与 pnpm；pnpm 缺失会自动安装）。 */
@@ -208,7 +208,7 @@ export default {
       if (!ok) return;
       try { await ctx.runTask('dsh', 'add_market', {}, { confirm: true }); }
       catch { /* runTask 内部已提示 */ }
-      load();
+      // 同上：done 订阅已刷新，去掉 await 后的重复 load()。
     }
 
     // 任务结束后刷新状态（dsh / pnpm / 插件市场是否就位）

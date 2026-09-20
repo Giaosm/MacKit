@@ -60,8 +60,14 @@ const PROPFIND_BODY =
 const DEFAULT_TIMEOUT = 20_000;
 /** 传输类请求（PUT / GET）默认超时（ms）。 */
 const TRANSFER_TIMEOUT = 120_000;
-/** 响应体上限（8MB），避免异常响应撑爆内存。 */
-const MAX_BODY = 8_000_000;
+/**
+ * 传输体上限（32MB），**上传与下载必须同一个数**。
+ *
+ * ★ 2026-09-21 修复：原来只有一个 8MB 的下载上限（旧名 MAX_BODY），上传（PUT）却没有任何限制。
+ *   于是超过 8MB 的备份能顺利传上去，恢复时却被下载侧以「服务器返回内容过大」拒收 ——
+ *   备份写出去却永远读不回来。方向和大小任一不对称都会制造这种死数据，故上传/下载共用本常量。
+ */
+const MAX_DAV_BODY = 32 * 1024 * 1024;
 
 // ===========================================================================
 // 纯函数
@@ -472,7 +478,7 @@ function request(url, opts = {}) {
         let size = 0;
         res.on('data', (c) => {
           size += c.length;
-          if (size > MAX_BODY) {
+          if (size > MAX_DAV_BODY) {
             settle(() => reject(new AppError(DAV_ERR.PARSE, '服务器返回内容过大')));
             try { res.destroy(); } catch { /* ignore */ }
             return;
@@ -626,9 +632,16 @@ export async function uploadBackup(cfg, name, text, opts = {}) {
   const dirUrl = remoteDirUrl(cfg);
   const fileUrl = joinUrl(dirUrl, name);
   const body = String(text);
+  // ★ 2026-09-21 修复：上传前先按 UTF-8 字节数校验，超过共享上限就直接拒绝 ——
+  //   绝不允许写出一份下载侧读不回来的备份。校验必须在发请求之前。
+  const byteLength = Buffer.byteLength(body, 'utf8');
+  if (byteLength > MAX_DAV_BODY) {
+    const mb = (byteLength / (1024 * 1024)).toFixed(1);
+    throw new AppError(DAV_ERR.PARSE, `备份内容过大（约 ${mb} MB，上限 32 MB），请减少 Rime 配置文件后重试`);
+  }
   const headers = {
     'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body, 'utf8'),
+    'Content-Length': byteLength, // 复用上面已算好的字节数，避免重复编码
   };
   const timeoutMs = opts.timeoutMs ?? TRANSFER_TIMEOUT;
 

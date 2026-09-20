@@ -33,6 +33,15 @@ const UPDATE_FETCH_TIMEOUT_MS = 90_000;
 const PULL_TIMEOUT_MS = 120_000;
 
 /**
+ * ★ 正在进行的远端检查（并发去重）。总览 15s 健康轮询、用户点「检查更新」与视图 refresh
+ * 会同时进来；并发跑多条 `git fetch` 会在 `.git` 的锁文件（如 `shallow.lock` /
+ * `index.lock`）上互相争抢，轻则一条无谓失败、重则把两次结果都搅乱。
+ * 复用进行中的 Promise（force:true 也一样：那一次 fetch 本身就是新的），
+ * 并照 lib/env.js 的 snapshot() 那样在 `.finally()` 里清空。
+ */
+let checkInflight = null;
+
+/**
  * 在**仓库目录里**跑一条 git 命令。
  *
  * ★ 必须显式传 cwd：exec 层的子进程默认 `cwd` 是用户家目录（lib/exec.js 的
@@ -112,18 +121,35 @@ async function findConflicts(upstream, porcelain) {
 
 /**
  * 远端比较（fetch + rev-list），结果写磁盘缓存。
+ *
+ * ★ 只缓存「成功」的结果：fetchOk === false（网络抖动 / 代理挂了）不写缓存，
+ *   否则一次瞬时失败会让 UI 连续 10 分钟显示「无法检查更新」，网络恢复了也看不到。
+ * ★ 并发去重见模块头部的 checkInflight。
+ *
  * @param {{force?:boolean}} [opts]
  * @returns {Promise<{value:any, cached:boolean}>}
  */
 async function checkRemote(opts = {}) {
+  // 缓存命中路径（force 时跳过）：并发去重放在其后，让热点路径保持同步返回、不进任何锁。
   if (opts.force !== true) {
     const cached = store.getCached(CHECK_CACHE_KEY);
     if (cached && cached.value && typeof cached.value === 'object'
       && typeof cached.at === 'number' && Date.now() - cached.at < CHECK_TTL_MS) {
+      // 缓存里的值一定来自一次成功的 fetch（失败不写缓存）→ cached:true 仍如实表示「命中缓存」
       return { value: cached.value, cached: true };
     }
   }
 
+  // ★ 已有一次检查在跑 → 直接复用它，不再发起第二条 fetch（避免抢 .git 锁）。
+  //   force:true 也复用：那次 fetch 正在/即将拿到最新远端数据，对调用方就是「新鲜」的。
+  if (checkInflight) return checkInflight;
+
+  checkInflight = computeRemote().finally(() => { checkInflight = null; });
+  return checkInflight;
+}
+
+/** 真正执行 fetch + rev-list 的那一轮检查（由 checkRemote 负责缓存与并发去重）。 */
+async function computeRemote() {
   const branch = await currentBranch();
   const upstream = await upstreamRef(branch);
 
@@ -150,7 +176,12 @@ async function checkRemote(opts = {}) {
   }
 
   const value = { upstream, behind, ahead, latest, fetchOk, fetchError, checkedAt: Date.now() };
-  try { store.setCached(CHECK_CACHE_KEY, value); } catch { /* 缓存写失败不影响本次结果 */ }
+  // ★ 2026-09-21 修复：fetch 失败时**不写缓存**（仍照常返回 value）。
+  //   原实现无条件 setCached，导致瞬时网络故障被缓存 10 分钟：用户网络恢复后
+  //   UI 仍一直显示「无法检查更新」，直到 TTL 过期。成功才缓存，同一成功结果依旧 10 分钟内复用。
+  if (fetchOk) {
+    try { store.setCached(CHECK_CACHE_KEY, value); } catch { /* 缓存写失败不影响本次结果 */ }
+  }
   return { value, cached: false };
 }
 
@@ -193,7 +224,7 @@ export async function queryStatus(opts = {}) {
 function updateStep() {
   return {
     id: 'update', title: '检查并更新 MacKit',
-    channelPolicy: 'proxy_first', timeoutMs: 300_000,
+    timeoutMs: 300_000,
     run: async (ctx) => {
       if (!paths.exists(paths.GIT_DIR)) {
         throw new AppError(ERR.ENV_MISSING, '当前不是 git 检出，无法自动更新',

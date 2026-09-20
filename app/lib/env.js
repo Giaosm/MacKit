@@ -441,14 +441,25 @@ export async function snapshot(opts = {}) {
   // ★ 并发去重：一次体检要跑 5 条 brew 命令 + 4 次网络探测，而首屏多个视图会同时请求
   //   /api/env（还有 15s 一次的健康轮询与各处 refreshEnv(true)）。没有这层去重就会并行
   //   跑多轮 brew —— 与本文件「brew 命令串行以避免抢锁」的约束冲突（index.lock）。
-  if (inflight) return inflight;
+  if (inflight) {
+    // 同 generation 的构建直接复用（无论 force：新的那一轮已经在算了）。
+    if (inflightGen === generation) return inflight;
+    // 否则那次构建基于「配置已被改动」之前的旧数据（invalidate 提升了 generation）。
+    // force 本意是「不要缓存、要新的」，把过期结果回给它就等于失效没生效；
+    // 这里先等旧构建收尾（仍不并行 → 不抢 index.lock），再重新构建一次。
+    await inflight.catch(() => { /* 旧构建失败无所谓，下面重建 */ });
+    if (inflight) return inflight; // 等待期间又有人发起了构建
+  }
   const gen = generation;
+  inflightGen = gen;
   inflight = buildSnapshot(gen).finally(() => { inflight = null; });
   return inflight;
 }
 
 /** 正在构建的快照（并发去重）；generation 用于丢弃「构建期间配置已变」的过期结果。 */
 let inflight = null;
+/** 上面那次 inflight 构建发起时的 generation（用于判断它是否已被 invalidate 作废）。 */
+let inflightGen = -1;
 let generation = 0;
 
 async function buildSnapshot(gen) {
@@ -478,7 +489,11 @@ async function buildSnapshot(gen) {
     mirror: {
       status: 'ok',
       id: cfg.mirror,
-      label: mirrorLabel(cfg.mirror),
+      // mirrorRaw 是文件里 MIRROR 行的原值：自定义镜像（枚举外）时 id 会回落 'official'，
+      // 只回 id 会把自建源显示成官方源（误导用户以为镜像被改了）。
+      raw: cfg.mirrorRaw,
+      label: cfg.mirrorRaw && cfg.mirrorRaw !== cfg.mirror ? `自定义（${cfg.mirrorRaw}）` : mirrorLabel(cfg.mirror),
+      isCustom: !!(cfg.mirrorRaw && cfg.mirrorRaw !== cfg.mirror),
     },
     proxyPorts: {
       status: cfg.exists ? 'ok' : 'warn',

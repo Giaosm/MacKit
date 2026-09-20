@@ -99,8 +99,10 @@ async function readQuarantine(p) {
   try {
     const res = await exec.run('xattr', ['-r', '-l', p], { noMirror: true, timeoutMs: 20_000 });
     if (res.code !== 0) return null;
-    return new RegExp(`(^|\\n)[^\\n]*${QUARANTINE.replace(/\./g, '\\.')}`).test(res.stdout)
-      || res.stdout.includes(QUARANTINE);
+    // ★ 2026-09-21：原先这里还有一条 `|| res.stdout.includes(QUARANTINE)` 兜底 ——
+    //   但上面的正则已覆盖「行内任意位置出现该属性」（`[^\n]*` + `^|\n`），恒为超集，
+    //   那条分支永远走不到，属死代码，删除以免让人误以为两个判据语义不同。
+    return new RegExp(`(^|\\n)[^\\n]*${QUARANTINE.replace(/\./g, '\\.')}`).test(res.stdout);
   } catch { return null; }
 }
 

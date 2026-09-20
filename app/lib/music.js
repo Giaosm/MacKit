@@ -65,6 +65,20 @@ const HEARTBEAT_MS = 15_000;
 const MUSICDL_TARGET_VERSION = '2.13.11';
 
 let sourcesCache = { at: 0, keys: null };
+
+/**
+ * 让「音乐环境」相关的全部缓存失效。
+ *
+ * ★ 2026-09-21 修：安装 / 升级 / 卸载 musicdl 之后各调用点只调了 `env.invalidate()`，
+ *   而本文件的 `sourcesCache`（已登记音源键，TTL 缓存）不会跟着失效 —— 于是刚装好 musicdl
+ *   的用户在界面上仍然看到「未登记任何音源」的旧列表，直到 TTL 到期。
+ *   统一入口，避免以后新增缓存又漏掉一处。
+ */
+function invalidateMusicEnvCache() {
+  sourcesCache = { at: 0, keys: null };
+  streamMetaCache.clear();
+  env.invalidate();
+}
 /** 在线播放元信息内存缓存（LRU + TTL），见 STREAM_META_* 常量。 */
 const streamMetaCache = new Map();
 
@@ -183,7 +197,11 @@ export function audioCacheKey(rec) {
   const song = String(r.song_name || '');
   const singers = String(r.singers || '');
   const album = String(r.album || '');
-  const ext = String(r.ext || '').replace(/^\./, '').toLowerCase();
+  // ★ ext 白名单（2026-09-21 修）：这个值会直接拼进缓存文件名 `snd-<digest>.<ext>`，
+  //   再由 server.js `path.join` 成路径并参与 rmSync / renameSync。bridge.py 侧已收口，
+  //   但纵深防御不能只靠上游 —— 一旦 ext 变成 `../../foo`，那就是「任意路径写 + 删」。
+  //   只允许 [a-z0-9]{1,8}（含 dtshd / mpc2k 这类长扩展名），否则回落 'bin'。
+  const ext = String(r.ext || '').replace(/^\./, '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 8);
   // 文件大小：优先顶层（proxy 记录无 clean），回落到 clean.file_size_bytes（musicdl 记录），
   // 以尽量区分「不同码率/大小」的同名同扩展名曲目，降低缓存键碰撞概率。
   const size = r.filesize != null ? r.filesize
@@ -476,7 +494,9 @@ export async function queryMusicdlUpstream(params = {}, deps = {}) {
   }
 
   // ② curl 落盘 → 解析（网络范式同 downloadIndex）
-  const tmpFile = path.join(paths.CACHE_DIR, `musicdl-upstream-${process.pid}.json`);
+  // ★ 文件名必须带随机段：只用 pid 的话，同一进程内两次并发调用（例如界面点「检查更新」的同时
+  //   配置页触发一次）会写同一个文件 —— 一个已经 rmSync 掉，另一个读不到 → 误报解析失败（2026-09-21 修）。
+  const tmpFile = path.join(paths.CACHE_DIR, `musicdl-upstream-${process.pid}-${crypto.randomBytes(4).toString('hex')}.json`);
   try {
     await runWithChannel('direct_first', '查询 musicdl 上游版本', 'curl',
       ['-fsSL', '--compressed', '--max-time', '20', '-o', tmpFile, MUSICDL_PYPI_URL],
@@ -858,14 +878,15 @@ function createVenvStep() {
  *       失败再试直连（`channel:'direct'` + 显式删除三键）。
  *     · direct 模式：只做一次直连。
  *   代理地址经 resolveInstallProxyEnv()（唯一下发出口，含 socks5）。
- * `channelPolicy:'proxy_first'` 仅作为元数据（runner 存档展示），不参与逻辑。
+ * ★ 2026-09-21：原先每个 plan 上还挂了一个 `channelPolicy` 字段，标注「仅作为元数据供 runner
+ *   存档展示」—— 但全项目没有任何读取方（runner 只在 steps 投影里抄一份，前端从不显示），
+ *   属死字段，已随本次清理删除；实际通道仍由本函数内的显式 run/runWithChannel 决定。
  */
 function pipInstallStep() {
   return {
     id: 'pip_install',
     title: '安装 musicdl（约 300–500 MB）',
-    channelPolicy: 'proxy_first',
-    timeoutMs: PIP_TIMEOUT_MS,
+        timeoutMs: PIP_TIMEOUT_MS,
     run: async (ctx) => {
       if (!paths.exists(paths.MUSIC_VENV_PIP)) {
         throw new AppError(ERR.ENV_MISSING, '未找到 venv 内的 pip', `期望位置：${paths.MUSIC_VENV_PIP}`);
@@ -937,18 +958,18 @@ function verifyEnvStep() {
           const rolled = await rollbackMusicdl(ctx);
           r = await env.probeMusicdl();
           if (!r.installed) {
-            env.invalidate();
+            invalidateMusicEnvCache();
             throw new AppError(ERR.CMD_FAILED,
               rolled ? `安装已结束，回滚到 ${MUSICDL_TARGET_VERSION} 后 import musicdl 仍失败` : '安装已结束，但 import musicdl 仍失败',
               r.importError || undefined);
           }
-          env.invalidate();
+          invalidateMusicEnvCache();
           // 日志按**实际结果**区分：真的执行了回滚 vs 只是探针瞬时失败、复查已通过
           ctx.log('warn', rolled
             ? `升级失败，已回滚到 ${MUSICDL_TARGET_VERSION}`
             : `探测瞬时失败，复查已通过（未执行回滚，当前 musicdl ${r.version || '未知版本'}）`);
         }
-        env.invalidate();
+        invalidateMusicEnvCache();
         ctx.log('ok', `音乐环境已就绪：musicdl ${r.version || '未知版本'}`);
         ctx.log('info', `桥接脚本：${paths.MUSIC_BRIDGE}${paths.exists(paths.MUSIC_BRIDGE) ? '' : '（缺失！）'}`);
       } finally {
@@ -1019,7 +1040,7 @@ function removeEnvStep() {
       try {
         if (paths.exists(paths.PY_DIR) && fs.readdirSync(paths.PY_DIR).length === 0) fs.rmdirSync(paths.PY_DIR);
       } catch { /* 非空或权限问题：忽略 */ }
-      env.invalidate();
+      invalidateMusicEnvCache();
     },
   };
 }

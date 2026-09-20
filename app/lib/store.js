@@ -17,6 +17,7 @@ import path from 'node:path';
 import * as paths from './paths.js';
 
 
+// ★ 本对象是**唯一**默认值事实源：readMackit 的每一处回落都必须引用它，不得写字面量。
 const MACKIT_DEFAULTS = Object.freeze({
   defaultChannel: 'auto', autoFallback: true, autoCleanup: true, lastCheckedAt: null, version: 1,
   // 音乐模块（第 8 模块）配置：默认下载目录 / 命名模板 / 网络通道 / 已选音源
@@ -59,6 +60,11 @@ const PROXY_ADDR_RE = /^([A-Za-z0-9.\-]+):(\d{1,5})$/;
 /** 非法代理地址时的统一可读提示（前端直接 toast 这句）。 */
 const PROXY_ADDR_HINT = '请填写 主机:端口，例如 127.0.0.1:7897，不要带 http://';
 const MIRROR_IDS = Object.freeze(['official', 'tuna', 'ustc', 'aliyun', 'tencent']);
+/**
+ * 自定义 MIRROR 值（枚举外，如自建镜像 / 带路径的 URL）的合法字符集。
+ * 该值会被原样写进 `MIRROR=<值>`，因此**必须**拒绝换行、`#` 与空白，避免注入新行或注释掉后续配置。
+ */
+const MIRROR_VALUE_RE = /^[A-Za-z0-9_.:/@?&=%+-]{1,256}$/;
 const CHANNEL_POLICIES = Object.freeze(['direct_first', 'proxy_first', 'auto']);
 
 const LOG_KEEP_TASKS = 50;
@@ -82,9 +88,17 @@ function readJsonSafe(p, fallback) {
  */
 function writeJsonSafe(p, obj) {
   const tmp = `${p}.tmp`;
+  const text = JSON.stringify(obj, null, 2);
+  // ★ 一律 0600：这里写的包含 WebDAV 凭据、备份信封、redact 前的历史与日志。
+  //   `writeFileSync` 的 mode 只在**新建**时生效，历史遗留的 0644 临时文件不会被改，
+  //   所以再补一次 chmod（失败不致命：目录本身是 0700）。
+  const write = (target) => {
+    fs.writeFileSync(target, text, { encoding: 'utf8', mode: 0o600 });
+    try { fs.chmodSync(target, 0o600); } catch { /* 权限设置失败不致命 */ }
+  };
   try {
     paths.ensureDirs();
-    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+    write(tmp);
     try {
       fs.renameSync(tmp, p); // 同目录内 rename 是原子的（首选路径）
     } catch (err) {
@@ -92,7 +106,7 @@ function writeJsonSafe(p, obj) {
       // provenance/TCC 策略），但原地覆盖写允许 —— 降级为直接写目标文件。
       // 代价只是丢失「中途崩溃不留半截文件」的原子性保证，可接受。
       if (err && err.code === 'EPERM') {
-        fs.writeFileSync(p, JSON.stringify(obj, null, 2), 'utf8');
+        write(p);
         try { fs.rmSync(tmp, { force: true }); } catch { /* 已降级，tmp 仅是多余副本 */ }
         return true;
       }
@@ -182,11 +196,19 @@ export function readBrewgo() {
  * `mirror` 缺省（undefined）= **本次不改写 MIRROR 行**；只有界面上显式选了镜像才传值。
  * （2026-09-19 修：此前一律回落 'official' 并整行写回，用户在文件里自定义的镜像值
  *   只要改一次端口就会被静默改成 official。）
+ *
+ * 2026-09-21 增补 `mirrorRaw`：枚举外的自定义镜像值（自建源 / URL）无法用 `mirror` 表达，
+ * 于是「备份 → 恢复」只能回落 official，把对端机器上自定义的 MIRROR 覆盖掉。
+ * mirrorRaw 是「用户显式给出的原值」，仅在**通过安全字符校验**时生效，优先级高于 mirror。
  */
 function normalizeBrewgoInput(v) {
   const httpPort = Number.isInteger(v.httpPort) && v.httpPort >= 1 && v.httpPort <= 65535 ? v.httpPort : 7897;
   const socksPort = Number.isInteger(v.socksPort) && v.socksPort >= 1 && v.socksPort <= 65535 ? v.socksPort : 7897;
-  const mirror = MIRROR_IDS.includes(v.mirror) ? v.mirror : null;
+  const raw = typeof v.mirrorRaw === 'string' ? v.mirrorRaw.trim() : '';
+  // 防注入：这个值会被原样写进 `MIRROR=<值>` 行，因此禁止换行 / # / 空白，
+  // 只放行 URL / 主机名 / 常见路径字符。
+  const rawOk = raw.length > 0 && raw.length <= 256 && MIRROR_VALUE_RE.test(raw);
+  const mirror = rawOk ? raw : (MIRROR_IDS.includes(v.mirror) ? v.mirror : null);
   return { httpPort, socksPort, mirror };
 }
 
@@ -286,7 +308,7 @@ export function readMackit() {
     autoFallback: typeof raw.autoFallback === 'boolean' ? raw.autoFallback : MACKIT_DEFAULTS.autoFallback,
     // 升级完成后是否自动清理缓存：默认 true（对齐用户要求「默认开」）
     autoCleanup: typeof raw.autoCleanup === 'boolean' ? raw.autoCleanup : MACKIT_DEFAULTS.autoCleanup,
-    lastCheckedAt: typeof raw.lastCheckedAt === 'number' ? raw.lastCheckedAt : null,
+    lastCheckedAt: typeof raw.lastCheckedAt === 'number' ? raw.lastCheckedAt : MACKIT_DEFAULTS.lastCheckedAt,
     // 音乐模块。缺失/类型不符一律回落默认值（缺省下载目录、命名模板、通道、音源）。
     musicDownloadDir: typeof raw.musicDownloadDir === 'string' && raw.musicDownloadDir.trim()
       ? raw.musicDownloadDir : MACKIT_DEFAULTS.musicDownloadDir,
@@ -295,18 +317,20 @@ export function readMackit() {
     musicChannel: MUSIC_CHANNELS.includes(raw.musicChannel) ? raw.musicChannel : MACKIT_DEFAULTS.musicChannel,
     musicSources: Array.isArray(raw.musicSources)
       ? raw.musicSources.filter((s) => typeof s === 'string' && s.length > 0) : MACKIT_DEFAULTS.musicSources,
-    musicSaveLyrics: raw.musicSaveLyrics !== false,
+    musicSaveLyrics: typeof raw.musicSaveLyrics === 'boolean' ? raw.musicSaveLyrics : MACKIT_DEFAULTS.musicSaveLyrics,
     // 增强搜索（实验）：默认 false；true = 搜索走第三方代理 API（更快、组合词更宽容，但依赖外部服务）
-    musicEnhancedSearch: raw.musicEnhancedSearch === true,
+    musicEnhancedSearch: raw.musicEnhancedSearch === true ? true : MACKIT_DEFAULTS.musicEnhancedSearch,
     // R0 · 代理三键（容错读出）：枚举外回落 homebrew；地址经 normalizeProxyAddr 归一（非法即视为空）。
     musicProxySource: MUSIC_PROXY_SOURCES.includes(raw.musicProxySource)
       ? raw.musicProxySource : MACKIT_DEFAULTS.musicProxySource,
-    musicProxyHttp: normalizeProxyAddr(raw.musicProxyHttp),
-    musicProxySocks5: normalizeProxyAddr(raw.musicProxySocks5),
+    musicProxyHttp: normalizeProxyAddr(raw.musicProxyHttp) || MACKIT_DEFAULTS.musicProxyHttp,
+    musicProxySocks5: normalizeProxyAddr(raw.musicProxySocks5) || MACKIT_DEFAULTS.musicProxySocks5,
     // 音频缓存容量上限（MB）与下载并发度：读取时夹取到合法区间，非法/缺失一律回落默认值。
     musicCacheMaxMb: clampInt(raw.musicCacheMaxMb, MUSIC_CACHE_MB_MIN, MUSIC_CACHE_MB_MAX, MACKIT_DEFAULTS.musicCacheMaxMb),
     musicDownloadConcurrency: clampInt(raw.musicDownloadConcurrency, MUSIC_CONCURRENCY_MIN, MUSIC_CONCURRENCY_MAX, MACKIT_DEFAULTS.musicDownloadConcurrency),
-    version: 1,
+    // ★ 2026-09-21：这里原本硬编码字面量（null / 1 / ''），与 MACKIT_DEFAULTS 里的声明各写一份 ——
+    //   改了 DEFAULTS 却不生效的经典漂移。全部改回读 DEFAULTS，保持「默认值只有一处」的口径。
+    version: MACKIT_DEFAULTS.version,
   };
 }
 
@@ -477,11 +501,24 @@ export function logFilePath(taskId) { return path.join(paths.LOGS_DIR, `${taskId
 
 /** 追加一行日志（逐行 JSON）。 */
 export function appendLog(taskId, line) {
-  paths.ensureDirs();
+  const file = logFilePath(taskId);
+  const text = JSON.stringify(line) + '\n';
   // mode 只在**创建**时生效：日志里可能含 WebDAV 地址、包名、本机路径，
   // 与 config.json / webdav.json / history 同口径收紧到仅本人可读。
+  const opts = { encoding: 'utf8', mode: 0o600 };
+  // ★ 此处不再逐行 paths.ensureDirs()：一次 brew upgrade 会打上千行日志，而 ensureDirs
+  //   每次要发 4 条 mkdirSync —— 纯白白的系统调用。目录在进程启动时已建好，只有在被外部
+  //   删掉（用户清理 ~/.mackit）时才补建一次重试。
   try {
-    fs.appendFileSync(logFilePath(taskId), JSON.stringify(line) + '\n', { encoding: 'utf8', mode: 0o600 });
+    fs.appendFileSync(file, text, opts);
+    return;
+  } catch (err) {
+    const code = err && err.code;
+    if (code !== 'ENOENT' && code !== 'EACCES' && code !== 'EPERM') return; // 其它错误不阻断任务
+  }
+  try {
+    paths.ensureDirs();
+    fs.appendFileSync(file, text, opts);
   } catch { /* 日志写失败不阻断任务 */ }
 }
 

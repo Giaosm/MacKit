@@ -828,11 +828,11 @@ async function downloadInstallScript(ctx) {
 function homebrewInstallSteps() {
   return [
     {
-      id: 'download', title: '下载官方安装脚本', channelPolicy: 'proxy_first', timeoutMs: 200_000,
+      id: 'download', title: '下载官方安装脚本', timeoutMs: 200_000,
       run: async (ctx) => { await downloadInstallScript(ctx); },
     },
     {
-      id: 'install', title: '安装 Homebrew（官方脚本）', channelPolicy: 'proxy_first', timeoutMs: UPGRADE_TIMEOUT,
+      id: 'install', title: '安装 Homebrew（官方脚本）', timeoutMs: UPGRADE_TIMEOUT,
       run: async (ctx) => {
         const scriptPath = path.join(paths.CACHE_DIR, 'homebrew-install.sh');
         if (!fs.existsSync(scriptPath)) throw new AppError(ERR.NOT_FOUND, '安装脚本不存在，请重试');
@@ -896,7 +896,6 @@ function installSteps(items, kind) {
   }
   const plans = list.map((it, i) => ({
     id: `install_${i}`, title: `安装 ${it.name}`,
-    channelPolicy: it.mode === 'proxy' ? 'proxy_first' : 'direct_first',
     timeoutMs: UPGRADE_TIMEOUT,
     run: async (ctx) => {
       const label = `${it.name} ${it.mode === 'proxy' ? '代理' : '直连'}安装`;
@@ -928,7 +927,7 @@ const actions = {
   brew_update: {
     title: '更新 Homebrew 本体',
     steps: () => [{
-      id: 'brew_update', title: '更新 Homebrew 本体', channelPolicy: 'proxy_first', timeoutMs: UPGRADE_TIMEOUT,
+      id: 'brew_update', title: '更新 Homebrew 本体', timeoutMs: UPGRADE_TIMEOUT,
       run: async (ctx) => { await runPolicyWithSelfHeal(ctx); },
     }],
   },
@@ -945,7 +944,6 @@ const actions = {
         const mode = it.mode === 'proxy' ? 'proxy' : (it.mode === 'direct' ? 'direct' : 'skip');
         return {
           id: `item_${i}`, title: `${it.name}`,
-          channelPolicy: mode === 'proxy' ? 'proxy_first' : (mode === 'direct' ? 'direct_first' : null),
           timeoutMs: UPGRADE_TIMEOUT,
           run: async (ctx) => {
             if (mode === 'skip') {

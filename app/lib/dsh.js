@@ -24,6 +24,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import * as paths from './paths.js';
+
+// 本文件别名：错误详情统一截尾（实现唯一在 lib/paths.js；此前这里另有一份同构实现）
+const tailLines = paths.tailLines;
 import * as store from './store.js';
 import * as exec from './exec.js';
 
@@ -48,7 +51,6 @@ const NODE_MIN_MAJOR = 20;
 
 // ------------------------------ 小工具 ------------------------------
 const firstLine = (res) => paths.lines(res && res.stdout)[0] || null;
-const tail = (text, n = 3) => String(text || '').trim().split('\n').slice(-n).join('\n');
 
 /** 「失败自动换通道」开关（与 brew 模块共用 ~/.mackit/config.json 的 autoFallback）。 */
 function autoFallbackEnabled() {
@@ -319,7 +321,7 @@ async function installGlobal(ctx, pkg, label, timeoutMs = INSTALL_TIMEOUT_MS) {
     ctx.log('info', '已关闭「自动降级」：只走代理通道');
     const res = await ctx.exec.run('npm', args, { ...common, channel: 'proxy' });
     ctx.setChannel('proxy');
-    if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, `${label}安装失败`, tail(res.stderr) || tail(res.stdout));
+    if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, `${label}安装失败`, tailLines(res.stderr) || tailLines(res.stdout));
     ctx.log('ok', `${label} 安装完成`);
     return;
   }
@@ -394,8 +396,7 @@ function npmInstallStep(pkg, label, timeoutMs = INSTALL_TIMEOUT_MS) {
   return {
     id: `install_${pkg.replace(/[^A-Za-z0-9]+/g, '_')}`,
     title: `安装 ${label}`,
-    channelPolicy: 'proxy_first',
-    timeoutMs,
+        timeoutMs,
     run: (ctx) => installGlobal(ctx, pkg, label, timeoutMs),
   };
 }
@@ -429,7 +430,7 @@ function verifyDshStep() {
           `已检查：${paths.DSH_BIN}${prefix ? ` 与 ${path.join(prefix, 'lib', 'node_modules', ...paths.DSH_PACKAGE.split('/'))}` : ''}`);
       }
       const res = await probe(inv.bin, [...inv.argv, '--version']);
-      if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, 'dsh --version 执行失败', tail(res.stderr));
+      if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, 'dsh --version 执行失败', tailLines(res.stderr));
       ctx.log('ok', `DeepSeek Harness 已就绪：${firstLine(res) || ''}（${inv.path}）`);
       if (!paths.readDshMarketState().installed) {
         ctx.log('info', `提示：插件市场（${paths.DSH_MARKET_PACKAGE}）尚未安装，可在本页单独安装`);
@@ -446,8 +447,7 @@ function verifyDshStep() {
 function marketStep() {
   return {
     id: 'market', title: `安装插件市场（${paths.DSH_MARKET_PACKAGE}）`,
-    channelPolicy: 'proxy_first',
-    timeoutMs: MARKET_TIMEOUT_MS,
+        timeoutMs: MARKET_TIMEOUT_MS,
     run: async (ctx) => {
       const prefix = await npmPrefix();
       const inv = dshInvocation(prefix);
@@ -488,7 +488,7 @@ function marketStep() {
         ctx.log('info', '已关闭「自动降级」：只走代理通道');
         const res = await ctx.exec.run(inv.bin, args, { ...common, channel: 'proxy' });
         ctx.setChannel('proxy');
-        if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, '插件市场安装失败', tail(res.stderr) || tail(res.stdout));
+        if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, '插件市场安装失败', tailLines(res.stderr) || tailLines(res.stdout));
       } else {
         const res = await ctx.exec.runWithChannel('proxy_first', '安装插件市场', inv.bin, args, {
           ...common,

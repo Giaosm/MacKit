@@ -546,9 +546,13 @@ export default {
       async function savePorts(httpI, socksI) {
         const cur = config.brewgo || {};
         const ok = ui.portOk;
-        const http = ok(httpI.value.trim()) ? Number(httpI.value) : cur.httpPort;
-        const socks = ok(socksI.value.trim()) ? Number(socksI.value) : cur.socksPort;
-        if (http === cur.httpPort && socks === cur.socksPort) ui.toast('warn', '端口未变化或输入非法，已保持原值');
+        const httpText = httpI.value.trim(), socksText = socksI.value.trim();
+        // 非法或未变化一律 return，不提交：原先只 toast「已保持原值」，却仍无条件写入并再弹「端口已保存」。
+        if (!ok(httpText) || !ok(socksText) || (Number(httpText) === cur.httpPort && Number(socksText) === cur.socksPort)) {
+          ui.toast('warn', '端口未变化或输入非法，已保持原值');
+          return;
+        }
+        const http = Number(httpText), socks = Number(socksText);
         await saveConfig({ proxy: { httpPort: http, socksPort: socks } }, `端口已保存：HTTP=${http} / SOCKS5=${socks}`);
         // 改端口后展示提示，不自动改 Git 代理
         hintBox.innerHTML = '';
@@ -560,7 +564,7 @@ export default {
           else if (!gp) hintBox.append(el('div', { class: 'warn-box section', text: `Git 全局代理未设置；如需使用请在系统初始化模块设为 ${want}。` }));
         } catch { /* 体检失败忽略 */ }
       }
-      onPanel('config', draw);
+      // 此处原先有 onPanel('config', draw)：全仓没有任何 emit('config')，该订阅永不触发（已删）。
       box.append(host); draw();
     }
 

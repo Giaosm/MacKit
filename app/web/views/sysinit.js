@@ -21,7 +21,7 @@ export default {
 
   mount(root, ctx) {
     const { el, ui, api } = ctx;
-    const st = { data: null, gitInputs: new Map(), userInput: null, tokenInput: null, computeChanges: () => [], portHint: '' };
+    const st = { data: null, gitInputs: new Map(), gitDraft: new Map(), userInput: null, tokenInput: null, computeChanges: () => [], portHint: '' };
     const head = el('div', { class: 'view-head' });
     const body = el('div');
     root.append(head, body);
@@ -104,7 +104,10 @@ export default {
       st.gitInputs.clear();
       for (const f of gitForm) {
         const cur = f.current == null ? '' : String(f.current);
-        const input = el('input', { type: 'text', value: cur, placeholder: f.placeholder || '', style: 'min-width:260px', on: { input: () => refreshGitHint() } });
+        // 优先回显用户草稿：done → load() → render() 会重建本卡，若只用服务端值，
+        // 「已填但未点应用」的用户名/邮箱会被静默清空（上轮只堵了 set_proxy_ports 一条路径）。
+        const draft = st.gitDraft.has(f.key) ? st.gitDraft.get(f.key) : cur;
+        const input = el('input', { type: 'text', value: draft, placeholder: f.placeholder || '', style: 'min-width:260px', on: { input: (e) => { st.gitDraft.set(f.key, e.target.value); refreshGitHint(); } } });
         st.gitInputs.set(f.key, { input, current: cur, key: f.key });
         rows.append(el('div', { class: 'field__row' }, [
           el('span', { class: 'mono', style: 'width:160px', text: f.key }),

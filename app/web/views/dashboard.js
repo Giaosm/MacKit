@@ -17,6 +17,9 @@ export default {
     const grid = el('div', { class: 'grid grid--2 section' });
     // 「上次体检」时间戳：每次成功刷新后更新，让用户能确认体检真的跑过一次
     const envCheckedAt = el('span', { class: 'view-head__meta' });
+    // 「重新体检」按钮：请求期间禁用并显示忙碌态（与 brew 视图的 envBusy 同思路），
+    // 避免连点造成并发响应乱序覆盖。
+    const envBtn = el('button', { class: 'btn btn--ghost', type: 'button', text: '⟳ 重新体检', on: { click: () => load(true) } });
     // MacKit 自身更新按钮（状态由 /api/selfupdate/status 驱动）
     const updBtn = el('button', { class: 'btn', type: 'button', text: '检查 MacKit 更新', on: { click: () => onUpdate() } });
 
@@ -24,7 +27,7 @@ export default {
       el('div', {}, [el('h1', { text: '总览' }), el('div', { class: 'muted', text: '环境体检' })]),
       el('div', { class: 'row' }, [
         envCheckedAt,
-        el('button', { class: 'btn btn--ghost', type: 'button', text: '⟳ 重新体检', on: { click: () => load(true) } }),
+        envBtn,
         updBtn,
       ]),
     ]);
@@ -81,6 +84,7 @@ export default {
     }
 
     function render(e) {
+      e = e || {};   // API 返回 undefined 时不能整卡抛错（会被 emit 的 try/catch 吞掉，页面永久停在「正在体检…」）
       grid.innerHTML = '';
       const b = e.brew || {}, n = e.network || {}, sh = e.shell || {}, rm = e.rime || {}, g = e.git || {}, m = e.mirror || {}, pp = e.proxyPorts || {};
       envCheckedAt.textContent = e.checkedAt ? `上次检查 ${ctx.fmtTime(e.checkedAt)}` : '';
@@ -146,7 +150,12 @@ export default {
       renderDsh();
     }
 
+    let envBusy = false;
     async function load(force) {
+      if (envBusy) return;   // 并发守卫：请求期间按钮已禁用，这里再兜一层
+      envBusy = true;
+      const idleText = envBtn.textContent;
+      envBtn.disabled = true; envBtn.textContent = '⏳ 体检中…';
       grid.innerHTML = '';
       grid.append(el('div', { class: 'view-loading', text: '正在体检…' }));
       envCheckedAt.textContent = '正在体检…';
@@ -158,6 +167,8 @@ export default {
         grid.innerHTML = '';
         grid.append(el('div', { class: 'err-box', text: `体检失败：${err.message || err}` }));
         envCheckedAt.textContent = '';
+      } finally {
+        envBusy = false; envBtn.disabled = false; envBtn.textContent = idleText;
       }
     }
 

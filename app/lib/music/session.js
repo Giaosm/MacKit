@@ -31,6 +31,24 @@ const CACHE_KEEP_FILES = 50;
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** 快照清理的最小间隔（毫秒）：sweepTtl 每次轮询都会跑，别每次都 readdir */
 const CACHE_PRUNE_INTERVAL_MS = 60_000;
+/**
+ * 单会话事件缓冲上限（条）。
+ *
+ * ★ 2026-09-21 修：`s.events` 此前**无上限** —— 57 源搜索 / 大歌单会持续 push，
+ *   而每个会话在内存里活到 TTL（10 分钟）为止；同时 `poll()` 每次都会 `s.events.slice(from)`
+ *   再序列化一遍。总量 = 会话数 × 事件数，属明确的内存放大面。
+ *   现在按环形窗口裁剪，并用 `eventsBase` 记录「被丢弃的前缀条数」，保证对外的
+ *   `nextSince` 仍然单调递增（增量协议不破）。
+ */
+const EVENTS_MAX = 4000;
+/**
+ * 同时运行的搜索 / 歌单会话上限。
+ *
+ * ★ 2026-09-21 修：`start()` 此前无任何并发闸 —— 每个会话都会起一个 Python 子进程
+ *   （musicdl 内部再按 57 源 × threads 开线程池）。前端若因误操作 / 脚本狂点触发多次搜索，
+ *   会瞬间把机器打满。4 个已足够覆盖「搜索 + 歌单 + 重试」的正常交互。
+ */
+const MAX_RUNNING_SESSIONS = 4;
 
 /** @type {Map<string, object>} */
 const sessions = new Map();
@@ -141,6 +159,13 @@ function pruneSearchCache() {
     ttlMs: CACHE_TTL_MS,
     maxEntries: CACHE_KEEP_FILES,
   });
+  // ★ 顺手回收 bridge 的原子写残留（`search-<id>.json.tmp`，bridge.py write_cache 先写 .tmp 再
+  //   os.replace）。进程被 SIGKILL 时会留下孤儿；它不被上面的 accept 匹配，永远不会过期，
+  //   实测残留 4 份。写盘中的 .tmp 寿命只有毫秒级，故 1 小时即可安全判定为孤儿（2026-09-21 修）。
+  pruneDirByLru(paths.MUSIC_SEARCH_CACHE_DIR, {
+    accept: (name) => name.startsWith('search-') && name.endsWith('.json.tmp'),
+    ttlMs: 60 * 60 * 1000,
+  });
 }
 
 function pushStderr(s, line) {
@@ -194,7 +219,6 @@ function append(s, ev) {
       row.protocol = ev.protocol === 'HLS' ? 'HLS' : 'HTTP';
       row.playable = !!ev.playable;
       s.rows.push(row);
-      s.rowByUid.set(row.uid, row);
       s.counts.songs += 1;
       break;
     }
@@ -215,6 +239,13 @@ function append(s, ev) {
       break; // progress / result 等对搜索无意义，仅转发
   }
   s.events.push(ev);
+  // 环形窗口裁剪（见 EVENTS_MAX 注释）：只丢最旧的前缀，eventsBase 记录丢了多少条，
+  // 使 poll() 对外的 nextSince 保持单调。
+  if (s.events.length > EVENTS_MAX) {
+    const drop = s.events.length - EVENTS_MAX;
+    s.events.splice(0, drop);
+    s.eventsBase += drop;
+  }
 }
 
 /**
@@ -236,6 +267,12 @@ function append(s, ev) {
  */
 export function start(opts) {
   sweepTtl();
+  // ★ 并发闸（见 MAX_RUNNING_SESSIONS 注释）：每个会话一个 Python 子进程 + musicdl 线程池。
+  const running = [...sessions.values()].filter((s) => s.status === 'running').length;
+  if (running >= MAX_RUNNING_SESSIONS) {
+    throw new exec.AppError(exec.ERR.CMD_FAILED,
+      `同时进行的搜索过多（上限 ${MAX_RUNNING_SESSIONS} 个），请等待当前搜索结束或先取消`);
+  }
   const command = opts.command === 'playlist' ? 'playlist' : 'search';
   const id = SEARCH_ID_RE.test(String(opts.id || '')) ? String(opts.id) : newSearchId();
   const keyword = String(opts.keyword || '').trim();
@@ -251,8 +288,8 @@ export function start(opts) {
     sources,
     sourcesTotal: sources.length,
     events: [],
+    eventsBase: 0, // 已被环形窗口丢弃的前缀条数（见 EVENTS_MAX），用于让 nextSince 保持单调
     rows: [],
-    rowByUid: new Map(),
     counts: { sourcesOk: 0, sourcesFail: 0, songs: 0 },
     currentSource: null,
     runningSources: new Set(), // ★ 并行搜索：仍在跑的音源集合（source_start 加、source 出结果删）
@@ -294,7 +331,12 @@ export function start(opts) {
       cache_path: cachePath,
     };
 
-  const finish = (err) => {
+  /**
+   * 收尾。`exitCode` 为子进程退出码（正常 resolve 时由 exec.run 给出）。
+   * ★ 2026-09-21 修：此前一律传 `null`，于是「进程退出码非 0 且没发 done」这类协议异常
+   *   在界面上只显示「未收到 done 事件」，没有退出码可查 —— 与 stderr 一起才是可诊断的。
+   */
+  const finish = (err, exitCode) => {
     session.updatedAt = Date.now();
     if (err) {
       if (session.cancelRequested) {
@@ -309,7 +351,7 @@ export function start(opts) {
       session.status = 'fail';
       session.error = {
         code: exec.ERR.PARSE_FAILED,
-        message: `${command === 'playlist' ? '歌单解析' : '搜索'}未正常结束（未收到 done 事件）`,
+        message: `${command === 'playlist' ? '歌单解析' : '搜索'}未正常结束（未收到 done 事件，退出码 ${exitCode == null ? '未知' : exitCode}）`,
         detail: session.stderr.slice(-5).join('\n') || undefined,
       };
     }
@@ -332,7 +374,8 @@ export function start(opts) {
         pushStderr(session, line);
       }
     },
-  }).then(() => finish(null)).catch((err) => finish(err));
+  }).then((res) => finish(null, res && typeof res.code === 'number' ? res.code : null))
+    .catch((err) => finish(err, null));
 
   return { id, command, keyword, url, sourcesTotal: sources.length };
 }
@@ -357,8 +400,14 @@ export function poll(id, since) {
   sweepTtl();
   const s = sessions.get(id);
   if (!s) throw new exec.AppError(exec.ERR.NOT_FOUND, '搜索会话不存在或已过期');
+  // TTL 续期是有意的：会话被持续轮询说明「用户正在看」，不能中途回收。
+  // （会话终态后前端不再轮询，10 分钟空闲即被 sweepTtl 收走。）
   s.updatedAt = Date.now();
-  const from = Number.isInteger(since) && since >= 0 ? Math.min(since, s.events.length) : 0;
+  // 事件窗口的绝对偏移换算（见 EVENTS_MAX）：`since` 是客户端持有的**绝对**序号，
+  // 而 s.events 只保留最新的 EVENTS_MAX 条，故先减 eventsBase 再夹取。
+  const total = s.eventsBase + s.events.length;
+  const abs = Number.isInteger(since) && since >= 0 ? Math.min(since, total) : 0;
+  const from = Math.max(0, Math.min(abs - s.eventsBase, s.events.length));
   return {
     status: s.status,
     events: s.events.slice(from),
@@ -367,8 +416,8 @@ export function poll(id, since) {
     currentSource: s.currentSource || null,
     currentSources: [...s.runningSources],
     error: s.error,
-    nextSince: s.events.length,
-    total: s.events.length,
+    nextSince: total,
+    total,
   };
 }
 

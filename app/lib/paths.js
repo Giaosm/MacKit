@@ -67,8 +67,12 @@ export const SHELL_RC = SHELL_KIND === 'bash' ? RC_BASH_PROFILE : RC_ZPROFILE;
  * 判定一段 rc 文本是否已写入 brew 环境变量。
  * env.js（环境体检：查 zprofile / bash_profile 两份）与 brew.js（幂等写入：只查将要写的那份）
  * 共用同一标记，避免两处正则各自漂移。
+ *
+ * ★ 2026-09-21 修：此前是裸 `/brew\s+shellenv/`，会命中**被注释掉**的行
+ *   （用户自己 `# eval "$(brew shellenv)"` 关掉过配置）→ env.js 误报「已配置」、
+ *   brew.js 误判幂等而跳过写入，配置永远修不回来。现在要求该行不是注释行（m 标志逐行判定）。
  */
-export const SHELLENV_RE = /brew\s+shellenv/;
+export const SHELLENV_RE = /^(?!\s*#).*brew\s+shellenv/m;
 
 // ---------------------------------------------------------------------------
 // Rime 输入法

@@ -27,6 +27,7 @@ stdout 隔离手法（设计 §3.1 / §10 项 2）：进程启动**最先把 sys
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
@@ -97,10 +98,6 @@ class ParseFailedError(BridgeError):
     code = "PARSE_FAILED"
 
 
-class NetUnreachable(BridgeError):
-    code = "NET_UNREACHABLE"
-
-
 class DownloadFailed(BridgeError):
     code = "DL_FAILED"
 
@@ -158,6 +155,9 @@ _ILLEGAL_FILENAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 _SUFFIX_RE = re.compile(r'^s_\d+_[0-9a-f]{6}$')
 # 半成品 / 临时文件后缀（设计 §10 项 6：musicdl 与 N_m3u8DL-RE 主要在临时目录里倒腾，
 # 这里做**兜底**清扫，防止异常中断后在下载目录留下残渣）。
+# ★ 仅用于 `pick_produced_file` 挑选产物时跳过中间文件 —— 它的作用范围是**本程序自己的**
+#   `<out_dir>/.mackit-tmp/<uid>/` 工作目录，跳过面宽一点无副作用。
+#   ★ 顶层清扫见 cleanup_partials —— 那里**不再**按后缀删任何东西（2026-09-21 修，原因见该函数）。
 _PARTIAL_SUFFIXES = (".part", ".tmp", ".download", ".mackitpart", ".crdownload")
 
 
@@ -300,10 +300,9 @@ def build_song_tree(info, source: str, index: int) -> tuple:
     """
     构建一个搜索条目对应的一组 song 事件与快照缓存项（含两级：专辑 → 子剧集）。
 
-    返回 (events, entries, span)：
+    返回 (events, entries)：
       · events ：待下发的 song 事件列表（专辑自身在前，子剧集随后）
       · entries：[(uid, cache_entry)]，与 events 的 uid 一一对应，供调用方**批量**并入快照
-      · span   ：该条目占用的 uid 序号跨度（专辑自身 + 子项）
 
     ★ 只构建、不 emit、不写盘 —— 交由调用方按「先写快照、后 emit」的时序统一处理，
       以保证「任何已下发给前端的 song，其 uid 必定已在磁盘快照中」，
@@ -321,7 +320,7 @@ def build_song_tree(info, source: str, index: int) -> tuple:
         child_uid = f"{source}#{index}-{child_index}"
         events.append(project_song(child, child_uid, uid, "track"))
         entries.append((child_uid, cache_entry(child, source)))
-    return events, entries, 1 + child_index
+    return events, entries
 
 
 def cache_entry(info, source: str) -> dict:
@@ -395,13 +394,84 @@ def read_cache(cache_path: str) -> dict:
 PER_SOURCE_SEARCH_TIMEOUT_S = 90
 
 
-def make_client(music_sources, per_source=5, threads=8, proxies=None, init_overrides=None):
+# ---------------------------------------------------------------------------
+# musicdl 的 work_dir（搜索 / 歌单解析的中间产物目录）
+# ---------------------------------------------------------------------------
+# musicdl 默认把 work_dir 设为**相对路径** 'musicdl_outputs'，并写下
+# `<work_dir>/<Client>/<时间戳> <搜索关键词>/search_results.pkl`；而本脚本由 Node 以 $HOME
+# 为 cwd 拉起 → 关键词（用户数据）明文落进家目录。故统一把 work_dir 指到 mackit 缓存内的
+# work 子目录，并在命令结束（或进程退出）时整体删除。
+MUSIC_CACHE_ROOT = os.path.join(os.path.expanduser("~/.mackit/cache/music"), "")
+WORK_ROOT = os.path.join(MUSIC_CACHE_ROOT, "work")
+DEFAULT_MUSIC_WORK_DIR = WORK_ROOT
+
+
+def work_dir_for(cache_path: str = "") -> str:
+    """本次搜索的 work 目录：跟随快照所在目录，并**带上快照文件名**（每个 search_id 一份）。
+
+    ★ 为什么末级要带 stem（2026-09-21 修）：此前固定用 `<快照目录>/work`，而 Node 侧的搜索
+      会话是**相互独立、可并发**的（多个 search_id 同时跑）。两个 bridge 子进程共用一个 work
+      目录时，先结束的那个会 rmtree 掉另一个正在写的目录 —— musicdl 写 pkl 报错，并发搜索被
+      无辜打断。带上 search_id 后每个会话一份，互不影响。
+    """
+    base = WORK_ROOT
+    stem = ""
+    if cache_path:
+        try:
+            parent = os.path.dirname(os.path.abspath(cache_path))
+            if parent:
+                base = os.path.join(parent, "work")
+            stem = os.path.splitext(os.path.basename(str(cache_path)))[0]
+        except Exception:
+            base = WORK_ROOT
+            stem = ""
+    # stem 只用于拼一层目录名，仍按「只允许安全字符」收口，避免路径穿越。
+    if stem and all(c.isalnum() or c in "._-" for c in stem):
+        return os.path.join(base, stem)
+    # 没有快照路径的场景（如 reselect_songinfo 的兜底重搜）也要**进程隔离**：
+    # 两个并发下载各自触发重搜时会共用同一个 work 目录，同样会互删（用 pid 兜住）。
+    return os.path.join(base, f"p{os.getpid()}")
+
+
+def cleanup_work_dir(work_dir: str) -> None:
+    """整体删除本次搜索的 work 目录。
+
+    ★ 安全闸（2026-09-21 收紧）：目标必须**严格位于 `~/.mackit/cache/music/` 之下**，
+      且相对该根的路径段里**必须出现 `work`**（兼容 `<快照目录>/work/<search_id>` 与
+      回落的 `<缓存根>/work`）。两道条件都比原来的「末级目录名等于 work」更严 ——
+      绝不因为路径参数异常而碰到用户音乐目录或其它缓存。
+    """
+    if not work_dir:
+        return
+    try:
+        target = os.path.abspath(work_dir)
+        root = os.path.abspath(MUSIC_CACHE_ROOT)
+        rel = os.path.relpath(target, root)
+    except Exception:
+        return
+    if rel.startswith(os.pardir) or os.path.isabs(rel):
+        return
+    if "work" not in rel.split(os.sep):
+        return
+    shutil.rmtree(target, ignore_errors=True)
+
+
+def make_client(music_sources, per_source=5, threads=8, proxies=None, init_overrides=None,
+                work_dir=None):
     m = load_musicdl()
+    # ★ work_dir 逐源注入：不传则回落到 mackit 缓存的 work 目录，绝不使用 musicdl 的相对默认值。
+    wd = str(work_dir or DEFAULT_MUSIC_WORK_DIR)
+    try:
+        os.makedirs(wd, exist_ok=True)
+    except OSError as err:
+        log_line(f"创建搜索 work 目录失败（沿用原值）：{wd}: {err}")
+    # 异常 / 提前退出路径的兜底清理（正常结束由调用方显式调用 cleanup_work_dir）。
+    atexit.register(cleanup_work_dir, wd)
     init_cfg = {}
     clients_threadings = {}
     overrides = build_requests_overrides(music_sources, proxies)
     for s in music_sources:
-        cfg = {"search_size_per_source": int(per_source), "disable_print": True}
+        cfg = {"search_size_per_source": int(per_source), "disable_print": True, "work_dir": wd}
         if init_overrides and s in init_overrides:
             cfg.update(init_overrides[s])
         init_cfg[s] = cfg
@@ -418,7 +488,7 @@ def cmd_version(_payload: dict) -> None:
     m = load_musicdl()
     emit({
         "ev": "done", "command": "version", "version": m["version"],
-        "count": 0, "ok": 0, "fail": 0, "skip": 0, "sources_ok": 0, "sources_fail": 0,
+        "count": 0, "ok": 0, "fail": 0, "sources_ok": 0, "sources_fail": 0,
     })
 
 
@@ -427,7 +497,7 @@ def cmd_sources(_payload: dict) -> None:
     keys = list(m["registered"])
     emit({
         "ev": "done", "command": "sources", "registered": keys,
-        "count": len(keys), "ok": 0, "fail": 0, "skip": 0, "sources_ok": 0, "sources_fail": 0,
+        "count": len(keys), "ok": 0, "fail": 0, "sources_ok": 0, "sources_fail": 0,
     })
 
 
@@ -498,6 +568,20 @@ def _ext_from_url(url: str):
         return None
     e = m.group(1).lower()
     return e if e in ("mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "ape", "alac", "mp4") else None
+
+
+_SAFE_EXT_RE = re.compile(r"^[A-Za-z0-9]{2,4}$")
+
+
+def _safe_ext(v) -> str:
+    """把任意来源的扩展名收敛为安全值：转字符串 → 去首部 '.' → lower → 只留 ^[A-Za-z0-9]{2,4}$，否则 'mp3'。
+
+    ★ 该值会被拼进**文件路径**（download_proxy_one 的临时文件名；快照里的 `ext` 还会被 Node 侧
+      拼成 `snd-<digest>.<ext>` 缓存文件名）。远端 / 上游数据（酷我 `types[].format`、
+      musicdl 的 `info.ext`）**绝不可直接采信** —— 否则 `../`、`/` 之类的取值会逃出目标目录。
+    """
+    s = str(v or "").strip().lstrip(".").lower()
+    return s if _SAFE_EXT_RE.match(s) else "mp3"
 
 
 def _http_get(url: str, timeout: int, as_json: bool = True):
@@ -591,7 +675,8 @@ def _parse_kuwo(j):
         fmt = "mp3"
         if types:
             best = max(types, key=lambda t: int(str(t.get("bitrate") or 0)))
-            fmt = (best.get("format") or "mp3").lower() or "mp3"
+            # ★ 远端 format 是**不可信输入**（会被拼进缓存 / 临时文件名）→ 一律过白名单。
+            fmt = _safe_ext(best.get("format"))
         out.append({
             "song_name": it.get("song") or "",
             "singers": it.get("singer") or "",
@@ -772,7 +857,8 @@ def cmd_search_proxy(payload: dict) -> None:
         batch_entries, batch_events = [], []
         for it, i, audio_url, lyric_inline in resolved:
             uid = f"{src}#{i}"
-            real_ext = _ext_from_url(audio_url) or it["ext"]
+            # ★ 唯一写入点：直链推导值优先，回落上游 `it["ext"]`（也可能来自酷我 format）→ 全过白名单。
+            real_ext = _safe_ext(_ext_from_url(audio_url) or it["ext"])
             batch_entries.append((uid, {
                 "uid": uid, "source": src, "kind": "proxy", "proxy_key": key,
                 "song_name": it["song_name"], "singers": it["singers"], "album": it["album"],
@@ -813,9 +899,11 @@ def cmd_search_proxy(payload: dict) -> None:
     write_cache(cache_path, cache)
     emit({
         "ev": "done", "command": "search", "search_id": search_id,
-        "count": total_songs, "ok": 0, "fail": 0, "skip": 0,
+        "count": total_songs, "ok": 0, "fail": 0,
         "sources_ok": sources_ok, "sources_fail": sources_fail,
     })
+    # ★ 本命令不建 musicdl 客户端、本不产生 work 目录；这里顺手清掉同快照目录下可能残留的 work。
+    cleanup_work_dir(work_dir_for(cache_path))
 
 
 def download_proxy_one(uid: str, out_dir: str, template: str, cache: dict, save_lyrics: bool = True,
@@ -837,7 +925,8 @@ def download_proxy_one(uid: str, out_dir: str, template: str, cache: dict, save_
     if not audio_url:
         raise DownloadFailed(f"[{rec.get('source')}] 无法解析播放地址（代理可能限流或歌曲已下架）")
 
-    ext = _ext_from_url(audio_url) or str(rec.get("ext") or "mp3").lstrip(".") or "mp3"
+    # ★ ext 会被拼进 tmp_file 路径 → 直链与快照 `ext` 都必须过白名单（快照值可能源自远端 format）。
+    ext = _safe_ext(_ext_from_url(audio_url) or rec.get("ext"))
     stem = sanitize_filename(rec.get("song_name") or "未命名")
     tmp_dir = os.path.join(out_dir, ".mackit-tmp", safe_dir_name(uid))
     shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -852,7 +941,7 @@ def download_proxy_one(uid: str, out_dir: str, template: str, cache: dict, save_
             if audio_url2 and audio_url2 != audio_url:
                 audio_url = audio_url2
                 lyric_inline = lyric2 or lyric_inline
-                ext = _ext_from_url(audio_url) or ext
+                ext = _safe_ext(_ext_from_url(audio_url) or ext)
                 _http_stream(audio_url, tmp_file, PROXY_DOWNLOAD_TIMEOUT_S)
             else:
                 raise
@@ -893,7 +982,7 @@ def download_proxy_one(uid: str, out_dir: str, template: str, cache: dict, save_
         return final, size, measured, bool(lyrics_path)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        cleanup_partials(out_dir)
+        cleanup_partials(out_dir, uid)
 
 
 def cmd_search(payload: dict) -> None:
@@ -921,13 +1010,16 @@ def cmd_search(payload: dict) -> None:
     threads = int(payload.get("threads") or 8)
     proxies = normalize_proxies(payload.get("proxies"))
     cache_path = payload.get("cache_path") or ""
+    # ★ musicdl 中间产物（含搜索关键词明文）落在快照目录下的 work 子目录，命令结束即整体删除。
+    work_dir = work_dir_for(cache_path)
 
     emit({
         "ev": "start", "command": "search", "keyword": keyword,
         "sources_total": len(valid), "started_at": now_ts(),
     })
 
-    client = make_client(valid, per_source=per_source, threads=threads, proxies=proxies)
+    client = make_client(valid, per_source=per_source, threads=threads, proxies=proxies,
+                         work_dir=work_dir)
     search_id = str(payload.get("search_id") or "")
     cache = {"search_id": search_id, "keyword": keyword, "sources": valid, "songs": {}}
 
@@ -990,7 +1082,7 @@ def cmd_search(payload: dict) -> None:
         seq = 0
         for info in infos:
             seq += 1
-            events, entries, _span = build_song_tree(info, src, seq)
+            events, entries = build_song_tree(info, src, seq)
             batch_events.extend(events)
             batch_entries.extend(entries)
         write_cache_locked(cache_path, cache, batch_entries)
@@ -1016,9 +1108,11 @@ def cmd_search(payload: dict) -> None:
     write_cache(cache_path, cache)
     emit({
         "ev": "done", "command": "search", "search_id": search_id,
-        "count": total_songs, "ok": 0, "fail": 0, "skip": 0,
+        "count": total_songs, "ok": 0, "fail": 0,
         "sources_ok": sources_ok, "sources_fail": sources_fail,
     })
+    # ★ 正常结束即删本次 work 目录（关键词明文不留存）；异常 / 提前退出由 atexit 兜底。
+    cleanup_work_dir(work_dir)
 
 
 def render_template(template: str, info, ext: str) -> str:
@@ -1071,22 +1165,29 @@ def pick_produced_file(tmp_dir: str, ext: str) -> str | None:
     return best
 
 
-def cleanup_partials(directory: str) -> None:
-    """兜底清扫下载目录顶层的半成品文件（设计 §10 项 6）。"""
+def cleanup_partials(directory: str, uid: str = "") -> None:
+    """清理**本进程自己**的下载残留（设计 §10 项 6）。
+
+    ★ 2026-09-21 重写，修一个并发缺陷：本函数原先在收尾时无条件
+      `shutil.rmtree(<out_dir>/.mackit-tmp)` —— 而 Node 侧 `musicDownloadConcurrency>1` 时
+      会**并发**跑多个 bridge 子进程、共用同一个 out_dir（各写 `.mackit-tmp/<uid>/`）。
+      先结束的进程会把兄弟进程正在写的目录整棵删掉 → 对方下载失败。
+      现在只删自己的 `<uid>` 子目录；`.mackit-tmp` 父目录仅在**空**时才回收，
+      于是最后一个结束的进程负责收尾，中途谁都不会碰到别人的目录。
+
+    ★ 同时不再按通用后缀清扫**用户下载目录顶层**：那条路径可能误删浏览器正在下载的
+      `.crdownload` / 别的软件的 `.tmp`（不可恢复）。原先只允许删本程序专属的
+      `.mackitpart`，但全项目根本没有产生该后缀的代码 —— 扫描是纯粹的空转 + 误删风险，故移除。
+    """
+    if not directory:
+        return
+    tmp_root = os.path.join(directory, ".mackit-tmp")
+    if uid:
+        shutil.rmtree(os.path.join(tmp_root, safe_dir_name(uid)), ignore_errors=True)
+    # 父目录只在空时回收（非空 = 还有兄弟进程在工作，绝不能动）
     try:
-        for name in os.listdir(directory):
-            low = name.lower()
-            if any(low.endswith(suf) for suf in _PARTIAL_SUFFIXES):
-                try:
-                    os.remove(os.path.join(directory, name))
-                except OSError:
-                    pass
-    except OSError:
-        pass
-    leftover = os.path.join(directory, ".mackit-tmp")
-    try:
-        if os.path.isdir(leftover) and not os.listdir(leftover):
-            os.rmdir(leftover)
+        if os.path.isdir(tmp_root) and not os.listdir(tmp_root):
+            os.rmdir(tmp_root)
     except OSError:
         pass
 
@@ -1114,7 +1215,9 @@ def reselect_songinfo(source: str, name: str, singers: str, threads: int, proxie
     keyword = " ".join([p for p in [str(name or "").strip(), str(singers or "").strip()] if p])
     if not keyword:
         return None
-    client = make_client([source], threads=threads, proxies=proxies)
+    # ★ 重搜同样会产生 musicdl 中间产物（含关键词明文）→ 指到 mackit 缓存 work 目录，退出时清理。
+    client = make_client([source], threads=threads, proxies=proxies,
+                         work_dir=work_dir_for(""))
     try:
         results = list(client.music_clients[source].search(
             keyword=keyword, num_threadings=threads,
@@ -1537,7 +1640,7 @@ def download_one(uid: str, out_dir: str, template: str, threads: int, proxies, c
         # ★ D1：清理显式内嵌可能留下的同名 `.bak` 残留（临时目录随即整体删除，这里是兜底）。
         _remove_backup_files(produced, final)
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        cleanup_partials(out_dir)
+        cleanup_partials(out_dir, uid)
 
 
 def cmd_download(payload: dict) -> None:
@@ -1560,7 +1663,7 @@ def cmd_download(payload: dict) -> None:
         "sources_total": 0, "started_at": now_ts(), "count": len(uids),
     })
 
-    ok = fail = skip = 0
+    ok = fail = 0
     songs_cache = cache.get("songs") or {}
     for uid in uids:
         try:
@@ -1594,7 +1697,7 @@ def cmd_download(payload: dict) -> None:
 
     emit({
         "ev": "done", "command": "download",
-        "count": len(uids), "ok": ok, "fail": fail, "skip": skip,
+        "count": len(uids), "ok": ok, "fail": fail,
         "sources_ok": 0, "sources_fail": 0,
     })
 
@@ -1609,13 +1712,13 @@ def cmd_playlist(payload: dict) -> None:
         sources = list(m["registered"])  # 未指定则遍历全部源尝试解析
     proxies = normalize_proxies(payload.get("proxies"))
     cache_path = payload.get("cache_path") or ""
+    # ★ 歌单解析同样经 musicdl 写中间产物 → 指到缓存 work 目录，命令结束整体删除。
+    work_dir = work_dir_for(cache_path)
 
     emit({"ev": "start", "command": "playlist", "sources_total": len(sources), "started_at": now_ts()})
-    client = make_client(sources, proxies=proxies)
+    client = make_client(sources, proxies=proxies, work_dir=work_dir)
     try:
         infos = list(client.parseplaylist(url) or [])
-    except NetUnreachable:
-        raise
     except Exception as err:
         raise ParseFailedError("歌单解析失败", f"{err.__class__.__name__}: {err}")
 
@@ -1627,7 +1730,7 @@ def cmd_playlist(payload: dict) -> None:
     for info in infos:
         idx += 1
         src = getattr(info, "source", None) or (sources[0] if sources else "unknown")
-        events, entries, _span = build_song_tree(info, src, idx)
+        events, entries = build_song_tree(info, src, idx)
         events_all.extend(events)
         entries_all.extend(entries)
     write_cache_locked(cache_path, cache, entries_all)
@@ -1635,8 +1738,10 @@ def cmd_playlist(payload: dict) -> None:
         emit(song_event)
     emit({
         "ev": "done", "command": "playlist", "search_id": str(payload.get("search_id") or ""),
-        "count": len(infos), "ok": 0, "fail": 0, "skip": 0, "sources_ok": 1, "sources_fail": 0,
+        "count": len(infos), "ok": 0, "fail": 0, "sources_ok": 1, "sources_fail": 0,
     })
+    # ★ 正常结束即删本次 work 目录（关键词明文不留存）；异常 / 提前退出由 atexit 兜底。
+    cleanup_work_dir(work_dir)
 
 
 # ---------------------------------------------------------------------------

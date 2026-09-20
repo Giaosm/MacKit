@@ -245,9 +245,15 @@ async function runTask(rec) {
     return;
   }
 
-  task.steps = plans.map((p) => ({
-    id: p.id, title: p.title, status: 'pending',
-    channelPolicy: p.channelPolicy ?? null, channel: null,
+  // 归一化：steps() 是模块自由代码，可能返回 null / 非对象 / 缺字段的条目。
+  // 直接在 map 里读 p.id 一旦抛错，runTask 会 reject → pump 的 catch 吞掉异常、
+  // 而 L.running 永远停在 true ⇒ 该 lane 从此彻底卡死（只能重启进程）。这里兜住。
+  plans = plans.filter((p) => p && typeof p === 'object');
+  task.steps = plans.map((p, i) => ({
+    id: typeof p.id === 'string' && p.id ? p.id : `step_${i}`,
+    title: typeof p.title === 'string' && p.title ? p.title : `步骤 ${i + 1}`,
+    status: 'pending',
+    channel: null,
     startedAt: null, endedAt: null, exitCode: null, error: null,
   }));
   task.progress.total = task.steps.length;
@@ -275,11 +281,24 @@ async function runTask(rec) {
     let stepTimedOut = false;
     const onTaskAbort = () => { try { stepCtrl.abort(); } catch { /* ignore */ } };
     signal.addEventListener('abort', onTaskAbort, { once: true });
-    const timer = setTimeout(() => { stepTimedOut = true; try { stepCtrl.abort(); } catch { /* ignore */ } }, stepTimeout);
+    // ★ 硬超时：timer 只 abort 信号是不够的 —— 若 plan.run 内部没有把 signal 透给
+    //   exec.run（或它在非子进程的 await 上挂住），单步会无限期占住 lane。
+    //   这里额外用 Promise.race 让步骤一定在 stepTimeout 内落定为 fail。
+    //   race 输掉的那条 promise 必须自带 catch，否则会变成 unhandledRejection。
+    let timer = null;
+    let hardTimeoutReject = null;
+    const hardTimeout = new Promise((_, reject) => { hardTimeoutReject = reject; });
+    timer = setTimeout(() => {
+      stepTimedOut = true;
+      try { stepCtrl.abort(); } catch { /* ignore */ }
+      if (hardTimeoutReject) hardTimeoutReject(new exec.AppError(exec.ERR.TIMEOUT, `步骤超时（>${Math.round(stepTimeout / 1000)}s）`));
+    }, stepTimeout);
     if (timer.unref) timer.unref();
 
     try {
-      await plan.run(makeStepCtx(rec, step, stepCtrl.signal));
+      const stepRun = Promise.resolve().then(() => plan.run(makeStepCtx(rec, step, stepCtrl.signal)));
+      stepRun.catch(() => { /* race 已定局时的迟到异常，忽略（真正处理在下方 race 结果） */ });
+      await Promise.race([stepRun, hardTimeout]);
       if (signal.aborted) { cancelled = true; step.status = 'cancelled'; step.error = { code: exec.ERR.CANCELLED, message: '任务已取消' }; }
       else { step.status = 'ok'; }
     } catch (err) {

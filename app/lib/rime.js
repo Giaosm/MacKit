@@ -436,7 +436,7 @@ function installBaseSteps(installed) {
     { id: 'plum', title: '准备 plum', run: async (ctx) => { await ensurePlum(ctx); } },
     {
       id: 'vocab', title: installed ? '更新雾凇拼音词库' : '安装雾凇拼音主方案（默认配置）',
-      channelPolicy: 'proxy_first', timeoutMs: NET_TIMEOUT,
+      timeoutMs: NET_TIMEOUT,
       run: async (ctx) => {
         // 官方推荐（iDvel/rime-ice README）：安装与更新是同一条命令
         // `rime-install iDvel/rime-ice`；默认即全拼雾凇拼音，无需任何额外参数。
@@ -575,26 +575,37 @@ function removeGrammarPatch(ctx, schema) {
 /** 安装 / 更新万象模型步骤：直接从 RIME-LMDG 官方 release 下载（与 plum 配方的 download_files 同源同 URL），不碰任何方案配置。 */
 function grammarDownloadStep() {
   return {
-    id: 'download', title: `下载万象模型（${GRAMMAR_MODEL_NAME}，约 400MB）`, channelPolicy: 'proxy_first', timeoutMs: NET_TIMEOUT,
+    id: 'download', title: `下载万象模型（${GRAMMAR_MODEL_NAME}，约 400MB）`, timeoutMs: NET_TIMEOUT,
     run: async (ctx) => {
       const target = grammarModelPath();
       const tmp = target + '.download';
-      ctx.log('info', `开始下载：${GRAMMAR_MODEL_URL}`);
-      const res = await runNet(ctx, '下载万象模型', 'curl',
-        ['-fsSL', '--retry', '2', '--max-time', '1700', '-o', tmp, GRAMMAR_MODEL_URL],
-        { timeoutMs: NET_TIMEOUT });
-      if (res.code !== 0) {
-        try { fs.unlinkSync(tmp); } catch { /* 忽略 */ }
-        throw new AppError(ERR.NET_UNREACHABLE, `模型下载失败（curl 退出码 ${res.code}），可稍后重试`);
-      }
-      // 常驻进程 rename 可能被 macOS 拒（EPERM，见 store.js writeJsonSafe 同款注释）→ 降级复制
+      // ★ 2026-09-21 修复：清理 tmp 必须覆盖「抛异常」路径。以前只在 curl 返回非零码时
+      //   删 .download；而用户取消 / 超时 / 代理失败都会让 runNet **抛 AppError**，
+      //   流程直接跳走，那个约 400MB 的半成品文件就永久留在磁盘上没人回收。
+      //   这里用 moved 标记 + finally：任何失败（抛异常或非零码）都清掉 tmp，
+      //   只有成功 rename 到 target 后才保留（EPERM → copyFileSync + unlink 同属成功）。
+      let moved = false;
       try {
-        fs.renameSync(tmp, target);
-      } catch (err) {
-        if (err && err.code === 'EPERM') { fs.copyFileSync(tmp, target); fs.unlinkSync(tmp); }
-        else { throw err; }
+        ctx.log('info', `开始下载：${GRAMMAR_MODEL_URL}`);
+        const res = await runNet(ctx, '下载万象模型', 'curl',
+          ['-fsSL', '--retry', '2', '--max-time', '1700', '-o', tmp, GRAMMAR_MODEL_URL],
+          { timeoutMs: NET_TIMEOUT });
+        if (res.code !== 0) {
+          throw new AppError(ERR.NET_UNREACHABLE, `模型下载失败（curl 退出码 ${res.code}），可稍后重试`);
+        }
+        // 常驻进程 rename 可能被 macOS 拒（EPERM，见 store.js writeJsonSafe 同款注释）→ 降级复制
+        try {
+          fs.renameSync(tmp, target);
+        } catch (err) {
+          if (err && err.code === 'EPERM') { fs.copyFileSync(tmp, target); fs.unlinkSync(tmp); }
+          else { throw err; }
+        }
+        moved = true;
+        ctx.log('ok', `模型已就位：${target}`);
+      } finally {
+        // 失败路径（含 runNet 抛出的取消 / 超时 / 代理错误，以及非 EPERM 的 rename 失败）统一回收半成品
+        if (!moved) { try { fs.unlinkSync(tmp); } catch { /* 文件可能本就没生成，忽略 */ } }
       }
-      ctx.log('ok', `模型已就位：${target}`);
     },
   };
 }

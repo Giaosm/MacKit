@@ -266,7 +266,8 @@ function card(title, content, { light = null, extra = null } = {}) {
 /**
  * 通用表格（搜索 + 多选 + 全选 + 空态）。
  * columns: [{key, label, render?(row)}]；rowKey?(row,i)；selectable；searchable；emptyText。
- * 返回 { el, setRows(rows), getSelected(), getSelectedRows() }。
+ * 返回 { el, getSelectedRows() }。setRows 只供内部初始化使用，不对外暴露
+ * （对外暴露的 getSelected / setRows 全仓无调用方，已移除）。
  */
 function dataTable(cfg) {
   const { columns = [], rows = [], rowKey = (r, i) => String(i), selectable = false, searchable = false, searchPlaceholder = '搜索…', emptyText = '无数据' } = cfg;
@@ -285,7 +286,6 @@ function dataTable(cfg) {
     el('span', { class: 'grow' }), countEl,
   ]);
   const visible = () => (filter.q ? items.filter((it) => columns.map((c) => it.row[c.key]).join(' ').toLowerCase().includes(filter.q)) : items);
-  const getSelected = () => Array.from(selected);
   const getSelectedRows = () => items.filter((it) => selected.has(it.key)).map((it) => it.row);
   function syncHead() { if (!headCb) return; const v = visible(); headCb.checked = v.length > 0 && v.every((it) => selected.has(it.key)); headCb.disabled = v.length === 0; }
   function render() {
@@ -307,7 +307,7 @@ function dataTable(cfg) {
   function setRows(r) { items = (r || []).map((row, i) => ({ row, key: String(rowKey(row, i)) })); selected.clear(); render(); }
   if (headCb) headCb.addEventListener('change', (e) => { for (const it of visible()) { if (e.target.checked) selected.add(it.key); else selected.delete(it.key); } render(); });
   setRows(rows);
-  return { el: el('div', {}, [toolbar, el('div', { class: 'table__scroll' }, [table])]), setRows, getSelected, getSelectedRows };
+  return { el: el('div', {}, [toolbar, el('div', { class: 'table__scroll' }, [table])]), getSelectedRows };
 }
 
 // ============================== 日志抽屉 ==============================
@@ -569,7 +569,9 @@ function buildNav() {
 }
 function hashView() {
   const raw = (location.hash || '').replace(/^#\/?/, '').split('/')[0];
-  return VIEW_MODULES[raw] ? raw : 'dashboard';
+  // 必须走 hasOwnProperty：直接 VIEW_MODULES[raw] 会让 #/constructor、#/toString、
+  // #/__proto__ 命中 Object.prototype 上的成员而被当成合法视图 id。
+  return Object.prototype.hasOwnProperty.call(VIEW_MODULES, raw) ? raw : 'dashboard';
 }
 let routeToken = 0;
 async function route() {
@@ -603,7 +605,9 @@ async function route() {
   const subs = [];
   const viewCtx = makeCtx(subs);
   const teardown = () => {
-    for (const u of subs) { try { u(); } catch { /* ignore */ } }
+    // 必须先快照再遍历：makeCtx 的解绑器会把自己从 subs 移出，直接 for...of 边遍历边删
+    // 会跳过一半条目，导致订阅泄漏。
+    for (const u of subs.slice()) { try { u(); } catch { /* ignore */ } }
     if (typeof view.unmount === 'function') { try { view.unmount(); } catch (e) { console.error(e); } }
   };
   try { await view.mount(root, viewCtx); }
@@ -618,7 +622,13 @@ function makeCtx(subs) {
   return {
     api, el, state, navigate: (h) => { location.hash = h; },
     runTask,
-    on: (ev, fn) => { const u = on(ev, fn); subs.push(u); return u; },
+    // 解绑器被主动调用时同步从视图级 subs 移出：视图/面板自己解绑（如 brew 的
+    // releasePanelSubs）后条目若仍留在 subs，会无界增长且闭包一直持有已卸载的 DOM。
+    on: (ev, fn) => {
+      const off = on(ev, fn);
+      const u = () => { try { off(); } finally { const i = subs.indexOf(u); if (i >= 0) subs.splice(i, 1); } };
+      subs.push(u); return u;
+    },
     refreshEnv: refreshEnv,
     fmtTime, fmtDateTime, fmtRel, fmtSize,
     ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, kv, card, copy: copyText, portOk },

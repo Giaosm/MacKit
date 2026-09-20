@@ -82,7 +82,9 @@ async function collectData() {
   }
   return {
     mackit: { defaultChannel: mackit.defaultChannel, autoFallback: mackit.autoFallback, autoCleanup: mackit.autoCleanup },
-    brewgo: { httpPort: brewgo.httpPort, socksPort: brewgo.socksPort, mirror: brewgo.mirror },
+    // mirrorRaw 一并备份：自定义镜像（枚举外的自建源 / URL）只存在原始行里，
+    // 只带枚举 mirror 的话「备份 → 恢复」会把它悄悄改写成 official。
+    brewgo: { httpPort: brewgo.httpPort, socksPort: brewgo.socksPort, mirror: brewgo.mirror, mirrorRaw: brewgo.mirrorRaw },
     git: gitCfg,
     github: await git.readCredential(),
     rime: { files: collectRimeFiles(), grammarModels: collectGrammarModels() },

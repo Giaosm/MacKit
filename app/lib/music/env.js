@@ -246,21 +246,38 @@ export function repairVenvHome(venvDir, realPy, log = () => {}) {
  * @param {{venvPy:string, venvPip:string, run:Function}} o
  * @returns {Promise<{usable:boolean, reason:string}>}
  */
+/**
+ * 探测失败时的判定：**取消 / 超时 / 授权被拒不算「venv 坏了」**。
+ * 调用方 ensureVenv 在 unusable 时会 `rmSync(venvDir, {recursive:true})` 删掉整个虚拟环境
+ * （实测 498MB）；用户按一次「取消」、或在慢磁盘上超时，就把健康环境删掉重建，代价完全
+ * 不成比例。这类错误必须原样上抛，让任务以 CANCELLED / TIMEOUT 收场。
+ * @param {unknown} err
+ * @param {string} reason 非「探测类」失败时的 unusable 原因
+ * @returns {{usable:false, reason:string}}
+ */
+function probeFailure(err, reason) {
+  const obj = exec.toErrObj(err);
+  if (obj.code === exec.ERR.CANCELLED || obj.code === exec.ERR.TIMEOUT || obj.code === exec.ERR.AUTH_CANCELLED) throw err;
+  // reason 的取值是**对外契约**（单测 music-venv-selfheal 精确断言 'pip 无法运行'），
+  // 因此底层错误只并进 detail 供日志排查，不改写 reason 本身。
+  return { usable: false, reason, detail: obj.message || '' };
+}
+
 export async function venvUsable({ venvPy, venvPip, run }) {
   if (!paths.exists(venvPip)) return { usable: false, reason: 'pip 文件缺失' };
   try {
     const r = await run(venvPy, ['-c', 'import sys'], { noMirror: true, timeoutMs: VENV_PROBE_TIMEOUT_MS });
     if (!r || r.code !== 0) return { usable: false, reason: 'venv 内 python 无法启动' };
-  } catch {
-    return { usable: false, reason: 'venv 内 python 无法启动' };
+  } catch (err) {
+    return probeFailure(err, 'venv 内 python 无法启动');
   }
   try {
     // ★ 探测的就是安装步骤要执行的那个可执行文件本身（bin/pip console script），
     //   而非 `venvPy -m pip`——后者绕过脚本形态，会漏判 shebang / 可执行位失败。
     const p = await run(venvPip, ['--version'], { noMirror: true, timeoutMs: VENV_PROBE_TIMEOUT_MS });
     if (!p || p.code !== 0) return { usable: false, reason: 'pip 无法运行' };
-  } catch {
-    return { usable: false, reason: 'pip 无法运行' };
+  } catch (err) {
+    return probeFailure(err, 'pip 无法运行');
   }
   return { usable: true, reason: '' };
 }

@@ -29,12 +29,20 @@
 // ============================== 定时器 / 实时流 ==============================
 /** 视图内所有 interval 的登记处，unmount 时统一回收。 */
 const timers = new Set();
+/**
+ * 视图是否已卸载（mount 复位 false / unmount 置 true）。
+ * ★ 卸载后在途的异步续跑（await 之后）不得再注册 interval / EventSource 或触碰 DOM：
+ *   新实例的 clearTimers 无从回收这些句柄，否则就是永久泄漏。
+ */
+let disposed = false;
 /** 打开中的 EventSource（实时日志流）登记处；unmount / 切换任务时必须全部关闭，避免连接泄漏。 */
 const sseSources = new Set();
 /**
  * 每个任务的「实时态」：已收到的日志行 + 当前日志容器 + SSE 句柄 + 是否已收尾。
  * 视图每 1.5s 重绘队列，日志区内容从这里回填，保证滚动内容不丢、不重建连接。
- * @type {Map<string, {lines:object[], logEl:HTMLElement|null, stream:object|null, done:boolean, startedAt:number, pinned:boolean}>}
+ * `renderedLines` = 已渲染进 logEl 的日志行数（增量 append 的游标）；
+ * `hasPlaceholder` = 当前容器里是否只挂着「等待日志…」占位行。
+ * @type {Map<string, {lines:object[], logEl:HTMLElement|null, stream:object|null, done:boolean, startedAt:number, pinned:boolean, renderedLines:number, hasPlaceholder:boolean}>}
  */
 const live = new Map();
 
@@ -44,6 +52,8 @@ const SSE_MAX_RETRY = 5;
 const TASK_FALLBACK_MS = 2000;
 /** 单个任务实时日志最多保留的行数（避免超长下载日志拖垮渲染）。 */
 const LIVE_LOG_MAX = 500;
+/** 搜索轮询遇到网络类失败时的连续容忍次数（业务错误仍立即判失败）。 */
+const POLL_NET_RETRY_MAX = 3;
 /** 分页：结果区每页 10 首；下载队列每页 5 条（列表本身最新在前）。 */
 const RESULTS_PER_PAGE = 10;
 const QUEUE_PER_PAGE = 5;
@@ -52,13 +62,13 @@ const QUEUE_PER_PAGE = 5;
 function liveFor(id) {
   let e = live.get(id);
   if (!e) {
-    e = { lines: [], logEl: null, stream: null, done: false, startedAt: 0, pinned: true };
+    e = { lines: [], logEl: null, stream: null, done: false, startedAt: 0, pinned: true, renderedLines: 0, hasPlaceholder: false };
     live.set(id, e);
   }
   return e;
 }
 
-function addTimer(fn, ms) { const h = setInterval(fn, ms); timers.add(h); return h; }
+function addTimer(fn, ms) { if (disposed) return null; const h = setInterval(fn, ms); timers.add(h); return h; }
 
 /** 关闭单个 EventSource 并注销。 */
 function closeSource(es) {
@@ -81,7 +91,7 @@ function closeSource(es) {
  */
 const player = {
   audio: null, uid: null, row: null, list: [], index: -1,
-  volume: 1, dragging: false, duration: 0, currentTime: 0, playing: false,
+  volume: 1, dragging: false,
   ui: null, ctx: null, sessId: null, viewSessId: null, rows: [],
   lyric: { open: true, uid: null, lines: [], active: -1, synced: false, loading: false, error: null, cache: new Map() },
 };
@@ -121,19 +131,14 @@ function ensureAudio() {
   if (!el) return null; // 尚未 mount（正常流程不会：首次播放一定发生在视图内）
   const a = el('audio', { preload: 'metadata' });
   a.volume = player.volume;
-  a.addEventListener('play', () => { player.playing = true; syncPlayButton(); });
-  a.addEventListener('pause', () => { player.playing = false; syncPlayButton(); });
+  a.addEventListener('play', () => syncPlayButton());
+  a.addEventListener('pause', () => syncPlayButton());
   a.addEventListener('ended', () => playAdjacent(1)); // 放完自动下一首（视图未挂载也照走）
   a.addEventListener('timeupdate', () => {
-    player.currentTime = a.currentTime;
-    player.duration = Number.isFinite(a.duration) ? a.duration : 0;
     syncProgress();
     syncLyric(); // ★ 即使视图未挂载也推进歌词索引 → 切回时正停在当前句
   });
-  a.addEventListener('loadedmetadata', () => {
-    player.duration = Number.isFinite(a.duration) ? a.duration : 0;
-    syncProgress();
-  });
+  a.addEventListener('loadedmetadata', () => { syncProgress(); });
   a.addEventListener('error', () => {
     if (player.uid) playerToast('err', '播放失败：该音源可能已失效或被限流');
     syncPlayButton();
@@ -206,7 +211,6 @@ function syncProgress() {
   const a = player.audio;
   if (!a) return;
   const dur = Number.isFinite(a.duration) ? a.duration : 0;
-  player.currentTime = a.currentTime; player.duration = dur;
   const ui = player.ui;
   if (!ui) return; // 后台播放：不碰 DOM
   if (ui.seekEl && !player.dragging) {
@@ -255,10 +259,10 @@ function renderLyricLine() {
   box.classList.toggle('is-muted', muted);
 }
 
-/** 显示 / 隐藏内联单行歌词（不再有展开面板）。 */
-function toggleLyric(force) {
+/** 显示 / 隐藏内联单行歌词（不再有展开面板；唯一调用点即无参切换）。 */
+function toggleLyric() {
   const lyric = player.lyric;
-  lyric.open = (force === undefined) ? !lyric.open : !!force;
+  lyric.open = !lyric.open;
   const ui = player.ui;
   if (ui && ui.lyricBtn) ui.lyricBtn.classList.toggle('is-active', lyric.open);
   renderLyricLine();
@@ -337,13 +341,31 @@ const INSTALL_COMMANDS = [
 ];
 
 // ============================== 无状态小工具 ==============================
-/** 秒 → m:ss（非法值回落 —）。 */
-function fmtDur(sec) {
+/**
+ * 秒 → `m:ss`（结果表时长列与播放条计时共用的**唯一**实现）。
+ * @param {number} sec
+ * @param {boolean} [dashForBad] true → 非法 / 非正值回落 `—`（结果表）；默认回落 `0:00`（播放条计时）。
+ */
+function fmtClock(sec, dashForBad) {
   const s = Number(sec);
-  if (!Number.isFinite(s) || s <= 0) return '—';
+  if (!Number.isFinite(s) || s < 0 || (dashForBad === true && s === 0)) return dashForBad === true ? '—' : '0:00';
   const m = Math.floor(s / 60);
   const r = Math.floor(s % 60);
   return `${m}:${String(r).padStart(2, '0')}`;
+}
+
+/** 日志等级 → 着色类（队列实时日志与「查看日志」弹窗共用；两处映射不再各自漂移）。 */
+function logLevelClass(level) {
+  if (level === 'error') return 'diff__del';
+  if (level === 'ok') return 'diff__add';
+  if (level === 'warn') return 'diff__warn';
+  return 'diff__same';
+}
+
+/** 是否网络类失败（搜索轮询可重试）：api() 把 fetch 抛错统一包成 NET_UNREACHABLE；无 code 的裸异常同按抖动处理。 */
+function isNetErr(err) {
+  const code = err && err.code;
+  return code === 'NET_UNREACHABLE' || !code;
 }
 
 /** 秒 → `1m20s` / `45s`（安装「已用时」展示用；非法值按 0）。 */
@@ -413,15 +435,6 @@ function applyTemplate(tmpl, row) {
     .split('{ext}').join(r.ext || 'mp3');
 }
 
-/** 秒 → m:ss（播放条时间；非法 / 负值 → 0:00）。 */
-function fmtClock(sec) {
-  const s = Number(sec);
-  if (!Number.isFinite(s) || s < 0) return '0:00';
-  const m = Math.floor(s / 60);
-  const r = Math.floor(s % 60);
-  return `${m}:${String(r).padStart(2, '0')}`;
-}
-
 /**
  * 解析 LRC 歌词文本 → `[{ t, text }]`（按时间升序）。
  *
@@ -459,6 +472,7 @@ export default {
   title: '音乐下载',
 
   async mount(root, ctx) {
+    disposed = false; // ★ 新挂载复位卸载标记（unmount 置 true；addTimer / 异步续跑据此短路）
     clearTimers();
     player.ctx = ctx; // 记住本次上下文（el / api / ui.toast）——后台播放时仍可用
     const app = createApp(root, ctx);
@@ -467,6 +481,7 @@ export default {
 
   // ★ 切走时**不停播**：只回收本视图的 interval/SSE、解绑播放条 UI 引用，并快照会话状态。
   unmount() {
+    disposed = true; // ★ 先落标记再清句柄：在途 await 续跑回来后一律短路
     clearTimers();
     detachPlayerUI();
     if (typeof saveSessionFn === 'function') { try { saveSessionFn(); } catch { /* ignore */ } }
@@ -499,7 +514,7 @@ function createApp(root, ctx) {
     config: null,
     selSources: new Set(),
     // 会话（搜索 / 歌单共用）
-    sess: { id: null, kind: 'search', since: 0, status: 'idle', rows: [], counts: {}, error: null, sourcesTotal: 0 },
+    sess: { id: null, kind: 'search', since: 0, status: 'idle', rows: [], counts: {}, error: null, sourcesTotal: 0, netFails: 0 },
     lastKeyword: '',
     pollTimer: null,
     selected: new Map(), // uid -> row（自建表的选中态，跨增量刷新保持）
@@ -557,6 +572,7 @@ function createApp(root, ctx) {
     const s = lastSession;
     if (!s) return;
     app.sess = s.sess;
+    app.sess.netFails = 0; // ★ 连续网络失败计数跨视图不继承（只统计同一段轮询内的「连续」失败）
     app.lastKeyword = s.lastKeyword;
     app.lastPerSource = s.lastPerSource;
     app.selSources = new Set(s.selSources);
@@ -655,9 +671,8 @@ function createApp(root, ctx) {
     //   而 Chrome 会暂停「被移出 document 的正在播放媒体元素」→ 表现为「切模块停播」（QA 第 4 轮实测复现）。
     //   audio 由 ensureAudio()（本文件 ensureAudio）用 ctx.el('audio', …) 一次性创建后**始终保持 detached**，
     //   仅由模块级 player.audio 强引用持有（不会被 GC），故永远不会被移出 document、也不会被暂停。
-    app.playerBar = bar;
     // ★ 绑定本视图播放条 DOM 引用：切回时引擎据 player.ui 无缝接管；切走时 detachPlayerUI 置 null。
-    player.ui = { playBtn, npCoverEl, npTitleEl, npMetaEl, seekEl, curTimeEl, durTimeEl, volEl, lyricBtn, npLyricEl, playerBar: bar };
+    player.ui = { playBtn, npCoverEl, npTitleEl, npMetaEl, seekEl, curTimeEl, durTimeEl, volEl, lyricBtn, npLyricEl };
     renderNowPlaying();
     if (lyricBtn) lyricBtn.classList.toggle('is-active', player.lyric.open);
     renderLyricLine();
@@ -695,33 +710,44 @@ function createApp(root, ctx) {
     app.selSources = new Set(initial);
   }
 
-  /** 加载 / 刷新部署状态；可用性发生变化时整体重绘。 */
+  /** 加载 / 刷新部署状态；可用性发生变化时整体重绘。@returns {Promise<boolean>} 本次查询是否成功（供「重新检测」提示口径用）。 */
   async function loadDeploy(force) {
     let d;
     try {
       d = await api('GET', `/api/music/deployStatus${force ? '?force=1' : ''}`);
     } catch (err) {
-      app.deploy = { state: 'not_deployed', usable: false, error: err, disk: {}, python: {}, musicdl: {}, venv: {} };
-      app.mountedUsable = false;
-      paint();
+      if (disposed) return false;
+      // ★ 单次查询失败（后端重启 / 网络抖动）**不得**把可用界面整体降级：
+      //   保留上一次成功的部署快照，仅「从未成功过」才回落未部署态；不 paint（不清空搜索结果 / 队列），只提示。
+      if (app.deploy) {
+        app.deploy = { ...app.deploy, error: err }; // mountedUsable 保持不动：一次抖动不得翻转可用性判定
+      } else {
+        app.deploy = { state: 'not_deployed', usable: false, error: err, disk: {}, python: {}, musicdl: {}, venv: {} };
+        app.mountedUsable = false;
+        paint();
+      }
+      ctx.ui.toast('err', (err && err.message) || '检测音频环境失败');
       startQueuePolling(true);
-      return;
+      return false;
     }
+    if (disposed) return false;
     app.deploy = d;
     const usable = !!d.usable;
-    if (usable === app.mountedUsable) { updateEnvBar(); startQueuePolling(true); refreshUpstream(); return; }
+    if (usable === app.mountedUsable) { updateEnvBar(); startQueuePolling(true); refreshUpstream(); return true; }
     app.mountedUsable = usable;
     if (usable && (!app.sources || !app.config)) await loadMeta();
     paint();
     // ★ Bug C：两种态都要轮询 —— 部署态也据此在刷新页面后重新发现并订阅正在跑的安装任务。
     startQueuePolling(true);
     refreshUpstream(); // 非阻塞：deployStatus 只带缓存摘要，这里再拿实时上游版本（纯提示，失败安静）
+    return true;
   }
 
   async function doRefreshDeploy() {
     ctx.ui.toast('info', '正在重新检测…');
-    await loadDeploy(true);
-    ctx.ui.toast('ok', '已刷新');
+    const ok = await loadDeploy(true);
+    // ★ 失败时 loadDeploy 已 toast err：这里不再补「已刷新」，避免自相矛盾
+    if (ok) ctx.ui.toast('ok', '已刷新');
   }
 
   // ------------------------------ 任务提交（★ 不走 ctx.runTask） ------------------------------
@@ -733,7 +759,8 @@ function createApp(root, ctx) {
     try {
       let res;
       try { res = await api('POST', '/api/tasks', bodyReq); }
-      catch (err) { ctx.ui.toast('err', err.message || '提交任务失败'); return null; }
+      catch (err) { if (!disposed) ctx.ui.toast('err', err.message || '提交任务失败'); return null; }
+      if (disposed) return null; // ★ 已卸载：不再订阅实时流 / 起轮询（任务已在后端提交成功）
       const task = res && res.task;
       ctx.ui.toast('ok', `已提交任务：${(task && task.title) || action}`);
       // ★ Bug C：安装 / 卸载任务**立即**订阅实时日志 —— 这类任务可能在 <200ms 内失败，
@@ -765,6 +792,7 @@ function createApp(root, ctx) {
    * @returns {{close:()=>void}}
    */
   function openTaskStream(taskId, h) {
+    if (disposed) return { close() { /* 已卸载：不建连接、不注册兜底轮询 */ } };
     let closed = false;
     let retries = 0;
     let fallbackTimer = null;
@@ -785,6 +813,9 @@ function createApp(root, ctx) {
         if (closed) return;
         let t = null;
         try { t = await api('GET', `/api/tasks/${encodeURIComponent(taskId)}`); } catch { /* ignore */ }
+        // ★ await 期间可能已收到 done / 已被卸载：再复核一次，避免 onTask / onDone 二次触发
+        if (closed) return;
+        if (disposed) { close(); return; }
         if (t && t.id) {
           if (h.onTask) h.onTask(t);
           if (isTerminalTask(t.status)) { close(); if (h.onDone) h.onDone(t); return; }
@@ -825,7 +856,7 @@ function createApp(root, ctx) {
 
   /** 打开（若尚未打开）某任务的实时流，并绑定到 live 表（回填 backlog / 追加日志 / 收尾）。 */
   function ensureTaskStream(task) {
-    if (!task || !task.id) return;
+    if (disposed || !task || !task.id) return;
     const e = liveFor(task.id);
     if (e.stream || e.done) return;
     e.startedAt = task.startedAt || task.createdAt || Date.now();
@@ -856,8 +887,9 @@ function createApp(root, ctx) {
     const e = live.get(id);
     if (!e || !e.logEl) return;
     e.logEl.innerHTML = '';
-    if (e.lines.length === 0) e.logEl.append(logPlaceholderNode());
-    else for (const l of e.lines) e.logEl.append(logLineNode(l));
+    if (e.lines.length === 0) { e.logEl.append(logPlaceholderNode()); e.hasPlaceholder = true; }
+    else { for (const l of e.lines) e.logEl.append(logLineNode(l)); e.hasPlaceholder = false; }
+    e.renderedLines = e.lines.length; // ★ 全量回填后同步游标，后续 appendLogLine 才能接着做增量
     e.logEl.scrollTop = e.logEl.scrollHeight;
   }
 
@@ -865,8 +897,17 @@ function createApp(root, ctx) {
   function appendLogLine(id, line) {
     const e = live.get(id);
     if (!e || !e.logEl) return;
-    if (e.lines.length === 1) e.logEl.innerHTML = ''; // 清掉「等待日志…」占位
+    if (e.hasPlaceholder || e.lines.length === 1) { e.logEl.innerHTML = ''; e.hasPlaceholder = false; } // 清掉「等待日志…」占位
     e.logEl.append(logLineNode(line));
+    // ★ 与 live 表同口径裁剪：超过 LIVE_LOG_MAX 后从 DOM 头部滑出最旧行（不整段重建）。
+    //   只用 children + removeChild：`childNodes` / `firstChild` 在视图单测的轻量 DOM 桩里
+    //   并不存在（music-install-progress 曾因此整例抛 TypeError），而浏览器与桩件都支持前者。
+    while (e.logEl.children && e.logEl.children.length > e.lines.length) {
+      const first = e.logEl.children[0];
+      if (!first) break;
+      e.logEl.removeChild(first);
+    }
+    e.renderedLines = e.lines.length; // 与 DOM 同步游标
     if (e.pinned !== false) e.logEl.scrollTop = e.logEl.scrollHeight; // 自动吸底（用户上滚则不打扰）
   }
 
@@ -878,9 +919,7 @@ function createApp(root, ctx) {
   /** 一条日志 → DOM 行（等宽、按 level 着色；复用 .diff 风格）。 */
   function logLineNode(l) {
     const line = l || {};
-    const cls = line.level === 'error' ? 'diff__del'
-      : line.level === 'ok' ? 'diff__add'
-        : line.level === 'warn' ? 'diff__warn' : 'diff__same';
+    const cls = logLevelClass(line.level);
     return el('div', { class: 'diff__line' }, [
       // 注意不能用 .diff__no（为 diff 行号设计，固定 32px 宽）——装不下 8 字符时间戳会溢出重叠
       el('span', { class: 'music-logts', text: ctx.fmtTime(line.ts) }),
@@ -1120,6 +1159,7 @@ function createApp(root, ctx) {
   async function refreshUpstream() {
     let u = null;
     try { u = await api('GET', '/api/music/musicdlUpstream'); } catch { u = null; }
+    if (disposed) return; // ★ 已卸载：不碰 DOM
     app.musicdlUpstream = (u && u.fetchOk) ? u : null;
     // 仅在「要不要显示提示」发生翻转时重绘环境条，避免无谓地打断用户操作
     const show = !!upstreamNoticeNode();
@@ -1174,6 +1214,7 @@ function createApp(root, ctx) {
     let res;
     try { res = await api('POST', '/api/music/search', { keyword, sources, perSource, enhanced: app.config.enhancedSearch === true }); }
     catch (err) { ctx.ui.toast('err', err.message || '搜索失败'); return; }
+    if (disposed) return; // ★ 已卸载：不再起轮询
     startSession('search', res);
   }
 
@@ -1184,17 +1225,19 @@ function createApp(root, ctx) {
     let res;
     try { res = await api('POST', '/api/music/playlist', { url, sources }); }
     catch (err) { ctx.ui.toast('err', err.message || '解析歌单失败'); return; }
+    if (disposed) return; // ★ 已卸载：不再起轮询
     startSession('playlist', res);
   }
 
   function startSession(kind, res) {
+    if (disposed) return; // ★ 已卸载：不接管会话、不起轮询（服务端会话仍可被其它入口消费）
     stopPoll();
     lastSession = null; // ★ 发起新会话即作废旧快照：切回时不应再恢复上一次的搜索结果
     app.resPage = 1; // 新会话回到结果第一页
     app.sess = {
       id: res.searchId, kind, since: 0, status: 'running',
       rows: [], counts: { sourcesOk: 0, sourcesFail: 0, songs: 0 }, currentSource: null, error: null,
-      sourcesTotal: Number(res.sourcesTotal) || 0,
+      sourcesTotal: Number(res.sourcesTotal) || 0, netFails: 0,
     };
     app.selected.clear();
     app.expanded.clear();
@@ -1210,9 +1253,16 @@ function createApp(root, ctx) {
     let data;
     try { data = await api('GET', `/api/music/search/${encodeURIComponent(id)}?since=${app.sess.since}`); }
     catch (err) {
-      stopPoll();
-      // 取消 / 新会话后到达的过期错误不得覆盖本地状态
+      if (disposed) return; // ★ 已卸载：不得再触碰 DOM / 状态
+      // 取消 / 新会话后到达的过期错误不得覆盖本地状态（放在 stopPoll 之前：否则会误停新会话的轮询）
       if (app.sess.id !== id || app.sess.status === 'cancelled') return;
+      // ★ 网络类失败（后端重启 / 瞬时断连）不立即判死：连续达 POLL_NET_RETRY_MAX 次才终态；
+      //   业务错误（HTTP 错误码）仍立即失败。计数记在 app.sess 上，成功即归零。
+      if (isNetErr(err)) {
+        app.sess.netFails = (Number(app.sess.netFails) || 0) + 1;
+        if (app.sess.netFails < POLL_NET_RETRY_MAX) return; // 保留轮询，下一拍继续重试
+      }
+      stopPoll();
       app.sess.status = 'fail';
       app.sess.error = err;
       updateSearchStatus();
@@ -1220,7 +1270,9 @@ function createApp(root, ctx) {
       return;
     }
     // 在途轮询的迟到响应：用户已取消（或已开新会话）时直接丢弃，防止把 cancelled 改回 running
+    if (disposed) return;
     if (app.sess.id !== id || app.sess.status === 'cancelled') return;
+    app.sess.netFails = 0; // ★ 成功即归零（该计数只统计「连续」失败）
     app.sess.since = Number(data.nextSince) || app.sess.since;
     app.sess.status = data.status || app.sess.status;
     app.sess.counts = data.counts || app.sess.counts;
@@ -1241,6 +1293,9 @@ function createApp(root, ctx) {
     const id = app.sess.id;
     if (!id) return;
     try { await api('POST', `/api/music/search/${encodeURIComponent(id)}/cancel`); } catch { /* 忽略 */ }
+    // ★ await 期间可能已切走视图 / 已开新会话：与 pollSession 同口径，过期续跑不得停掉新会话的轮询或改状态
+    if (disposed) return;
+    if (!app.sess || app.sess.id !== id) return;
     stopPoll();
     app.sess.status = 'cancelled';
     // 状态栏与结果区空态都要重绘：emptyResultText() 依赖 status，漏了 renderResults 会残留「正在搜索…」
@@ -1357,9 +1412,12 @@ function createApp(root, ctx) {
         {
           label: '应用', kind: 'primary',
           onClick: async (close) => {
+            const prev = new Set(app.selSources); // ★ 保存前的勾选：失败时回滚
             app.selSources = draft;
             updateSourceBadge();
-            await saveConfig({ sources: [...draft] });
+            const next = await saveConfig({ sources: [...draft] });
+            // ★ saveConfig 失败返回 null（已 toast err）：回滚勾选且不关弹窗，避免界面显示「已应用」而实际未生效
+            if (!next) { app.selSources = prev; updateSourceBadge(); return; }
             close(true);
           },
         },
@@ -1488,7 +1546,7 @@ function createApp(root, ctx) {
 
     tr.append(el('td', { text: r.singers || '—' }));
     tr.append(el('td', { text: r.album || '—' }));
-    tr.append(el('td', { class: 'nowrap mono', text: fmtDur(r.duration) }));
+    tr.append(el('td', { class: 'nowrap mono', text: fmtClock(r.duration, true) }));
     // 格式 / 码率：码率缺失时加悬浮提示（C2）
     const qCell = el('td', { class: 'nowrap', text: fmtQuality(r) });
     if (!hasBitrate(r)) qCell.title = '该音源搜索阶段未提供码率，下载后可查看实测值';
@@ -1530,6 +1588,7 @@ function createApp(root, ctx) {
     const kind = app.sess.kind;
     if (app.sess.status === 'idle') return kind === 'playlist' ? '粘贴歌单 / 专辑链接后点「解析歌单」' : '输入关键词开始搜索（支持 57 个音源）';
     if (app.sess.status === 'running') return kind === 'playlist' ? '正在解析歌单…' : '正在搜索，结果会陆续出现…';
+    if (app.sess.status === 'cancelled') return '已取消'; // 与状态栏口径一致（取消后不得再显示「正在搜索…」）
     if (app.sess.status === 'fail') return `搜索失败：${(app.sess.error && app.sess.error.message) || '未知错误'}`;
     return kind === 'playlist' ? '未从该链接解析出曲目' : '没有找到结果，换个关键词试试';
   }
@@ -1635,6 +1694,7 @@ function createApp(root, ctx) {
   }
 
   function startQueuePolling(immediate) {
+    if (disposed) return; // ★ 卸载后的在途续跑不得再起轮询（addTimer 同时也已短路）
     if (immediate) refreshTasks();
     if (app.taskTimer == null) app.taskTimer = addTimer(refreshTasks, 1500);
   }
@@ -1658,8 +1718,16 @@ function createApp(root, ctx) {
   async function refreshTasks() {
     let list;
     try { list = await api('GET', '/api/tasks'); } catch { return; }
+    if (disposed) return; // ★ 卸载后迟到的响应：不得再注册轮询 / SSE
     const music = (Array.isArray(list) ? list : []).filter((t) => t && t.module === 'music');
     app.tasks = music;
+    // ★ 剪枝：已不在新列表里的任务，实时态（含已分离的日志 DOM 子树）立即丢弃并关流，避免长期驻留
+    const ids = new Set(music.map((t) => t && t.id));
+    for (const [id, e] of Array.from(live.entries())) {
+      if (ids.has(id)) continue;
+      if (e && e.stream && typeof e.stream.close === 'function') { try { e.stream.close(); } catch { /* ignore */ } }
+      live.delete(id);
+    }
     ensureStreams();
     updateInstallButton();
     renderQueue();
@@ -1729,14 +1797,35 @@ function createApp(root, ctx) {
   /** 实时日志区（等宽、按 level 着色、自动吸底；内容从 live 表回填，重绘不丢）。 */
   function renderLiveLog(t) {
     const e = liveFor(t.id);
-    const box = el('div', { class: 'diff music-tasklog music-livlog' });
-    e.logEl = box;
-    e.pinned = true;
-    box.addEventListener('scroll', () => { e.pinned = box.scrollTop + box.clientHeight >= box.scrollHeight - 24; });
+    // ★ 复用已建过的日志容器：队列每 1.5s 重绘一次，重建节点会让 ≤500 行日志整段回填（卡顿源）。
+    //   容器被 renderQueue 从 DOM 摘下时仍保留自己的子节点与 scrollTop，重新 append 即原位复活。
+    let box = e.logEl;
+    if (!box) {
+      box = el('div', { class: 'diff music-tasklog music-livlog' });
+      e.logEl = box;
+      e.renderedLines = 0;
+      e.hasPlaceholder = false;
+      // 滚动监听只绑一次：pinned = 用户是否仍贴底（后续吸底据此判断，不再无条件重置为 true）
+      box.addEventListener('scroll', () => { e.pinned = box.scrollTop + box.clientHeight >= box.scrollHeight - 24; });
+    }
     const lines = e.lines || [];
-    if (lines.length === 0) box.append(logPlaceholderNode());
-    else for (const l of lines) box.append(logLineNode(l));
-    box.scrollTop = box.scrollHeight;
+    if (e.hasPlaceholder && lines.length > 0) { box.innerHTML = ''; e.hasPlaceholder = false; e.renderedLines = 0; }
+    if (lines.length === 0) {
+      if (!e.hasPlaceholder) { box.innerHTML = ''; box.append(logPlaceholderNode()); e.hasPlaceholder = true; }
+      e.renderedLines = 0;
+    } else {
+      let rendered = Number(e.renderedLines) || 0;
+      // ★ 行数回退（live 表超上限后从头部滑出）：只删 DOM 头部多出的行，不整段重建。
+      //   同上：用 children + removeChild（视图单测的 DOM 桩没有 childNodes / firstChild）。
+      while (rendered > lines.length && box.children && box.children.length > 0) {
+        box.removeChild(box.children[0]);
+        rendered -= 1;
+      }
+      for (let i = rendered; i < lines.length; i++) box.append(logLineNode(lines[i])); // 只追加新行
+      e.renderedLines = lines.length;
+    }
+    // ★ 保留用户上滚位置：只有本来贴底（pinned !== false）才吸底
+    if (e.pinned !== false) box.scrollTop = box.scrollHeight;
     return box;
   }
 
@@ -1822,6 +1911,7 @@ function createApp(root, ctx) {
 
   /** 启动「已用时」秒级刷新定时器（仅在存在运行中任务时）。 */
   function ensureElapsedTicker() {
+    if (disposed) return; // ★ 卸载后不再起秒级刷新（addTimer 亦会返回 null）
     if (app.elapsedTimer == null) app.elapsedTimer = addTimer(updateElapsedNodes, 1000);
   }
 
@@ -1848,7 +1938,7 @@ function createApp(root, ctx) {
       box.append(el('div', { class: 'diff__line' }, [el('span', { class: 'diff__same', text: '（无日志）' })]));
     } else {
       for (const l of lines) {
-        const cls = l.level === 'error' ? 'diff__del' : (l.level === 'ok' ? 'diff__add' : 'diff__same');
+        const cls = logLevelClass(l.level);
         box.append(el('div', { class: 'diff__line' }, [
           el('span', { class: 'music-logts', text: ctx.fmtTime(l.ts) }),
           el('span', { class: cls, text: `[${l.level}] ${l.text}` }),

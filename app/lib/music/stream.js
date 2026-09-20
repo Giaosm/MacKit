@@ -15,10 +15,10 @@
 
 import http from 'node:http';
 import https from 'node:https';
-import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 
 import * as paths from '../paths.js';
+import * as exec from '../exec.js';
 import { AppError, ERR } from '../exec.js';
 
 /** 上游抓取默认超时（连接/整体各 30s 级） */
@@ -86,6 +86,11 @@ function openUpstreamDirect({ url, headers, range, timeoutMs }) {
           headers: baseHeaders,
           rejectUnauthorized: true,
         }, (res) => {
+          // ★ 必须挂 'error'：IncomingMessage 在**读体过程中**出错（连接被上游 RST、
+          //   压缩/长度异常）是经 'error' 事件抛出的。重定向分支下面直接 `res.resume()`、
+          //   调用方也可能还没接手，没有监听器时它会变成 uncaughtException ——
+          //   常驻服务里等于整个进程退出（2026-09-21 修）。
+          res.on('error', () => { /* 由消费方（pipeUpstream）的 error 分支统一收尾 */ });
           const status = res.statusCode || 0;
           const location = res.headers && res.headers.location;
           if (isRedirectStatus(status) && location) {
@@ -159,6 +164,11 @@ export function contentTypeForExt(ext) {
  *
  * 用途：判断是否「整段播放」（start===0 且无明确 end）→ 决定是否边听边存。
  * 多段（含逗号）/ 非法 / 缺失一律返回 null（= 整段）。
+ *
+ * ★ 契约说明（2026-09-21）：`start`/`end` **只在整段判定上有意义**，不是可直接套用的
+ *   字节区间 —— 后缀范围 `bytes=-N`（最后 N 字节）在本函数里强制表达为 `{start:0, end:N}`，
+ *   它**不等于**真实偏移。上游 Range 是原样透传的（不经本函数改写），所以这不影响播放；
+ *   但任何新调用方都不许拿这两个字段去算 Content-Range / 做切片。该形状已被单测锁定。
  * @param {string} value
  * @returns {{start:number, end:number|null, isFull:boolean}|null}
  */
@@ -306,7 +316,7 @@ function findHeaderBodyBoundary(buf) {
   }
 }
 
-/** 代理抓取：spawn 白名单内 curl（`-L` 跟随重定向），解析最终响应头块后再把 body 交给调用方。 */
+/** 代理抓取：经 exec.spawnStream 启动白名单内 curl（`-L` 跟随重定向），解析最终响应头块后再把 body 交给调用方。 */
 function openUpstreamProxy({ url, headers, range, proxies, timeoutMs }) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -321,13 +331,18 @@ function openUpstreamProxy({ url, headers, range, proxies, timeoutMs }) {
     args.push(url);
 
     const env = buildCurlEnv(proxies);
-    let child;
-    try {
-      child = spawn(paths.CURL_BIN, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (err) {
-      reject(new AppError(ERR.CMD_FAILED, '无法启动 curl', String(err && err.message)));
-      return;
-    }
+    /* ★ 走 exec.spawnStream，而不是本文件直接 spawn（2026-09-21 修）：
+       · child_process 只允许在 exec.js 出现；
+       · 只有经它启动才会登记进 LIVE_CHILDREN → 进程退出时能被整组回收，
+         此前播放用的 curl 从不登记，服务退出后就是孤儿进程；
+       · bin 也才经过白名单解析（paths.CURL_BIN 是绝对路径，直接 spawn 等于绕过校验）。
+       envReplace 让本文件刻意构造的最小环境生效（见 buildCurlEnv 注释），
+       lane 用独立的 'music-stream'：它不参与「取消全部下载」的 lane 强杀，
+       只随进程退出时的 killAllNow 一起回收。 */
+    const spawned = exec.spawnStream('curl', args, {
+      env, envReplace: true, lane: 'music-stream', timeoutMs,
+    });
+    const child = spawned.child;
 
     let settled = false;
     let buf = Buffer.alloc(0);
@@ -338,8 +353,27 @@ function openUpstreamProxy({ url, headers, range, proxies, timeoutMs }) {
     const fail = (err) => {
       if (settled) return;
       settled = true;
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
+      spawned.kill();
       reject(err);
+    };
+
+    /** 用已缓冲的头块 + 剩余正文构造返回值（头块解析成功即定局）。 */
+    const finish = (boundary) => {
+      if (settled) return;
+      settled = true;
+      child.stdout.off('data', onData);
+      const parsed = parseUpstreamHeadBlock(buf.subarray(0, boundary).toString('latin1'));
+      const rest = buf.subarray(boundary);
+      const stream = new PassThrough();
+      if (rest.length) stream.write(rest);
+      stream.on('close', () => spawned.release());
+      child.stdout.pipe(stream);
+      resolve({
+        status: parsed.status,
+        headers: parsed.headers,
+        stream,
+        abort: () => { try { stream.destroy(); } catch { /* ignore */ } spawned.kill(); },
+      });
     };
 
     const onData = (chunk) => {
@@ -349,25 +383,20 @@ function openUpstreamProxy({ url, headers, range, proxies, timeoutMs }) {
         if (buf.length > 256 * 1024) fail(new AppError(ERR.CMD_FAILED, '上游响应头异常'));
         return;
       }
-      child.stdout.off('data', onData);
-      const parsed = parseUpstreamHeadBlock(buf.subarray(0, boundary).toString('latin1'));
-      const rest = buf.subarray(boundary);
-      settled = true;
-      const stream = new PassThrough();
-      if (rest.length) stream.write(rest);
-      child.stdout.pipe(stream);
-      resolve({
-        status: parsed.status,
-        headers: parsed.headers,
-        stream,
-        abort: () => { try { child.kill('SIGTERM'); } catch { /* ignore */ } },
-      });
+      finish(boundary);
     };
 
     child.stdout.on('data', onData);
     child.on('error', (err) => fail(new AppError(ERR.CMD_FAILED, 'curl 启动失败', String(err && err.message))));
     child.on('close', (code) => {
       if (settled) return;
+      // ★ 空正文响应（Content-Length: 0 / 204 / 404 无体）在 onData 里永远等不到
+      //   「头块之后还有至少 1 字节」的后继，boundary 保持 -1；进程正常退出时若不在这里
+      //   补一次解析，就会被误判成「上游连接失败（curl exit 0）」（2026-09-21 修）。
+      if (buf.length > 0 && buf.subarray(-4).equals(CRLFCRLF)) {
+        finish(buf.length);
+        return;
+      }
       const msg = stderr.trim();
       if (code === 47 || /maximum.*redirects?|too many redirects/i.test(msg)) {
         fail(new AppError(ERR.CMD_FAILED, '上游重定向次数过多', msg || 'curl exit 47'));
@@ -412,6 +441,15 @@ export function openUpstream(opts) {
     proxies: opts.proxies && typeof opts.proxies === 'object' ? opts.proxies : null,
     timeoutMs,
   };
+  // ★ 协议白名单在**这里**统一把关，不能只放在直连分支：直连分支自己会校验 protocol，
+  //   而代理分支把 url 直接交给 curl（curl 支持 file:// / dict:// / gopher:// 等），
+  //   一旦上游给（或被篡改出）非 http(s) 的直链，代理分支就会变成任意协议抓取器。
+  //   SSRF 口径是「仅 http/https」，两个分支必须一致（2026-09-21 修）。
+  let proto = '';
+  try { proto = new URL(req.url).protocol; } catch { /* 下面统一报错 */ }
+  if (proto !== 'http:' && proto !== 'https:') {
+    return Promise.reject(new AppError(ERR.CMD_FAILED, '播放直链无效（仅支持 http/https）'));
+  }
   if (opts.channel === 'proxy') return openUpstreamProxy(req);
   return openUpstreamDirect(req);
 }

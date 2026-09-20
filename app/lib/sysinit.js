@@ -203,7 +203,15 @@ const actions = {
           ctx.log('info', `检测到 ${kind}，将操作 ${rcFile}`);
           if (mode === 'keep') { ctx.log('ok', '已选择「保留原样」，未做任何修改'); return; }
 
-          const text = readText(rcFile) || '';
+          // ★ readText 读失败（EACCES / 被 sudo 创建为 root 属主 / IO 错误）返回 null。
+          //   此前写成 `|| ''`：一旦读不到就把「空字符串」当成原文，随后 writeText 会
+          //   把用户的 .zshrc **整份覆盖**成几行别名 —— 属于不可逆的数据破坏。
+          //   brew.js 的同一写入点已有同款护栏，这里补齐（2026-09-21 修）。
+          const text = readText(rcFile);
+          if (text === null) {
+            throw new AppError(ERR.IO_ERROR, `无法读取 ${rcFile}，已中止以免覆盖你的配置`,
+              '请检查该文件权限（例如是否为 root 属主），或改用「保留原样」手动添加');
+          }
           const cfg = store.readBrewgo();
 
           let next;
