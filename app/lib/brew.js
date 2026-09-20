@@ -1007,6 +1007,12 @@ function consistencyStep() {
   };
 }
 
+// Homebrew 版本号末尾的 `_N` 是 revision（重新打包修订号，如 `1.5.7_1` 的上游版本仍是 1.5.7），
+// 不是上游版本的一部分。比较「上游版本」前必须先拆掉它，否则 `1.5.7_1` 会被误判成比 `1.5.7` 更新。
+function stripBrewRevision(v) {
+  return String(v == null ? '' : v).replace(/_[0-9]+$/, '');
+}
+
 async function checkUpstreamConsistency(ctx) {
   let checked = 0;
   let suspects = 0;
@@ -1034,7 +1040,12 @@ async function checkUpstreamConsistency(ctx) {
       if (!name || !installedVer || outdated.has(name)) continue;
       const idxVer = byName.get(name);
       // 只提示「看起来是版本号」的差异：cask 的 `version :latest` / 模板串与已装版本没有可比性
-      if (!idxVer || idxVer === installedVer || !/^[0-9]/.test(idxVer)) continue;
+      if (!idxVer || !/^[0-9]/.test(idxVer)) continue;
+      // 拆掉 revision（`1.5.7_1` → `1.5.7`）再比上游版本：`_N` 只是重新打包、上游版本没变，
+      // 不能当成「索引比 brew 新」而误报上游滞后。
+      const idxUp = stripBrewRevision(idxVer);
+      const insUp = stripBrewRevision(installedVer);
+      if (idxUp === insUp) continue;
       suspects += 1;
       if (suspects <= 3) {
         ctx.log('warn', `上游元数据可能滞后：索引里 ${name} 是 ${idxVer}，而 brew 元数据认为最新就是 ${installedVer}`);
