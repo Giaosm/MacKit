@@ -533,7 +533,7 @@ async function pollHealth() {
   try {
     const d = await api('GET', '/api/health');
     lastHealth = d;
-    syncRestartBanner();
+    syncHealthBanners();
     // 服务回来了，页面却还停在「服务已关闭」遮罩上 —— 说明用户点了关闭服务后，
     // 又从启动台/Dock 把 MacKit 打开了，而浏览器复用的就是这个旧标签页（启动器会优先
     // 聚焦已打开同一地址的标签）。页面自己不会醒，这里推一把重载回正常界面。
@@ -546,31 +546,57 @@ async function pollHealth() {
   }
 }
 
-// ============================== 「后端代码已换新」横幅 ==============================
+// ============================== 「代码已换新」横幅 ==============================
 /**
- * 后端代码在磁盘上被换新（例如刚点过「更新 MacKit」），但当前进程还在跑旧模块 ——
- * 界面看不出这一点，最容易让人以为「更新了却没生效」。这里挂一条带「立即重启」的横幅。
+ * 「更新 MacKit」只改磁盘上的文件，于是有两种「看起来更新了、其实没生效」：
+ *   ① 后端：常驻服务的内存模块不会重新加载 → 需要重启服务（带「立即重启」）；
+ *   ② 前端：已打开的页面里跑的还是加载那一刻的 JS → 需要刷新页面（带「刷新页面」）。
+ * 界面自己看不出这两点，所以我们用 /api/health 的两个时间戳判断后挂横幅。
  */
-let restartBanner = null;
-function syncRestartBanner() {
-  const need = !!(lastHealth && lastHealth.needsRestart);
-  if (!need) {
-    if (restartBanner && restartBanner.parentNode) restartBanner.parentNode.removeChild(restartBanner);
-    restartBanner = null;
-    return;
-  }
-  if (restartBanner && restartBanner.parentNode) return; // 已在显示
-  const files = Array.isArray(lastHealth.changedFiles) ? lastHealth.changedFiles : [];
-  const list = files.length ? files.slice(0, 3).join('、') + (files.length > 3 ? ` 等 ${files.length} 个文件` : '') : '后端代码';
-  const btn = el('button', { class: 'btn btn--primary btn--sm', type: 'button', text: '立即重启', on: { click: restartService } });
-  restartBanner = el('div', { class: 'warn-box restart-banner' }, [
+const PAGE_LOADED_AT = Date.now(); // 本页面加载时刻（与后端 mtime 同一台机器的时钟）
+/** 判定前端过期的容差：更新与刷新几乎同时发生时，避免误报（同机时钟，3s 足够）。 */
+const FRONTEND_STALE_SKEW_MS = 3000;
+/** kind → 横幅节点（route() 会清空 main，故需要登记以便重申 / 移除）。 */
+const healthBanners = new Map();
+
+/** 挂 / 撤某类横幅；spec 为 null 表示撤下。 */
+function setHealthBanner(kind, spec) {
+  const cur = healthBanners.get(kind);
+  if (cur && cur.parentNode) cur.parentNode.removeChild(cur);
+  healthBanners.delete(kind);
+  if (!spec) return;
+  const node = el('div', { class: 'warn-box restart-banner' }, [
     el('div', { class: 'restart-banner__text' }, [
-      el('div', { text: '后端代码已更新，当前服务仍在运行旧版本 —— 需要重启 MacKit 才会生效。' }),
-      el('div', { class: 'muted', text: `变更：${list}` }),
+      el('div', { text: spec.text }),
+      spec.sub ? el('div', { class: 'muted', text: spec.sub }) : null,
     ]),
-    btn,
+    el('button', { class: 'btn btn--primary btn--sm', type: 'button', text: spec.action, on: { click: spec.onClick } }),
   ]);
-  dom.main.insertBefore(restartBanner, dom.main.firstChild);
+  healthBanners.set(kind, node);
+  dom.main.insertBefore(node, dom.main.firstChild);
+}
+
+/** 依据最近一次 /api/health 结果同步两类横幅。 */
+function syncHealthBanners() {
+  if (!dom.main) return;
+  const h = lastHealth || {};
+  // 前端过期（刷新即可）：web/ 最近改动晚于本页面加载时刻
+  const webAt = Number(h.webChangedAt) || 0;
+  setHealthBanner('frontend', webAt > PAGE_LOADED_AT + FRONTEND_STALE_SKEW_MS ? {
+    text: '前端文件已更新，当前页面仍在运行旧版本 —— 刷新页面即可加载新界面。',
+    sub: `前端改动于 ${fmtTime(webAt)}，本页面加载于 ${fmtTime(PAGE_LOADED_AT)}`,
+    action: '刷新页面',
+    onClick: () => location.reload(),
+  } : null);
+  // 后端过期（必须重启）：先插前端那条、再插这条 → 重启提示排在更靠上的位置
+  const files = Array.isArray(h.changedFiles) ? h.changedFiles : [];
+  const list = files.length ? files.slice(0, 3).join('、') + (files.length > 3 ? ` 等 ${files.length} 个文件` : '') : '后端代码';
+  setHealthBanner('backend', h.needsRestart ? {
+    text: '后端代码已更新，当前服务仍在运行旧版本 —— 需要重启 MacKit 才会生效。',
+    sub: `变更：${list}`,
+    action: '立即重启',
+    onClick: restartService,
+  } : null);
 }
 
 /** 显示服务遮罩（关闭 / 重启共用），文案由调用方给。 */
@@ -664,8 +690,10 @@ async function route() {
   dom.main.innerHTML = '';
   const root = el('div');
   dom.main.append(root);
-  restartBanner = null; // 上面那句 innerHTML='' 连横幅一起清掉了，这里按最新体检结果重申
-  syncRestartBanner();
+  // 上面那句 innerHTML='' 连横幅节点一起摘掉了（节点仍在 Map 里但已脱离 DOM），
+  // 这里清掉登记并按最新体检结果重申。
+  healthBanners.clear();
+  syncHealthBanners();
   const subs = [];
   const viewCtx = makeCtx(subs);
   const teardown = () => {

@@ -993,6 +993,65 @@ async function refreshIndexStep(ctx, kind) {
 }
 
 /**
+ * 一键刷新收尾的「上游元数据一致性」核对：**只读 + 只写日志，绝不改任务状态**。
+ *
+ * 为什么需要（2026-09-20 实测）：上游发布侧会在几十分钟里分发不同世代的批量数据 ——
+ * 本机 brew 元数据仍认为 2.5.2 就是最新（于是「可更新」是 0 项），而同一时刻 MacKit 下到的
+ * `cask.json` 里已经是 2.5.4。用户只看到「点了更新还是 0 项」，完全不知道是上游哪一侧滞后。
+ * 这里把差异直接写进日志，省掉一轮「是不是我们坏了」的排查。
+ */
+function consistencyStep() {
+  return {
+    id: 'consistency', title: '核对上游元数据是否滞后', timeoutMs: 180_000,
+    run: async (ctx) => { await checkUpstreamConsistency(ctx); },
+  };
+}
+
+async function checkUpstreamConsistency(ctx) {
+  let checked = 0;
+  let suspects = 0;
+  for (const kind of ['cask', 'formula']) {
+    const spec = KIND_SPEC[kind];
+    let idx = null;
+    try { idx = await ensureIndex(kind); } catch { /* 索引不可用 → 跳过该类别 */ }
+    if (!idx) continue;
+    const byName = new Map();
+    for (const it of idx.items) if (it && it.t) byName.set(String(it.t), String(it.v || ''));
+
+    const listRes = await quietCtx(ctx, ['list', spec.brewFlag, '--versions']);
+    if (listRes.code !== 0) continue;
+    const outdatedRes = await quietCtx(ctx, kind === 'cask'
+      ? ['outdated', '--cask', '--greedy', '--quiet']
+      : ['outdated', '--formula', '--quiet']);
+    const outdated = new Set(lineList(outdatedRes.stdout));
+    checked += 1;
+
+    for (const line of lineList(listRes.stdout)) {
+      const parts = line.split(/\s+/);
+      const name = parts[0];
+      const installedVer = parts[parts.length - 1];
+      // brew 已报「可更新」的不在此列（那条链路由「重查可更新项」展示）
+      if (!name || !installedVer || outdated.has(name)) continue;
+      const idxVer = byName.get(name);
+      // 只提示「看起来是版本号」的差异：cask 的 `version :latest` / 模板串与已装版本没有可比性
+      if (!idxVer || idxVer === installedVer || !/^[0-9]/.test(idxVer)) continue;
+      suspects += 1;
+      if (suspects <= 3) {
+        ctx.log('warn', `上游元数据可能滞后：索引里 ${name} 是 ${idxVer}，而 brew 元数据认为最新就是 ${installedVer}`);
+      }
+    }
+  }
+  if (checked === 0) {
+    ctx.log('info', '未能核对上游元数据（brew 元数据读取失败或索引不可用）—— 跳过，不影响本次更新结果');
+  } else if (suspects > 0) {
+    ctx.log('warn', `共 ${suspects} 项存在上游滞后（brew 元数据比刚下到的索引旧）。这来自 Homebrew 的分发侧、`
+      + '不是本机问题：隔几分钟再点一次「一键更新」通常就好了；急着用可先让应用自带更新（auto_updates）顶上。');
+  } else {
+    ctx.log('ok', '核对完成：brew 元数据与最新索引一致，未发现上游滞后');
+  }
+}
+
+/**
  * 一键刷新的终态收尾：本体更新成功即算成功（索引属尽力而为），并作废环境体检缓存，
  * 让仪表盘的「可更新 N 项」与 brew 视图立刻一致（两条路径口径统一的最后一环）。
  */
@@ -1008,6 +1067,8 @@ function finalizeSync(task, { log }) {
     if (st.status === 'ok') log('info', `${label} 索引已刷新为最新`);
     else { indexBad += 1; log('warn', `${label} 索引未刷新（${st.status}，见上文原因，可再点一次「一键更新」）`); }
   }
+  const cons = byId('consistency');
+  if (cons && cons.status !== 'ok') log('info', `上游元数据核对未完成（${cons.status}），可看上文日志`);
   // ★ 本体更新是主目的，索引只是附加收益：只要 `brew update` 成功且任务未取消，终态一律 ok ——
   //   索引步骤的 skip / 超时 fail 都不该把整个任务标红（红字会让用户以为本体也没更新成功）。
   if (upd && upd.status === 'ok' && task.status !== 'cancelled') {
@@ -1047,6 +1108,8 @@ const actions = {
           run: async (ctx) => { await refreshIndexStep(ctx, kind); },
         });
       }
+      // 收尾核对：索引 vs brew 元数据（只写日志），把「上游滞后」这种坑直接说清楚
+      plans.push(consistencyStep());
       return plans;
     },
     finalize: finalizeSync,
@@ -1234,6 +1297,16 @@ function batchUninstallSteps(names, kind) {
 }
 
 /** 在 step 内直连执行（继承 task signal，取消可中断）。 */
+/** 只读探测：与 safeCtx 同款容错，但**不**把 stdout 逐行灌进任务日志（装列表动辄几十行）。 */
+async function quietCtx(ctx, args, timeoutMs = 120_000) {
+  try {
+    return await ctx.exec.run('brew', args, { env: BREW_ENV, timeoutMs });
+  } catch (err) {
+    if (err && (err.code === ERR.CANCELLED || err.code === ERR.TIMEOUT)) throw err;
+    return { code: -1, stdout: '', stderr: (err && err.message) || String(err) };
+  }
+}
+
 async function safeCtx(ctx, args) {
   try {
     return await ctx.exec.run('brew', args, {

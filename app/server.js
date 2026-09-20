@@ -534,6 +534,8 @@ async function handleApi(req, res, url) {
       // 磁盘上的后端代码与本进程加载的不一致 → 前端挂横幅提示重启（见 checkBackendCode 注释）
       needsRestart: code.changed,
       changedFiles: code.files,
+      // 前端资源最近改动时刻：页面据此判断「自己是否已过期」（见 latestWebMtime 注释）
+      webChangedAt: code.webChangedAt,
     });
     return;
   }
@@ -957,6 +959,25 @@ function scanBackendCode(dir, out = []) {
   }
   return out;
 }
+/**
+ * `web/` 下前端资源的**最近改动时刻**（毫秒）。
+ *
+ * 前端文件是每次请求现读磁盘的，但**已经打开的页面**里跑的还是加载那一刻的 JS ——
+ * 刷新才会换新。浏览器自己无从得知，所以由后端给出这个时间戳：页面拿它和「自己加载的时刻」
+ * 比较，晚于自己就是「页面已过期，请刷新」（见 app.js 的 syncHealthBanners）。
+ */
+function latestWebMtime(dir, acc = 0) {
+  let entries = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return acc; }
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) { acc = latestWebMtime(full, acc); continue; }
+    try { const st = fs.statSync(full); if (st.mtimeMs > acc) acc = st.mtimeMs; } catch { /* ignore */ }
+  }
+  return acc;
+}
+
 /** @type {Map<string, string>|null} 启动基线：路径 → `${mtimeMs}:${size}` */
 let codeBaseline = null;
 function captureCodeBaseline() {
@@ -966,7 +987,7 @@ function captureCodeBaseline() {
  * 与基线比对。结果缓存 3s（/api/health 被多个标签页按 15s 轮询，没必要每次都 stat 一遍）。
  * @returns {{changed:boolean, files:string[]}}
  */
-let codeCheckCache = { at: 0, value: { changed: false, files: [] } };
+let codeCheckCache = { at: 0, value: { changed: false, files: [], webChangedAt: 0 } };
 function checkBackendCode() {
   if (Date.now() - codeCheckCache.at < 3000) return codeCheckCache.value;
   const changed = [];
@@ -976,7 +997,11 @@ function checkBackendCode() {
     // 新增 / 删除的后端文件也算变化（例如新模块文件）
     for (const f of codeBaseline.keys()) if (!now.has(f)) changed.push(path.relative(paths.APP_DIR, f));
   }
-  codeCheckCache = { at: Date.now(), value: { changed: changed.length > 0, files: changed.slice(0, 8) } };
+  codeCheckCache = {
+    at: Date.now(),
+    // mtimeMs 是浮点（含亚毫秒），取整后回给前端 —— 前端拿它和 Date.now() 比较，整数更直观
+    value: { changed: changed.length > 0, files: changed.slice(0, 8), webChangedAt: Math.floor(latestWebMtime(paths.WEB_DIR)) },
+  };
   return codeCheckCache.value;
 }
 
