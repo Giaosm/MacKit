@@ -9,7 +9,9 @@
  *   - queries[name]   = (params) => Promise<data>   （只读；本文件直接用 lib/exec.js，不经 task signal）
  *
  * brew 7 容错：`brew tap` 空输出属正常；所有 JSON 解析 try/catch 降级为空数组。
- * 只读命令统一注入 HOMEBREW_NO_AUTO_UPDATE=1，避免隐式自动更新导致的 index.lock 冲突与噪声。
+ * 只读命令统一注入 HOMEBREW_NO_AUTO_UPDATE=1（常量唯一事实源在 paths.BREW_READ_ENV）：
+ * 既避免隐式自动更新导致的 index.lock 冲突与噪声，也保证「可更新」数字只在用户显式刷新后才变。
+ * ★ 唯一的刷新入口是 actions.brew_update（一键更新本体并刷新索引，2026-09-21 起含 MacKit 索引）。
  * 端口 / 镜像源读写一律走 store.readBrewgo() / store.writeBrewgo()。
  *
  * 软件包类别（2026-09-18）：搜索 / 索引 / 安装对 cask 与 formula 完全共用，
@@ -21,16 +23,31 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
+import * as env from './env.js';
 import { countSteps } from './runner.js';
 
 const { ERR, AppError } = exec;
 
-/** 只读/升级命令的通用环境（关闭隐式自动更新） */
-const BREW_ENV = Object.freeze({ HOMEBREW_NO_AUTO_UPDATE: '1', HOMEBREW_NO_ENV_HINTS: '1' });
+/** 只读/升级命令的通用环境（关闭隐式自动更新）。定义唯一在 paths.BREW_READ_ENV —— env.js 的
+ *  体检路径也引用同一个对象，避免两条「可更新」路径各写一份 env 而出现口径差。 */
+const BREW_ENV = paths.BREW_READ_ENV;
+/**
+ * 取消 / 超时类错误：必须**原样上抛**（任务取消与超时链路依赖它们），不得降级成 SKIP，
+ * 也不得被改写成 NET_UNREACHABLE。只按 `code` 判 —— 只认 `instanceof AppError` 会在
+ * 错误跨模块包装（或被测试桩替换）时漏判（2026-09-21）。
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isCancelOrTimeout(err) {
+  const code = err && err.code;
+  return code === ERR.CANCELLED || code === ERR.TIMEOUT;
+}
+
 /** 核心 Tap（卸载需加强警告） */
 const CORE_TAPS = Object.freeze(['homebrew/core', 'homebrew/cask']);
 const UPGRADE_TIMEOUT = 1_800_000;
@@ -299,6 +316,9 @@ function finalizeBatch(task, { log }) {
     task.error = null;
   }
   log('info', `处理完成: 成功 ${ok} 个 / 跳过 ${skip} 个 / 失败 ${fail} 个${autoCleanRan ? '（另含 1 次自动清理缓存，不计入上述成功数）' : ''}`);
+  // 安装 / 卸载 / 升级都改变了本机软件状态 → 立刻作废环境体检缓存（30s TTL）。
+  // 否则仪表盘的「可更新 N 项」会在最长 30s 内与 brew 视图的数字不一致（两条路径口径统一的最后一环）。
+  try { env.invalidate(); } catch { /* 缓存作废失败不影响任务结果 */ }
 }
 
 // ------------------------------ 只读查询 ------------------------------
@@ -628,12 +648,20 @@ function writeIndexCache(kind, items) {
  *   而 cask.json 约 18MB、formula.json 约 32MB，走 stdout 会被静默截断导致 JSON 解析失败（2026-09-16 实测踩坑）。
  * ★ `--compressed` 让 curl 协商 gzip：formula.json 32MB→5MB、cask.json 18MB→2MB，首次搜索明显更快。
  */
-async function downloadIndex(kind) {
+async function downloadIndex(kind, deps = {}) {
   const spec = KIND_SPEC[normKind(kind)];
   const url = indexApiUrl(kind);
-  const tmpFile = `${indexPath(kind)}.download`;
+  // ★ 临时文件名必须唯一（2026-09-21）：一键刷新索引与「搜索触发的按需下载」可能同时进行，
+  //   固定用 `<索引>.download` 会让两个 curl 写同一个文件、先结束者删掉对方正在读的内容。
+  const tmpFile = `${indexPath(kind)}.${process.pid}-${crypto.randomBytes(3).toString('hex')}.download`;
+  // 任务步骤里注入 ctx.exec.runWithChannel：自动带 AbortSignal 与 lane（可取消、可代理回退）；
+  // 查询路径沿用默认的 exec.runWithChannel。
+  const run = typeof deps.run === 'function' ? deps.run : exec.runWithChannel;
+  const log = typeof deps.log === 'function' ? deps.log : () => {};
+  const t0 = Date.now();
+  log('info', `下载最新元数据：${url}`);
   try {
-    await exec.runWithChannel('direct_first', `下载 ${spec.label} 索引`, 'curl',
+    await run('direct_first', `下载 ${spec.label} 索引`, 'curl',
       ['-fsSL', '--compressed', '--max-time', '300', '-o', tmpFile, url],
       { timeoutMs: 320_000, env: { HOMEBREW_NO_ENV_HINTS: '1' } });
     const raw = fs.readFileSync(tmpFile, 'utf8');
@@ -641,6 +669,7 @@ async function downloadIndex(kind) {
     if (items.length < spec.minCount) {
       throw new AppError(ERR.PARSE_FAILED, `${spec.label} 索引内容异常`, `仅解析到 ${items.length} 条`);
     }
+    log('ok', `${spec.label} 索引已更新：${items.length} 条（${((Date.now() - t0) / 1000).toFixed(1)}s）`);
     return items;
   } finally {
     try { fs.rmSync(tmpFile, { force: true }); } catch { /* ignore */ }
@@ -657,36 +686,52 @@ const indexStates = {
  * 确保某类别索引可用：内存 → 24h 内磁盘缓存 → 下载；下载失败时回退旧磁盘缓存。
  * 返回 { items, builtAt, source }，source ∈ memory|cache|downloaded|stale；全不可用则 throw。
  */
-async function ensureIndex(kind) {
+async function ensureIndex(kind, opts = {}) {
   const k = normKind(kind);
   const spec = KIND_SPEC[k];
   const st = indexStates[k];
-  if (st.items && Date.now() - st.at < INDEX_TTL_MS) {
-    return { items: st.items, builtAt: st.at, source: 'memory' };
-  }
+  const force = opts.force === true;
   const cached = readIndexCache(k);
-  if (cached && Date.now() - cached.builtAt < INDEX_TTL_MS) {
-    st.at = cached.builtAt; st.items = cached.items; st.loading = null;
-    return { items: cached.items, builtAt: cached.builtAt, source: 'cache' };
+
+  if (!force) {
+    if (st.items && Date.now() - st.at < INDEX_TTL_MS) {
+      return { items: st.items, builtAt: st.at, source: 'memory' };
+    }
+    if (cached && Date.now() - cached.builtAt < INDEX_TTL_MS) {
+      st.at = cached.builtAt; st.items = cached.items; st.loading = null;
+      return { items: cached.items, builtAt: cached.builtAt, source: 'cache' };
+    }
+    // 单飞：并发搜索只触发一次下载
+    if (st.loading) return await settleIndex(st.loading, cached, spec, false);
   }
-  if (!st.loading) {
-    st.loading = downloadIndex(k)
-      .then((items) => {
-        const at = Date.now();
-        st.at = at; st.items = items; st.loading = null;
-        writeIndexCache(k, items);
-        return { items, builtAt: at, source: 'downloaded' };
-      })
-      .catch((err) => {
-        st.loading = null;
-        throw err;
-      });
-  }
+
+  // ★ 下载序号（2026-09-21）：force 刷新期间可能还有一轮「搜索触发的按需下载」在跑。
+  //   后完成的若不做守卫，会把旧元数据写回内存/磁盘缓存，把刚刷新的结果覆盖掉。
+  const seq = (st.seq || 0) + 1;
+  st.seq = seq;
+  const p = downloadIndex(k, { run: opts.run, log: opts.log })
+    .then((items) => {
+      const at = Date.now();
+      if (st.seq === seq) { st.at = at; st.items = items; st.loading = null; writeIndexCache(k, items); }
+      return { items, builtAt: at, source: 'downloaded' };
+    })
+    .catch((err) => { if (st.seq === seq) st.loading = null; throw err; });
+  st.loading = p;
+  return await settleIndex(p, cached, spec, force);
+}
+
+/**
+ * 索引下载失败时的统一收尾：
+ *   · force（用户在「一键更新」里显式刷新）→ 原样上抛，绝不静默回落旧缓存 ——
+ *     否则界面会把旧索引当新索引用，用户以为刷新成功了；
+ *   · 按需查询 → 回退旧磁盘缓存（stale），取消/超时仍原样上抛，其余归一为 NET_UNREACHABLE。
+ */
+async function settleIndex(promise, cached, spec, force) {
   try {
-    return await st.loading;
+    return await promise;
   } catch (err) {
-    if (cached) return { items: cached.items, builtAt: cached.builtAt, source: 'stale' };
-    if (err instanceof AppError && (err.code === ERR.CANCELLED || err.code === ERR.TIMEOUT)) throw err;
+    if (cached && !force) return { items: cached.items, builtAt: cached.builtAt, source: 'stale' };
+    if (isCancelOrTimeout(err)) throw err;
     throw new AppError(ERR.NET_UNREACHABLE, `${spec.label} 索引下载失败（且无本地缓存）`, (err && err.message) || String(err));
   }
 }
@@ -920,16 +965,91 @@ function installSteps(items, kind) {
   return plans;
 }
 
+/**
+ * 一键刷新里的「重下索引」步骤。
+ *
+ * 语义：索引是**尽力而为**的附加收益 —— 本体更新成功才是用户的主要目的，所以索引失败只记
+ * warn 并让本步落到 `skip`（runner 的 SKIP 机制），任务整体仍算成功；日志里明确写「可重试」。
+ * 注入 ctx.exec.runWithChannel：自动带本步 AbortSignal 与 lane（可取消、直连失败自动换代理）。
+ * @param {object} ctx 步骤上下文
+ * @param {'cask'|'formula'} kind
+ */
+async function refreshIndexStep(ctx, kind) {
+  const spec = KIND_SPEC[normKind(kind)];
+  try {
+    const res = await ensureIndex(kind, {
+      force: true,
+      run: ctx.exec.runWithChannel,
+      log: (level, text) => ctx.log(level, text),
+    });
+    // 条数与耗时已在 downloadIndex 内打过，这里只补索引时间戳（前端也展示这个值）
+    ctx.log('info', `${spec.label} 索引时间戳：${new Date(res.builtAt).toLocaleString()}`);
+  } catch (err) {
+    if (isCancelOrTimeout(err)) throw err;
+    const msg = (err && err.message) || String(err);
+    ctx.log('warn', `${spec.label} 索引刷新失败（不影响本体更新）：${msg} —— 可稍后重试「一键更新」`);
+    throw Object.assign(new AppError('SKIP', `${spec.label} 索引刷新失败`), { code: 'SKIP' });
+  }
+}
+
+/**
+ * 一键刷新的终态收尾：本体更新成功即算成功（索引属尽力而为），并作废环境体检缓存，
+ * 让仪表盘的「可更新 N 项」与 brew 视图立刻一致（两条路径口径统一的最后一环）。
+ */
+function finalizeSync(task, { log }) {
+  const steps = Array.isArray(task.steps) ? task.steps : [];
+  const byId = (id) => steps.find((s) => s.id === id) || null;
+  const upd = byId('brew_update');
+  let indexBad = 0;
+  for (const kind of ['cask', 'formula']) {
+    const st = byId(`index_${kind}`);
+    if (!st) continue;
+    const label = KIND_SPEC[kind].label;
+    if (st.status === 'ok') log('info', `${label} 索引已刷新为最新`);
+    else { indexBad += 1; log('warn', `${label} 索引未刷新（${st.status}，见上文原因，可再点一次「一键更新」）`); }
+  }
+  // ★ 本体更新是主目的，索引只是附加收益：只要 `brew update` 成功且任务未取消，终态一律 ok ——
+  //   索引步骤的 skip / 超时 fail 都不该把整个任务标红（红字会让用户以为本体也没更新成功）。
+  if (upd && upd.status === 'ok' && task.status !== 'cancelled') {
+    task.status = 'ok';
+    task.error = null;
+    log('ok', indexBad === 0
+      ? 'Homebrew 本体与元数据已更新，MacKit 索引已刷新'
+      : `Homebrew 本体与元数据已更新；${indexBad} 份索引未刷新（不影响本体更新结果）`);
+  }
+  try { env.invalidate(); } catch { /* ignore */ }
+}
+
 // ------------------------------ 动作定义 ------------------------------
 const actions = {
 
-  /** brew 本体更新（proxy_first）。★ 失败若是「中断残留的 git 锁」→ 安全修复后重试一次（Task A 自愈） */
+  /**
+   * 一键刷新：**更新 Homebrew 本体（含元数据）→ 重下 MacKit 的两份软件包索引**。
+   *
+   * ★ 2026-09-21 合并为一个入口。此前只有第一步，于是「可更新」列表（读 brew 元数据）随本体更新
+   *   变新，而搜索/安装列表用的 MacKit 自建索引（24h TTL）要再等最多 24 小时 —— 点一次按钮只刷新
+   *   了一半数据。现在一次点完两条数据源都新鲜，且这是**唯一**的刷新入口（只读命令一律
+   *   HOMEBREW_NO_AUTO_UPDATE，见 paths.BREW_READ_ENV）。
+   *   `params.refreshIndex === false` 时只更新本体（保留给命令行 / 测试使用）。
+   *   ★ 失败若是「中断残留的 git 锁」→ 安全修复后重试一次（Task A 自愈）。
+   */
   brew_update: {
-    title: '更新 Homebrew 本体',
-    steps: () => [{
-      id: 'brew_update', title: '更新 Homebrew 本体', timeoutMs: UPGRADE_TIMEOUT,
-      run: async (ctx) => { await runPolicyWithSelfHeal(ctx); },
-    }],
+    title: '更新 Homebrew 本体并刷新索引',
+    steps: (params) => {
+      const plans = [{
+        id: 'brew_update', title: '更新 Homebrew 本体（含元数据）', timeoutMs: UPGRADE_TIMEOUT,
+        run: async (ctx) => { await runPolicyWithSelfHeal(ctx); },
+      }];
+      if (params && params.refreshIndex === false) return plans;
+      for (const kind of ['cask', 'formula']) {
+        plans.push({
+          id: `index_${kind}`, title: `刷新 ${KIND_SPEC[kind].label} 索引`, timeoutMs: 320_000,
+          run: async (ctx) => { await refreshIndexStep(ctx, kind); },
+        });
+      }
+      return plans;
+    },
+    finalize: finalizeSync,
   },
   /** 逐项选择通道升级（A6：由 params.items 动态生成步骤，非 stdin） */
   upgrade_one_by_one: {

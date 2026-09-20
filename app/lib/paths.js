@@ -74,6 +74,18 @@ export const SHELL_RC = SHELL_KIND === 'bash' ? RC_BASH_PROFILE : RC_ZPROFILE;
  */
 export const SHELLENV_RE = /^(?!\s*#).*brew\s+shellenv/m;
 
+/**
+ * brew **只读命令**的统一环境（跨模块共享，避免两处各写一份而漂移）。
+ *
+ * `HOMEBREW_NO_AUTO_UPDATE=1` 的两条理由（2026-09-21 收敛到这一处）：
+ *   ① 禁止 brew 在读命令里隐式执行 `brew update` —— 否则会与「更新 Homebrew 本体」/ 升级任务
+ *      抢 `index.lock`（这正是当初给只读命令加它的原因）；
+ *   ② 更重要的语义：**「可更新」列表只在用户显式刷新后才变**。若一条路径允许隐式刷新、另一条
+ *      不允许，同一个数字在「环境体检」与「brew 视图」里就会不一致（实测两条路径原本确实不同口径）。
+ * 元数据的新鲜度因此只由 actions.brew_update（一键更新本体并刷新索引）这一个入口驱动。
+ */
+export const BREW_READ_ENV = Object.freeze({ HOMEBREW_NO_AUTO_UPDATE: '1', HOMEBREW_NO_ENV_HINTS: '1' });
+
 // ---------------------------------------------------------------------------
 // Rime 输入法
 // ---------------------------------------------------------------------------

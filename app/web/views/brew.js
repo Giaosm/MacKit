@@ -4,7 +4,7 @@
  * 结构（按用户澄清后的目标形态）：
  *   - 环境卡 + 通道指示（实际通道由 SSE 的 step.channel 反映）
  *   - 首屏 = 「升级列表」（逐项形态）：
- *       · 顶部「⬆ 更新 Homebrew 本体（代理优先）」+「⟳ 重新检查」
+ *       · 顶部「⬆ 一键更新本体并刷新索引（代理优先）」+「⟳ 重查可更新项」（后者只重算，不下载）
  *       · 所有可更新项（formula / cask 分组）逐项显示「当前版本 → 可用版本」
  *       · 每项两个互斥按钮「代理 / 直连」，默认都不选；未选 = 不更新
  *       · 快捷「全部代理 / 全部直连 / 清除全部选择」+ 实时汇总「已选 N 项（代理 X / 直连 Y）」
@@ -263,7 +263,8 @@ export default {
           listHost.append(ui.card('可更新项', ui.empty({
             icon: '🎉', title: '所有 Homebrew 软件包均为最新，无需更新',
             text: `Formula ${data.counts.formula} 项 · Cask ${data.counts.cask} 项　　上次检查：${data.checkedAt ? ctx.fmtDateTime(data.checkedAt) : '—'}`,
-            actions: [{ label: '重新检查', kind: 'primary', onClick: load }],
+            // 这里原先还有一个「重新检查」按钮：与正上方工具条的按钮同名同功能，
+            // 两处并存只会让用户分不清各自做什么（2026-09-21 去掉重复入口，说明文字里已给出时间）。
           })));
           renderSummary();
           return;
@@ -287,8 +288,8 @@ export default {
         host.innerHTML = '';
         topBar.innerHTML = '';
         topBar.append(
-          el('button', { class: 'btn btn--primary', type: 'button', text: '⬆ 更新 Homebrew 本体（代理优先）', on: { click: () => { ctx.runTask('brew', 'brew_update').catch(() => {}); } } }),
-          el('button', { class: 'btn', type: 'button', text: '⟳ 重新检查', on: { click: load } }),
+          el('button', { class: 'btn btn--primary', type: 'button', text: '⬆ 一键更新本体并刷新索引（代理优先）', on: { click: () => { ctx.runTask('brew', 'brew_update').catch(() => {}); } } }),
+          el('button', { class: 'btn', type: 'button', text: '⟳ 重查可更新项', on: { click: load } }),
           el('span', { class: 'grow' }),
           searchI,
         );
@@ -304,7 +305,7 @@ export default {
       }
 
       box.append(host);
-      onPanel('done', (t) => { if (t.module === 'brew') load(); });
+      onPanel('done', (t) => { if (t.module === 'brew') { load(); loadEnv(false); } });
       load();
     }
 
@@ -367,7 +368,7 @@ export default {
         ct = ui.dataTable({ columns: [{ key: 'name', label: '名称' }], rows: names.map((n) => ({ name: n })), selectable: true, searchable: true, rowKey: (r) => r.name, emptyText: '无' });
         host.append(ui.card(label, el('div', {}, [ct.el, el('div', { class: 'row section' }, [el('button', { class: 'btn btn--danger', type: 'button', text: '卸载选中', on: { click: uninstallPackages } })])])));
       }
-      onPanel('done', (t) => { if (t.module === 'brew') load(); });
+      onPanel('done', (t) => { if (t.module === 'brew') { load(); loadEnv(false); } });
       box.append(tabs, host); drawTabs(); load();
     }
 
@@ -488,7 +489,12 @@ export default {
       });
 
       // 安装任务结束后刷新「已装」标识（顺带覆盖其他 brew 动作对已装列表的影响）
-      onPanel('done', (t) => { if (t.module === 'brew' && q) runSearch(); });
+      onPanel('done', (t) => {
+        if (t.module !== 'brew') return;
+        if (q) runSearch();
+        // 安装 / 卸载会改变「已装」与「可更新」计数 → 顶部环境卡一起刷新，避免与列表数字打架
+        loadEnv(false);
+      });
 
       host.append(kindTabs, el('div', { class: 'toolbar' }, [searchI, el('span', { class: 'grow' }), status, cancelBtn]), listHost);
       drawKindTabs();

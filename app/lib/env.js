@@ -69,7 +69,12 @@ function normLines(text) {
  */
 const warnedNotAllowed = new Set();
 async function runQuiet(bin, args, opts = {}) {
-  const res = await exec.runSafe(bin, args, { noMirror: true, ...opts });
+  // ★ 2026-09-21：brew 的读命令统一带上与 brew.js 相同的 env（常量唯一在 paths.BREW_READ_ENV）。
+  //   此前这条体检路径没带 HOMEBREW_NO_AUTO_UPDATE=1，于是 brew 可能在命令执行中途自己刷新元数据：
+  //   同一个「可更新 N 项」在仪表盘与 brew 视图里就会不一致，还可能去抢 index.lock。
+  //   现在两条路径读的是同一份元数据快照，新鲜度只由「一键更新本体并刷新索引」驱动。
+  const env = bin === 'brew' ? { env: paths.BREW_READ_ENV } : null;
+  const res = await exec.runSafe(bin, args, { noMirror: true, ...env, ...opts });
   if (res.errCode === exec.ERR.CMD_NOT_ALLOWED && !warnedNotAllowed.has(bin)) {
     warnedNotAllowed.add(bin);
     console.warn(`[env] 命令不在白名单，已跳过（应改用裸命令名）：${bin}`);
