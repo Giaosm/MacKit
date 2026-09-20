@@ -24,7 +24,7 @@ import * as paths from './lib/paths.js';
 import * as store from './lib/store.js';
 import * as runner from './lib/runner.js';
 import * as env from './lib/env.js';
-import { AppError, ERR, toErrObj, hasLiveChildren } from './lib/exec.js';
+import { AppError, ERR, toErrObj, hasLiveChildren, spawnDetached } from './lib/exec.js';
 import { DAV_ERR, urlHasCredentials } from './lib/webdav.js';
 import { parseReqUrl } from './lib/requrl.js';
 import {
@@ -527,7 +527,14 @@ async function handleApi(req, res, url) {
   const method = req.method || 'GET';
 
   if (method === 'GET' && pathname === '/api/health') {
-    ok(res, { ok: true, port: currentPort, pid: process.pid, version: VERSION });
+    const code = checkBackendCode();
+    ok(res, {
+      ok: true, port: currentPort, pid: process.pid, version: VERSION,
+      startedAt: BOOT_AT,
+      // 磁盘上的后端代码与本进程加载的不一致 → 前端挂横幅提示重启（见 checkBackendCode 注释）
+      needsRestart: code.changed,
+      changedFiles: code.files,
+    });
     return;
   }
 
@@ -809,9 +816,24 @@ async function handleApi(req, res, url) {
   }
 
   if (method === 'POST' && pathname === '/api/shutdown') {
+    // 与 chooseFolder 同一道闸：这两个动作会「终止正在跑的任务」，不能由任意网页通过
+    // 跨站子请求触发（POST 的 Origin 规则已挡住表单，这里再加 Sec-Fetch-Site 一层）。
+    requireUiTriggered(req, '关闭服务');
     ok(res, { ok: true });
     log('收到关闭请求，正在优雅退出…');
     setTimeout(() => { gracefulShutdown('api'); }, 100);
+    return;
+  }
+
+  // 受控重启：拉起一个新的 detached 服务进程后本进程退出（供「更新 MacKit 后立即重启」使用）。
+  // 语义上等于「关闭服务 + 重新双击 MacKit.command」，但不需要用户去 Dock / Finder 里操作。
+  if (method === 'POST' && pathname === '/api/restart') {
+    requireUiTriggered(req, '重启服务');
+    if (restarting) throw new AppError(ERR.CMD_FAILED, '重启已在进行中，请稍候');
+    restarting = true;
+    ok(res, { ok: true, willRestart: true });
+    log('收到重启请求：将拉起新服务进程后退出当前进程…');
+    setTimeout(() => { restartService(); }, 100);
     return;
   }
 
@@ -888,6 +910,10 @@ async function handler(req, res) {
 // ------------------------------ 运行态与生命周期 ------------------------------
 let currentPort = 0;
 let server = null;
+/** 本进程启动时刻（自更新后用于让用户一眼看出「服务是什么时候起来的」）。 */
+const BOOT_AT = Date.now();
+/** 重启流程互斥标记（见 restartService）。 */
+let restarting = false;
 
 function writeRuntime(port) {
   try {
@@ -895,7 +921,64 @@ function writeRuntime(port) {
     fs.writeFileSync(paths.RUNTIME_JSON, JSON.stringify({ port, pid: process.pid, startedAt: Date.now() }, null, 2), 'utf8');
   } catch (err) { log('写入 runtime.json 失败：', err && err.message); }
 }
-function removeRuntime() { try { fs.rmSync(paths.RUNTIME_JSON, { force: true }); } catch { /* ignore */ } }
+/**
+ * 删除运行态文件。
+ * ★ 2026-09-21：只删**属于本进程**的那一份 —— 「重启服务」会先删旧文件、再拉起新进程；
+ * 旧进程随后走 process.exit，若这里无条件 rmSync 就会把**新服务刚写好的 runtime.json 删掉**
+ * （启动器随后找不到运行态、又会去拉第三个实例）。文件里的 pid 不是自己就一律不动。
+ */
+function removeRuntime() {
+  try {
+    const cur = JSON.parse(fs.readFileSync(paths.RUNTIME_JSON, 'utf8'));
+    if (cur && typeof cur.pid === 'number' && cur.pid !== process.pid) return;
+  } catch { /* 读不到 / 损坏：当作自己那份处理 */ }
+  try { fs.rmSync(paths.RUNTIME_JSON, { force: true }); } catch { /* ignore */ }
+}
+
+// ------------------------------ 「磁盘代码已换新」检测 ------------------------------
+/**
+ * 记录本进程启动时**后端代码**在磁盘上的样子，之后每次 /api/health 比对。
+ *
+ * 为什么需要它：MacKit 的「更新 MacKit」只改磁盘上的文件，常驻服务里的 ES 模块**不会**重新加载
+ * （Node 会一直用启动时那份）。而前端 HTML/JS 是每次请求现读磁盘的（见 serveStatic），于是会出现
+ * 「按钮文案是新的、行为却是旧的」这种最难排查的状态（2026-09-20 实测踩到：用户点了新版按钮，
+ * 实际跑的还是旧版单步动作，索引刷新那两步根本没执行）。
+ * 只扫后端：`server.js` + `lib/**` 下的 .js —— 前端 / Python 都是按需读取，改它们不需要重启。
+ */
+function scanBackendCode(dir, out = []) {
+  let entries = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    if (e.name === 'node_modules' || e.name === 'test' || e.name.startsWith('.')) continue;
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) { scanBackendCode(full, out); continue; }
+    if (!e.name.endsWith('.js')) continue;
+    try { const st = fs.statSync(full); out.push([full, st.mtimeMs, st.size]); } catch { /* ignore */ }
+  }
+  return out;
+}
+/** @type {Map<string, string>|null} 启动基线：路径 → `${mtimeMs}:${size}` */
+let codeBaseline = null;
+function captureCodeBaseline() {
+  codeBaseline = new Map(scanBackendCode(paths.APP_DIR).map(([f, m, sz]) => [f, `${m}:${sz}`]));
+}
+/**
+ * 与基线比对。结果缓存 3s（/api/health 被多个标签页按 15s 轮询，没必要每次都 stat 一遍）。
+ * @returns {{changed:boolean, files:string[]}}
+ */
+let codeCheckCache = { at: 0, value: { changed: false, files: [] } };
+function checkBackendCode() {
+  if (Date.now() - codeCheckCache.at < 3000) return codeCheckCache.value;
+  const changed = [];
+  const now = new Map(scanBackendCode(paths.APP_DIR).map(([f, m, sz]) => [f, `${m}:${sz}`]));
+  if (codeBaseline) {
+    for (const [f, sig] of now) if (codeBaseline.get(f) !== sig) changed.push(path.relative(paths.APP_DIR, f));
+    // 新增 / 删除的后端文件也算变化（例如新模块文件）
+    for (const f of codeBaseline.keys()) if (!now.has(f)) changed.push(path.relative(paths.APP_DIR, f));
+  }
+  codeCheckCache = { at: Date.now(), value: { changed: changed.length > 0, files: changed.slice(0, 8) } };
+  return codeCheckCache.value;
+}
 
 function waitForIdle(timeoutMs) {
   return new Promise((resolve) => {
@@ -918,6 +1001,16 @@ async function gracefulShutdown(reason, exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   log(`开始优雅关闭（${reason}）…`);
+  await quiesce();
+  finishExit(exitCode);
+}
+
+/**
+ * 「静默」阶段：取消所有在执行的工作、回收子进程、关掉全部 SSE 连接。
+ * gracefulShutdown（关闭服务）与 restartService（重启服务）共用同一套动作 ——
+ * 重启就是「静默 → 拉起新进程 → 退出旧进程」，不能各自写一份而漂移。
+ */
+async function quiesce() {
   try {
     // 多 lane 并行：逐个取消所有 lane 上的当前任务（而非仅 default lane 的那一个）。
     const ids = runner.activeTaskIds();
@@ -946,7 +1039,10 @@ async function gracefulShutdown(reason, exitCode = 0) {
   } catch (err) { log('关闭前回收任务失败（继续退出）：', err && err.message); }
   for (const res of sseClients) { try { res.end(); } catch { /* ignore */ } }
   sseClients.clear();
+}
 
+/** 退出阶段：关监听、删运行态、按退出码结束进程（gracefulShutdown 与重启共用）。 */
+function finishExit(exitCode) {
   let exited = false;
   let fallback = null;
   const done = () => {
@@ -954,6 +1050,7 @@ async function gracefulShutdown(reason, exitCode = 0) {
     exited = true;
     if (fallback) clearTimeout(fallback);
     removeRuntime();
+    restarting = false;
     process.exit(exitCode);
   };
   if (server) {
@@ -965,10 +1062,59 @@ async function gracefulShutdown(reason, exitCode = 0) {
   } else done();
 }
 
+/**
+ * 受控重启：静默当前进程 → 删掉自己的运行态 → 拉起一个 detached 的新服务 → 退出。
+ *
+ * ★ 顺序很关键：
+ *   1) 先 quiesce（取消任务 / 关 SSE），再 `server.close()` 并**等它回调**：必须先把 18080 让出来，
+ *      否则新进程 listen 会撞 EADDRINUSE 顺延到 18081，用户的地址/书签就全对不上了；
+ *   2) 新进程经 exec.spawnDetached（不登记 LIVE_CHILDREN，否则会被我们随后的整组强杀带走）；
+ *   3) 起不来时不静默退出：日志写清「请手动双击 app/MacKit.command」，并以非 0 码退出。
+ */
+async function restartService() {
+  log('开始重启服务…');
+  try { await quiesce(); } catch (err) { log('重启前静默失败（继续）：', err && err.message); }
+  // 等监听套接字真正关闭（最多 3s；quiesce 已结束 SSE，正常情况几十毫秒内返回）
+  await new Promise((resolve) => {
+    if (!server) { resolve(); return; }
+    let settled = false;
+    const t = setTimeout(() => { if (!settled) { settled = true; resolve(); } }, 3000);
+    try {
+      server.close(() => { if (!settled) { settled = true; clearTimeout(t); resolve(); } });
+    } catch { if (!settled) { settled = true; clearTimeout(t); resolve(); } }
+  });
+  removeRuntime(); // 先删自己那份（新进程会写它自己的），避免旧 pid 残留把启动器引到已死进程
+
+  const serverJs = path.join(paths.APP_DIR, 'server.js');
+  // 续写启动器用的同一个日志文件（MacKit.command 里是 $MACKIT_DIR/server.out）
+  const outFile = path.join(paths.MACKIT_DIR, 'server.out');
+  let pid = 0;
+  try {
+    pid = spawnDetached('node', [serverJs], {
+      cwd: paths.APP_DIR,
+      outFile,
+      // 让新进程知道自己是「接替旧进程」起的：端口被短暂占住时它会在同一端口上重试，
+      // 而不是顺延到 18081（顺延会让用户手里的地址失效）。
+      env: { MACKIT_RESTARTED: '1' },
+    });
+  } catch (err) {
+    log('拉起新服务进程失败：', err && err.message);
+  }
+  if (!pid) {
+    // ★ 此刻监听套接字已经关掉了（上面 server.close 过），继续跑等于「进程活着但界面永远连不上」。
+    //   明确退出并给出人工恢复指令，好过静默挂死（2026-09-21 实测到的失败模式）。
+    log('重启失败：未能启动新的服务进程。请手动双击 app/MacKit.command 重新打开 MacKit');
+    process.exit(1);
+  }
+  log(`已启动新服务进程（pid ${pid}），当前进程退出以完成重启`);
+  process.exit(0);
+}
+
 // ------------------------------ 启动 ------------------------------
 async function main() {
   paths.ensureDirs();
   removeRuntime(); // 清理上一次可能残留的运行态
+  captureCodeBaseline(); // 必须在 loadModules 之前：基线 = 即将被加载的那份磁盘代码
   await loadModules();
   // 音乐音频缓存：启动时按配置上限裁剪一次（best-effort，绝不影响服务启动）。
   try { await queryModule('music', 'pruneAudio', {}); } catch { /* 模块缺失 / 失败忽略 */ }
@@ -977,7 +1123,16 @@ async function main() {
   let port = paths.DEFAULT_PORT;
   const maxPort = paths.DEFAULT_PORT + 50;
 
+  // 重启场景（MACKIT_RESTARTED=1）：旧进程刚释放端口，新进程可能抢跑几毫秒。
+  // 此时**不能**顺延到 18081 —— 用户手里的地址/书签会全部失效，所以先在原端口重试几轮。
+  let restartRetries = process.env.MACKIT_RESTARTED === '1' ? 20 : 0;
   server.on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE' && restartRetries > 0) {
+      restartRetries -= 1;
+      log(`端口 ${port} 尚未释放（重启接管中），200ms 后重试（剩余 ${restartRetries} 次）`);
+      setTimeout(() => server.listen(port, paths.LOOPBACK), 200);
+      return;
+    }
     if (err && err.code === 'EADDRINUSE' && port < maxPort) {
       port += 1;
       log(`端口被占用，顺延到 ${port}`);

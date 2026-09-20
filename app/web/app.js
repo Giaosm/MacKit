@@ -73,7 +73,8 @@ const dom = {
   logDrawer: $('logDrawer'), btnLogToggle: $('btnLogToggle'), logTaskLabel: $('logTaskLabel'),
   chkAutoScroll: $('chkAutoScroll'), btnLogClear: $('btnLogClear'), btnLogCopy: $('btnLogCopy'),
   btnLogOpen: $('btnLogOpen'), logBody: $('logBody'), logList: $('logList'),
-  shutdownVeil: $('shutdownVeil'), toastHost: $('toastHost'), modalHost: $('modalHost'),
+  shutdownVeil: $('shutdownVeil'), veilTitle: $('shutdownVeilTitle'), veilText: $('shutdownVeilText'),
+  toastHost: $('toastHost'), modalHost: $('modalHost'),
 };
 
 // ============================== 全局状态（仅缓存，非事实源） ==============================
@@ -418,6 +419,9 @@ function attach(taskId, opts = {}) {
         emit('task', t); setLogTaskLabel(taskLabel(t));
         if (isTerminal(t.status)) {
           state.currentTaskId = null; emit('done', t); refreshHistory();
+          // 「更新 MacKit」跑完 → 立刻体检一次：后端代码若已换新，横幅要马上出现，
+          // 不必等下一个 15s 轮询（用户刚点完更新，正是最需要看到「需要重启」的时刻）。
+          if (t.action === 'update') pollHealth();
           if (opts.onDone) { try { opts.onDone(t); } catch (e) { console.error(e); } }
         } else setService('warn', '日志流已断开，任务仍在后台运行');
       } else {
@@ -522,9 +526,14 @@ function setService(level, text) {
   dom.serviceStatus.className = `service-status is-${level}`;
   dom.serviceText.textContent = text;
 }
+/** 最近一次 /api/health 结果（needsRestart 等由它驱动横幅）。 */
+let lastHealth = null;
+
 async function pollHealth() {
   try {
     const d = await api('GET', '/api/health');
+    lastHealth = d;
+    syncRestartBanner();
     // 服务回来了，页面却还停在「服务已关闭」遮罩上 —— 说明用户点了关闭服务后，
     // 又从启动台/Dock 把 MacKit 打开了，而浏览器复用的就是这个旧标签页（启动器会优先
     // 聚焦已打开同一地址的标签）。页面自己不会醒，这里推一把重载回正常界面。
@@ -537,7 +546,44 @@ async function pollHealth() {
   }
 }
 
-// ============================== 关闭服务 ==============================
+// ============================== 「后端代码已换新」横幅 ==============================
+/**
+ * 后端代码在磁盘上被换新（例如刚点过「更新 MacKit」），但当前进程还在跑旧模块 ——
+ * 界面看不出这一点，最容易让人以为「更新了却没生效」。这里挂一条带「立即重启」的横幅。
+ */
+let restartBanner = null;
+function syncRestartBanner() {
+  const need = !!(lastHealth && lastHealth.needsRestart);
+  if (!need) {
+    if (restartBanner && restartBanner.parentNode) restartBanner.parentNode.removeChild(restartBanner);
+    restartBanner = null;
+    return;
+  }
+  if (restartBanner && restartBanner.parentNode) return; // 已在显示
+  const files = Array.isArray(lastHealth.changedFiles) ? lastHealth.changedFiles : [];
+  const list = files.length ? files.slice(0, 3).join('、') + (files.length > 3 ? ` 等 ${files.length} 个文件` : '') : '后端代码';
+  const btn = el('button', { class: 'btn btn--primary btn--sm', type: 'button', text: '立即重启', on: { click: restartService } });
+  restartBanner = el('div', { class: 'warn-box restart-banner' }, [
+    el('div', { class: 'restart-banner__text' }, [
+      el('div', { text: '后端代码已更新，当前服务仍在运行旧版本 —— 需要重启 MacKit 才会生效。' }),
+      el('div', { class: 'muted', text: `变更：${list}` }),
+    ]),
+    btn,
+  ]);
+  dom.main.insertBefore(restartBanner, dom.main.firstChild);
+}
+
+/** 显示服务遮罩（关闭 / 重启共用），文案由调用方给。 */
+function showVeil(title, text) {
+  if (dom.veilTitle) dom.veilTitle.textContent = title;
+  if (dom.veilText) dom.veilText.textContent = text;
+  dom.shutdownVeil.hidden = false;
+  // 用户很可能马上又从启动台把 MacKit 点开，而浏览器复用的正是这个标签页。
+  // 常规轮询 15s 太慢（会让人以为点了没反应），遮罩期间把探测间隔压到 2s。
+  if (!veilPollTimer) veilPollTimer = setInterval(pollHealth, 2000);
+}
+
+// ============================== 关闭 / 重启服务 ==============================
 async function shutdown() {
   if (state.running && state.task) {
     const ok = await confirmDialog({
@@ -551,10 +597,26 @@ async function shutdown() {
     if (!ok) return;
   }
   try { await api('POST', '/api/shutdown'); } catch { /* 服务可能已退出 */ }
-  dom.shutdownVeil.hidden = false;
-  // 用户很可能马上又从启动台把 MacKit 点开，而浏览器复用的正是这个标签页。
-  // 常规轮询 15s 太慢（会让人以为点了没反应），遮罩期间把探测间隔压到 2s。
-  if (!veilPollTimer) veilPollTimer = setInterval(pollHealth, 2000);
+  showVeil('服务已关闭', 'MacKit 后台服务已停止，可以关闭此标签页。需要时再次双击 MacKit.command 即可重新打开。');
+}
+
+/**
+ * 受控重启：后端会先拉起一个 detached 的新服务进程，再退出旧进程。
+ * 前端只需显示遮罩 —— 遮罩期间 pollHealth 每 2s 探测一次，服务回来后自动 reload。
+ */
+async function restartService() {
+  const running = state.running && state.task;
+  const okd = await confirmDialog({
+    title: running ? '有任务正在运行' : '重启 MacKit 服务？',
+    body: el('div', {}, [
+      el('p', { text: running ? `重启服务将终止「${state.task.title}」。` : '将用磁盘上的最新代码重新启动后台服务，页面会自动刷新。' }),
+      el('p', { class: 'muted', text: running ? '取消后已完成的步骤不会回滚。' : '服务会重启约 1–3 秒；正在跑的任务（若有）会被终止。' }),
+    ]),
+    confirmLabel: running ? '终止任务并重启' : '立即重启',
+  });
+  if (!okd) return;
+  try { await api('POST', '/api/restart'); } catch (err) { toast('err', err.message || '重启请求失败'); return; }
+  showVeil('正在重启 MacKit…', '后台服务正在用最新代码重新启动，页面会自动刷新。若 10 秒后仍未恢复，请重新双击 app/MacKit.command。');
 }
 
 // ============================== 路由 + 视图注册 ==============================
@@ -602,6 +664,8 @@ async function route() {
   dom.main.innerHTML = '';
   const root = el('div');
   dom.main.append(root);
+  restartBanner = null; // 上面那句 innerHTML='' 连横幅一起清掉了，这里按最新体检结果重申
+  syncRestartBanner();
   const subs = [];
   const viewCtx = makeCtx(subs);
   const teardown = () => {

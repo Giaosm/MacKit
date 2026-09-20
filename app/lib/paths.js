@@ -28,7 +28,13 @@ export const WEB_DIR = path.join(APP_DIR, 'web');
 // 用户家目录与 ~/.mackit 数据目录
 // ---------------------------------------------------------------------------
 export const HOME = os.homedir();
-const MACKIT_DIR = path.join(HOME, '.mackit');
+/**
+ * `~/.mackit`（MacKit 数据根目录）。
+ * 需要导出而不是各自拼串：启动器 MacKit.command 也把服务日志写成 `$MACKIT_DIR/server.out`，
+ * server.js 的「重启服务」必须续写到同一个文件（2026-09-21 实测：漏了 export 导致
+ * `path.join(undefined, ...)` 抛错，重启静默失败）。
+ */
+export const MACKIT_DIR = path.join(HOME, '.mackit');
 /** ~/.mackit/config.json（MacKit 专属配置） */
 export const CONFIG_JSON = path.join(MACKIT_DIR, 'config.json');
 /** ~/.mackit/runtime.json（运行态：port/pid/startedAt） */

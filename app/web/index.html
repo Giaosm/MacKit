@@ -106,8 +106,9 @@
   <div class="shutdown-veil" id="shutdownVeil" hidden>
     <div class="shutdown-veil__card">
       <div class="shutdown-veil__dot"></div>
-      <h1 class="shutdown-veil__title">服务已关闭</h1>
-      <p class="shutdown-veil__text">MacKit 后台服务已停止，可以关闭此标签页。</p>
+      <!-- 文案由 app.js 的 showVeil() 写入：关闭服务 / 重启服务共用这块遮罩 -->
+      <h1 class="shutdown-veil__title" id="shutdownVeilTitle">服务已关闭</h1>
+      <p class="shutdown-veil__text" id="shutdownVeilText">MacKit 后台服务已停止，可以关闭此标签页。</p>
       <p class="shutdown-veil__text">需要时再次双击 <code>MacKit.command</code> 即可重新打开。</p>
     </div>
   </div>

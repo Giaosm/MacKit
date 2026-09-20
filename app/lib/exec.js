@@ -753,6 +753,47 @@ export function spawnStream(bin, args, opts = {}) {
 }
 
 /**
+ * 启动一个**脱离父进程**的受控子进程（不登记 LIVE_CHILDREN，不随父进程退出被回收）。
+ *
+ * 唯一用途：MacKit 自更新后的「重启服务」——必须先拉起新服务、再退出旧进程。
+ * 因此它**刻意不登记** LIVE_CHILDREN：否则旧进程 gracefulShutdown 里那记「整组强杀」
+ * 会把刚起来的新服务一起带走（forceKill 对进程组发信号）。仍然照走 resolveBin 白名单与
+ * 统一的 env 构造 —— child_process 依旧只在本文件出现（2026-09-21 新增）。
+ *
+ * @param {string} bin 逻辑名（如 'node'）
+ * @param {string[]} args 参数数组
+ * @param {{cwd?:string, env?:object, outFile?:string}} [opts] outFile 存在时把 stdout/stderr 追加到该文件
+ * @returns {number} 新进程 pid（拿不到时为 0）
+ */
+export function spawnDetached(bin, args, opts = {}) {
+  const binPath = resolveBin(bin);
+  const argsArr = Array.isArray(args) ? args.slice() : [];
+  // 服务进程要一个干净环境：不注入镜像、显式按直连处理（代理只在具体命令里按需注入）
+  const env = buildEnv({ noMirror: true, channel: 'direct', env: opts.env });
+  let out = 'ignore';
+  let fd = null;
+  if (opts.outFile) {
+    try { fd = fs.openSync(opts.outFile, 'a'); out = fd; } catch { out = 'ignore'; }
+  }
+  let child;
+  try {
+    child = spawn(binPath, argsArr, {
+      cwd: opts.cwd || paths.APP_DIR,
+      env,
+      shell: false,
+      windowsHide: true,
+      detached: true, // setsid：新会话、无控制终端，父进程退出后继续存活
+      stdio: ['ignore', out, out],
+    });
+  } finally {
+    // 子进程已经 dup 了这两个 fd，父侧立刻关掉，避免句柄泄漏
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+  }
+  child.unref();
+  return child.pid || 0;
+}
+
+/**
  * 执行并吞掉异常，返回统一的「子进程退出码」结构。
  *
  * 供「只读探测 / 尽力而为」场景使用（env / sysinit / backup 的同类兜底已收敛到这里）。
