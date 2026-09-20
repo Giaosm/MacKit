@@ -381,7 +381,117 @@ async function queryDeployStatus(params = {}) {
     musicdl: st.musicdl,
     bridge: st.bridge,
     disk: st.disk,
+    // musicdl 上游版本摘要：**只读** 24h 磁盘缓存，绝不在此发网络请求（不能拖慢挂载轮询）；
+    // 前端挂载后再调 /api/music/musicdlUpstream 非阻塞刷新。无缓存 → null。
+    musicdlUpstream: cachedUpstreamSummary(st.musicdl.installed ? st.musicdl.version : null),
   };
+}
+
+// ------------------------------ musicdl 上游版本（PyPI，纯提示） ------------------------------
+
+/** 上游版本缓存键（store.getCached/setCached 磁盘缓存；导出供单测）。 */
+export const MUSICDL_UPSTREAM_CACHE_KEY = 'music-musicdl-upstream';
+/** 上游版本缓存 TTL：24h（上游发布频率低，一天一查足够）。 */
+const MUSICDL_UPSTREAM_TTL_MS = 24 * 60 * 60 * 1000;
+/** PyPI JSON API（只取 `info.version`）。 */
+const MUSICDL_PYPI_URL = 'https://pypi.org/pypi/musicdl/json';
+
+/**
+ * 比较上游版本与**已装版本**：'newer' | 'equal' | 'older'；任一缺失 → null（无从比较）。
+ * 纯函数（导出供单测）。复用既有 compareVersions（不可解析的版本按相等处理）。
+ * @param {string|null} upstream PyPI 上的版本
+ * @param {string|null} installed venv 内已装版本
+ * @returns {'newer'|'equal'|'older'|null}
+ */
+export function compareUpstreamVersion(upstream, installed) {
+  if (!upstream || !installed) return null;
+  const c = compareVersions(upstream, installed);
+  if (c > 0) return 'newer';
+  if (c < 0) return 'older';
+  return 'equal';
+}
+
+/**
+ * 解析 PyPI `/pypi/<pkg>/json` 响应文本，取 `info.version`。
+ * 纯函数（导出供单测）：非法 JSON / 缺 `info` / 缺版本 / 版本号形状不对 → ok:false。
+ * @param {string} text 响应全文
+ * @returns {{ok:true, version:string}|{ok:false, error:string}}
+ */
+export function parsePypiVersion(text) {
+  let obj;
+  try { obj = JSON.parse(String(text || '')); } catch { return { ok: false, error: 'PyPI 响应不是合法 JSON' }; }
+  const v = String((obj && obj.info && obj.info.version) || '').trim();
+  if (!v) return { ok: false, error: 'PyPI 响应缺少 info.version' };
+  if (!/^\d+(\.\d+)*$/.test(v)) return { ok: false, error: `PyPI 版本号格式异常：${v.slice(0, 40)}` };
+  return { ok: true, version: v };
+}
+
+/** 读 24h 内的上游版本缓存摘要（不发网络请求；无缓存 / 已过期 → null）。 */
+function cachedUpstreamSummary(installedVersion) {
+  try {
+    const cached = store.getCached(MUSICDL_UPSTREAM_CACHE_KEY);
+    if (!cached || !cached.value || !cached.value.version) return null;
+    if (Date.now() - cached.at >= MUSICDL_UPSTREAM_TTL_MS) return null;
+    return {
+      fetchOk: true,
+      version: cached.value.version,
+      checkedAt: cached.at,
+      installed: !!installedVersion,
+      installedVersion: installedVersion || null,
+      target: MUSICDL_TARGET_VERSION,
+      comparison: compareUpstreamVersion(cached.value.version, installedVersion),
+    };
+  } catch { return null; }
+}
+
+/**
+ * 查询 PyPI 上游 musicdl 版本（**纯提示功能：绝不向调用方抛网络错误**）。
+ *
+ * 网络范式抄 brew.js:downloadIndex —— `curl -o 临时文件` 落盘再读（exec 层 stdout 捕获上限
+ * 4MB，PyPI musicdl JSON 含全部历史版本，走 stdout 有截断风险），finally 删临时文件。
+ * 24h 磁盘缓存；`force=true` 绕过。
+ *
+ * ★ 依赖注入（deps）：`runWithChannel` / `detect` 可被单测替换成桩件，避免单测真发网络。
+ * @param {{force?:boolean}} [params]
+ * @param {{runWithChannel?:Function, detect?:Function}} [deps]
+ * @returns {Promise<{fetchOk:boolean, version:string|null, checkedAt:number|null,
+ *                     installed:boolean, installedVersion:string|null, target:string,
+ *                     comparison:'newer'|'equal'|'older'|null, error?:string}>}
+ */
+export async function queryMusicdlUpstream(params = {}, deps = {}) {
+  const runWithChannel = deps.runWithChannel || exec.runWithChannel;
+  const detect = deps.detect || env.detect;
+  const st = await detect();
+  const installedVersion = (st.musicdl && st.musicdl.installed && st.musicdl.version) || null;
+  const base = { installed: installedVersion != null, installedVersion, target: MUSICDL_TARGET_VERSION };
+
+  // ① 24h 缓存命中：不发请求
+  if (params.force !== true) {
+    try {
+      const cached = store.getCached(MUSICDL_UPSTREAM_CACHE_KEY);
+      if (cached && cached.value && cached.value.version && Date.now() - cached.at < MUSICDL_UPSTREAM_TTL_MS) {
+        return { fetchOk: true, version: cached.value.version, checkedAt: cached.at, ...base, comparison: compareUpstreamVersion(cached.value.version, installedVersion) };
+      }
+    } catch { /* 缓存读取失败：当无缓存 */ }
+  }
+
+  // ② curl 落盘 → 解析（网络范式同 downloadIndex）
+  const tmpFile = path.join(paths.CACHE_DIR, `musicdl-upstream-${process.pid}.json`);
+  try {
+    await runWithChannel('direct_first', '查询 musicdl 上游版本', 'curl',
+      ['-fsSL', '--compressed', '--max-time', '20', '-o', tmpFile, MUSICDL_PYPI_URL],
+      { timeoutMs: 25_000, noMirror: true });
+    const parsed = parsePypiVersion(fs.readFileSync(tmpFile, 'utf8'));
+    if (!parsed.ok) return { fetchOk: false, version: null, checkedAt: null, ...base, comparison: null, error: parsed.error };
+    try { store.setCached(MUSICDL_UPSTREAM_CACHE_KEY, { version: parsed.version }); } catch { /* 缓存写失败不影响本次 */ }
+    return { fetchOk: true, version: parsed.version, checkedAt: Date.now(), ...base, comparison: compareUpstreamVersion(parsed.version, installedVersion) };
+  } catch (err) {
+    // 取消 / 超时照常上抛（任务取消必须能中断）；其余网络错误归一为 fetchOk:false（纯提示，不抛）
+    if (err instanceof AppError && (err.code === ERR.CANCELLED || err.code === ERR.TIMEOUT)) throw err;
+    return { fetchOk: false, version: null, checkedAt: null, ...base, comparison: null, error: (err && err.message) || '查询 PyPI 失败' };
+  } finally {
+    try { fs.rmSync(tmpFile, { force: true }); } catch { /* ignore */ }
+  }
 }
 
 /**
@@ -816,11 +926,27 @@ function verifyEnvStep() {
       // Enhancement D：本步的 import 探针最长 30s，同样需要心跳；结束 / 异常两条路径都必须停。
       const stop = startHeartbeat(ctx, '验证音频环境');
       try {
-        const r = await env.probeMusicdl();
+        let r;
+        try { r = await env.probeMusicdl(); }
+        catch (err) { r = { installed: false, version: null, importError: String((err && err.message) || err) }; }
         if (!r.installed) {
+          // ★ 升级安全网（Task B）：`pip install -U musicdl` 可能装到坏包 / 上游新版本有破坏性变更，
+          //   此时 `import musicdl` 失败。自动回滚到 MacKit 锁定版本（**用常量**，不硬编码）后复查；
+          //   回滚后仍异常才走既有失败路径。已装版本 > target 的「不判 outdated」语义不受影响。
+          ctx.log('warn', `import musicdl 失败，尝试回滚到锁定版本 ${MUSICDL_TARGET_VERSION} …`);
+          const rolled = await rollbackMusicdl(ctx);
+          r = await env.probeMusicdl();
+          if (!r.installed) {
+            env.invalidate();
+            throw new AppError(ERR.CMD_FAILED,
+              rolled ? `安装已结束，回滚到 ${MUSICDL_TARGET_VERSION} 后 import musicdl 仍失败` : '安装已结束，但 import musicdl 仍失败',
+              r.importError || undefined);
+          }
           env.invalidate();
-          throw new AppError(ERR.CMD_FAILED, '安装已结束，但 import musicdl 仍失败',
-            r.importError || undefined);
+          // 日志按**实际结果**区分：真的执行了回滚 vs 只是探针瞬时失败、复查已通过
+          ctx.log('warn', rolled
+            ? `升级失败，已回滚到 ${MUSICDL_TARGET_VERSION}`
+            : `探测瞬时失败，复查已通过（未执行回滚，当前 musicdl ${r.version || '未知版本'}）`);
         }
         env.invalidate();
         ctx.log('ok', `音乐环境已就绪：musicdl ${r.version || '未知版本'}`);
@@ -830,6 +956,48 @@ function verifyEnvStep() {
       }
     },
   };
+}
+
+/**
+ * 升级安全网：把 musicdl 回滚到 MacKit 锁定版本（`pip install 'musicdl==<TARGET>'`）。
+ *
+ * 通道策略与 pipInstallStep 一致（代理优先、失败换直连）；任何失败都不抛 —— 由调用方
+ * 复查 `import musicdl` 决定后续（回滚成功与否都能得到明确的最终结论）。
+ * @param {object} ctx runner 步骤上下文（含 ctx.exec / ctx.log）
+ * @returns {Promise<boolean>} 回滚命令是否退出码 0
+ */
+async function rollbackMusicdl(ctx) {
+  if (!paths.exists(paths.MUSIC_VENV_PIP)) {
+    ctx.log('warn', `未找到 venv 内的 pip，无法回滚：${paths.MUSIC_VENV_PIP}`);
+    return false;
+  }
+  const args = ['install', `musicdl==${MUSICDL_TARGET_VERSION}`];
+  ctx.log('info', `执行：${paths.MUSIC_VENV_PIP} ${args.join(' ')}`);
+  const baseEnv = {
+    PIP_CACHE_DIR: paths.MUSIC_PIP_CACHE,
+    PIP_DISABLE_PIP_VERSION_CHECK: '1',
+    PIP_NO_INPUT: '1',
+  };
+  const onLine = (line, which) => { const t = String(line || '').trim(); if (t) ctx.log(which === 'stderr' ? 'warn' : 'info', t); };
+  try {
+    const { channel, env: proxyEnv } = resolveInstallProxyEnv();
+    if (channel === 'proxy') {
+      const resProxy = await ctx.exec.run(paths.MUSIC_VENV_PIP, args, {
+        noMirror: true, channel: 'proxy', env: { ...baseEnv, ...proxyEnv }, onLine, timeoutMs: PIP_TIMEOUT_MS,
+      });
+      if (resProxy.code === 0) return true;
+      ctx.log('warn', '代理回滚失败，改用直连重试…');
+    }
+    const resDirect = await ctx.exec.run(paths.MUSIC_VENV_PIP, args, {
+      noMirror: true, channel: 'direct',
+      env: { ...baseEnv, http_proxy: undefined, https_proxy: undefined, all_proxy: undefined },
+      onLine, timeoutMs: PIP_TIMEOUT_MS,
+    });
+    return resDirect.code === 0;
+  } catch (err) {
+    ctx.log('warn', `回滚执行异常（忽略，继续复查）：${(err && err.message) || err}`);
+    return false;
+  }
 }
 
 function removeEnvStep() {
@@ -1119,6 +1287,8 @@ export default {
   actions,
   queries: {
     deployStatus: queryDeployStatus,
+    // musicdl 上游版本（PyPI，纯提示；绝不抛网络错误，见 queryMusicdlUpstream）
+    musicdlUpstream: queryMusicdlUpstream,
     sources: querySources,
     config: queryConfig,
     search: querySearch,

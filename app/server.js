@@ -491,6 +491,11 @@ async function handleApi(req, res, url) {
     return;
   }
   if (method === 'GET' && pathname === '/api/music/sources') { ok(res, await queryModule('music', 'sources', {})); return; }
+  // musicdl 上游版本（PyPI，24h 缓存；force=1 绕过。纯提示功能：查询内部绝不抛网络错误）
+  if (method === 'GET' && pathname === '/api/music/musicdlUpstream') {
+    ok(res, await queryModule('music', 'musicdlUpstream', { force: url.searchParams.get('force') === '1' }));
+    return;
+  }
   if (method === 'GET' && pathname === '/api/music/config') { ok(res, await queryModule('music', 'config', {})); return; }
   if (method === 'PUT' && pathname === '/api/music/config') {
     const body = await readBody(req);

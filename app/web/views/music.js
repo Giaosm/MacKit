@@ -506,6 +506,8 @@ function createApp(root, ctx) {
     expanded: new Set(), // 已展开的专辑 uid
     sort: { key: null, dir: 'desc' }, // R3a/ P1-2：结果表排序（key: 'quality' | 'size' | null）
     sortThs: {}, // R3a/ P1-2：可排序表头的 DOM 引用（key -> { th, arrowEl }），供 syncSortIndicators 刷新箭头
+    musicdlUpstream: null, // musicdl 上游版本（PyPI 实时查询结果；deployStatus 只带缓存摘要）
+    upstreamShown: false,  // 上游提示当前是否已渲染（翻转时才重绘环境条，避免无谓打断）
     restoredSession: false, // 切回本视图时是否已灌入会话快照（只恢复一次）
     // 任务队列
     tasks: [],
@@ -707,12 +709,13 @@ function createApp(root, ctx) {
     }
     app.deploy = d;
     const usable = !!d.usable;
-    if (usable === app.mountedUsable) { updateEnvBar(); startQueuePolling(true); return; }
+    if (usable === app.mountedUsable) { updateEnvBar(); startQueuePolling(true); refreshUpstream(); return; }
     app.mountedUsable = usable;
     if (usable && (!app.sources || !app.config)) await loadMeta();
     paint();
     // ★ Bug C：两种态都要轮询 —— 部署态也据此在刷新页面后重新发现并订阅正在跑的安装任务。
     startQueuePolling(true);
+    refreshUpstream(); // 非阻塞：deployStatus 只带缓存摘要，这里再拿实时上游版本（纯提示，失败安静）
   }
 
   async function doRefreshDeploy() {
@@ -1063,7 +1066,27 @@ function createApp(root, ctx) {
     await submitTask(action, {}, true);
   }
 
-  // ------------------------------ ① 环境条（已就绪 / 可更新） ------------------------------
+  // ------------------------------ ① 环境条（已就绪 / 可更新 / 上游新版本提示） ------------------------------
+  /**
+   * musicdl 上游新版本提示（**仅 comparison==='newer' 显示**）：
+   * equal / older / 查询失败一律不渲染 —— 安静，不打扰。版本号全部来自数据。
+   */
+  function upstreamNoticeNode() {
+    const u = app.musicdlUpstream || (app.deploy && app.deploy.musicdlUpstream) || null;
+    if (!u || u.comparison !== 'newer' || !u.version) return null;
+    const installedVer = u.installedVersion
+      || (app.deploy && app.deploy.musicdl && app.deploy.musicdl.version)
+      || '未知';
+    return el('span', { class: 'music-envbar__upstream' }, [
+      ctx.ui.badge(`上游有新版本 ${u.version}（已装 ${installedVer}，MacKit 锁定 ${u.target}）`, 'warn'),
+      el('button', {
+        class: 'btn btn--sm', type: 'button', text: '升级 musicdl',
+        title: '走既有的「安装音频环境」任务（升级失败会自动回滚到锁定版本）',
+        on: { click: () => doInstall() },
+      }),
+    ]);
+  }
+
   function renderEnvBar() {
     const d = app.deploy || {};
     const meta = DEPLOY_META[d.state] || DEPLOY_META.deployed;
@@ -1078,6 +1101,7 @@ function createApp(root, ctx) {
       d.state === 'outdated'
         ? ctx.ui.badge(`可更新（目标 ${d.targetVersion}）`, 'warn')
         : ctx.ui.badge('部署正常', 'ok'),
+      upstreamNoticeNode(),
       el('span', { class: 'grow' }),
       el('button', { class: 'btn btn--sm', type: 'button', text: '重新检测', on: { click: () => doRefreshDeploy() } }),
       d.state === 'outdated'
@@ -1087,6 +1111,19 @@ function createApp(root, ctx) {
     ]);
 
     return el('div', { class: `section music-envbar music-envbar--${meta.tone}` }, [row]);
+  }
+
+  /**
+   * 非阻塞刷新 musicdl 上游版本（纯提示，任何失败都安静）。
+   * deployStatus 自带的缓存摘要先显示（app.deploy.musicdlUpstream），这里再拿实时结果覆盖。
+   */
+  async function refreshUpstream() {
+    let u = null;
+    try { u = await api('GET', '/api/music/musicdlUpstream'); } catch { u = null; }
+    app.musicdlUpstream = (u && u.fetchOk) ? u : null;
+    // 仅在「要不要显示提示」发生翻转时重绘环境条，避免无谓地打断用户操作
+    const show = !!upstreamNoticeNode();
+    if (show !== app.upstreamShown) { app.upstreamShown = show; updateEnvBar(); }
   }
 
   /** 只替换环境条内容（可用性未变时避免整页重绘、丢失搜索态）。 */

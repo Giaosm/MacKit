@@ -433,6 +433,9 @@ label.check { display: inline-flex; align-items: center; gap: var(--space-2); cu
 .music-envbar--ok { border-left: 3px solid var(--ok); }
 .music-envbar--warn { border-left: 3px solid var(--warn); }
 .music-envbar--err { border-left: 3px solid var(--err); }
+/* musicdl 上游新版本提示：badge（warn 配色，ctx.ui.badge 自带）+ btn--sm 内联在行内；
+   仅约束容器排布 —— 严禁 sticky / fixed / z-index / 浮层（项目红线）。 */
+.music-envbar__upstream { display: inline-flex; align-items: center; gap: var(--space-2); }
 
 /* ① 部署区（未部署 / 损坏） */
 .music-deploy { border-radius: var(--radius); }
