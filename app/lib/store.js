@@ -27,16 +27,29 @@ const MACKIT_DEFAULTS = Object.freeze({
   musicSources: null,
   // 是否随音频同时保存歌词 .lrc（musicdl 自动旁写；false = 下载后删除旁车歌词）
   musicSaveLyrics: true,
+  // 增强搜索（实验）：走 musicsquare 式第三方代理 API（更快、对「歌手 - 歌名」组合更宽容），
+  // 但强依赖外部社区代理，默认关闭，保持「离线 / 零依赖」红线。
+  musicEnhancedSearch: false,
   // R0 · 代理配置（v2 增量）：代理地址来源 + 自定义 HTTP / SOCKS5 地址（均 `host:port`，不带 scheme）
   // ★ 与上面 4 个键同口径：**默认值 / 读取 / 写入三处缺一不可**，否则「保存了但没生效」。
   musicProxySource: 'homebrew',
   musicProxyHttp: '',
   musicProxySocks5: '',
+  // 在线播放 / 边听边存：音频缓存容量上限（MB，默认 1024，可调 128–5120）
+  musicCacheMaxMb: 1024,
+  // 下载并发度（默认 3，可调 1–5）；=1 时与「每曲一步」的历史行为一致
+  musicDownloadConcurrency: 3,
 });
 /** 音乐模块可选的网络通道策略（auto = 直连，必要时由用户手动切代理） */
 const MUSIC_CHANNELS = Object.freeze(['auto', 'direct', 'proxy']);
 /** 音乐模块代理地址来源（v2）：跟随 Homebrew 或自定义 */
 const MUSIC_PROXY_SOURCES = Object.freeze(['homebrew', 'custom']);
+/** 音频缓存容量（MB）可调区间 */
+export const MUSIC_CACHE_MB_MIN = 128;
+export const MUSIC_CACHE_MB_MAX = 5120;
+/** 下载并发度可调区间 */
+export const MUSIC_CONCURRENCY_MIN = 1;
+export const MUSIC_CONCURRENCY_MAX = 5;
 /**
  * 代理地址校验正则：`host:port`。
  * host 允许 IPv4 / 主机名（`[A-Za-z0-9.\-]+`），port 为 1–5 位数字（范围另判 1–65535）。
@@ -103,6 +116,21 @@ function listFiles(dir, ext) {
       .filter((n) => (ext ? n.endsWith(ext) : true))
       .map((n) => path.join(dir, n));
   } catch { return []; }
+}
+
+/**
+ * 把任意输入夹取为 [min,max] 内的整数。
+ * 非数 / NaN / Infinity → 回落 fallback（用于读取容错：**绝不用非法值覆盖默认**）。
+ * @param {unknown} value
+ * @param {number} min
+ * @param {number} max
+ * @param {number} fallback
+ * @returns {number}
+ */
+function clampInt(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
 }
 
 // ---------------------- ~/.brewgo_config（事实源，格式不变） ----------------------
@@ -268,11 +296,16 @@ export function readMackit() {
     musicSources: Array.isArray(raw.musicSources)
       ? raw.musicSources.filter((s) => typeof s === 'string' && s.length > 0) : MACKIT_DEFAULTS.musicSources,
     musicSaveLyrics: raw.musicSaveLyrics !== false,
+    // 增强搜索（实验）：默认 false；true = 搜索走第三方代理 API（更快、组合词更宽容，但依赖外部服务）
+    musicEnhancedSearch: raw.musicEnhancedSearch === true,
     // R0 · 代理三键（容错读出）：枚举外回落 homebrew；地址经 normalizeProxyAddr 归一（非法即视为空）。
     musicProxySource: MUSIC_PROXY_SOURCES.includes(raw.musicProxySource)
       ? raw.musicProxySource : MACKIT_DEFAULTS.musicProxySource,
     musicProxyHttp: normalizeProxyAddr(raw.musicProxyHttp),
     musicProxySocks5: normalizeProxyAddr(raw.musicProxySocks5),
+    // 音频缓存容量上限（MB）与下载并发度：读取时夹取到合法区间，非法/缺失一律回落默认值。
+    musicCacheMaxMb: clampInt(raw.musicCacheMaxMb, MUSIC_CACHE_MB_MIN, MUSIC_CACHE_MB_MAX, MACKIT_DEFAULTS.musicCacheMaxMb),
+    musicDownloadConcurrency: clampInt(raw.musicDownloadConcurrency, MUSIC_CONCURRENCY_MIN, MUSIC_CONCURRENCY_MAX, MACKIT_DEFAULTS.musicDownloadConcurrency),
     version: 1,
   };
 }
@@ -313,6 +346,9 @@ export function writeMackit(patch = {}) {
   if (patch.musicSaveLyrics !== undefined && typeof patch.musicSaveLyrics === 'boolean') {
     next.musicSaveLyrics = patch.musicSaveLyrics;
   }
+  if (patch.musicEnhancedSearch !== undefined && typeof patch.musicEnhancedSearch === 'boolean') {
+    next.musicEnhancedSearch = patch.musicEnhancedSearch;
+  }
   // R0 · 代理三键（v2）：写入 + 校验。**仅当本次 patch 含任一代理字段时才校验**，
   // 避免「保存下载目录」这类无关 patch 因存量非法值被误拦。
   if (patch.musicProxySource !== undefined || patch.musicProxyHttp !== undefined || patch.musicProxySocks5 !== undefined) {
@@ -336,6 +372,19 @@ export function writeMackit(patch = {}) {
     next.musicProxySource = source;
     next.musicProxyHttp = http;
     next.musicProxySocks5 = socks;
+  }
+  // 在线播放缓存上限（MB）与下载并发度：非法值回落**当前值**（不抛错，也不写坏），合法值夹取到区间。
+  if (patch.musicCacheMaxMb !== undefined) {
+    const n = Number(patch.musicCacheMaxMb);
+    next.musicCacheMaxMb = Number.isFinite(n)
+      ? clampInt(n, MUSIC_CACHE_MB_MIN, MUSIC_CACHE_MB_MAX, cur.musicCacheMaxMb)
+      : cur.musicCacheMaxMb;
+  }
+  if (patch.musicDownloadConcurrency !== undefined) {
+    const n = Number(patch.musicDownloadConcurrency);
+    next.musicDownloadConcurrency = Number.isFinite(n)
+      ? clampInt(n, MUSIC_CONCURRENCY_MIN, MUSIC_CONCURRENCY_MAX, cur.musicDownloadConcurrency)
+      : cur.musicDownloadConcurrency;
   }
   next.version = 1;
 

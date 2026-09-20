@@ -27,6 +27,12 @@ import * as env from './lib/env.js';
 import { AppError, ERR, toErrObj, hasLiveChildren } from './lib/exec.js';
 import { DAV_ERR, urlHasCredentials } from './lib/webdav.js';
 import { parseReqUrl } from './lib/requrl.js';
+import {
+  openUpstream,
+  buildStreamResponseHeaders,
+  buildCoverResponseHeaders,
+  parseRangeHeader,
+} from './lib/music/stream.js';
 
 /** 版本号（读取 package.json，失败回落）。 */
 function readVersion() {
@@ -220,6 +226,116 @@ function handleSse(req, res, taskId, url) {
   req.on('close', cleanup);
 }
 
+// ------------------------------ 音乐：在线播放 / 封面 / 歌词 ------------------------------
+/**
+ * 把上游响应流式透传给客户端：统一的 `writeHead` + 错误/关闭收尾 + `pipe`。
+ *
+ * 抽出 handleMusicStream / handleMusicCover 共享的骨架，保证 status / header / abort 语义一致：
+ * 任何一路（上游 error / 客户端 close）触发即 `abort()` 上游、跑一次 `onCleanup`、`res.end()` 收尾。
+ * @param {{abort:()=>void, stream:NodeJS.ReadableStream}} upstream openUpstream 的返回值
+ * @param {import('node:http').ServerResponse} res
+ * @param {{status:number, headers:Record<string,string>, onData?:(chunk:Buffer)=>void, onEnd?:()=>void, onCleanup?:()=>void}} opts
+ */
+function pipeUpstream(upstream, res, opts) {
+  let closed = false;
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    try { upstream.abort(); } catch { /* ignore */ }
+    if (opts.onCleanup) { try { opts.onCleanup(); } catch { /* ignore */ } }
+    try { res.end(); } catch { /* ignore */ } // 上游中断（error）时收尾响应
+  };
+  res.writeHead(opts.status, opts.headers);
+  if (opts.onData) upstream.stream.on('data', opts.onData);
+  if (opts.onEnd) upstream.stream.on('end', opts.onEnd);
+  upstream.stream.on('error', cleanup);
+  res.on('close', cleanup);
+  upstream.stream.pipe(res);
+}
+
+/**
+ * 处理 `GET /api/music/stream/:id/:uid`。
+ *
+ * ★ 成功 = **裸二进制流**（不走 `{ok,data}` 包络）；失败 = JSON 包络。
+ * ★ SSRF 口径：url 只来自「快照内 uid 解析结果」（`streamMeta` 查询），路由**绝不接受任何外部 url 入参**。
+ * ★ 边听边存：仅整段播放（无 Range 或 Range 从 0 起）才 tee 到 `MUSIC_AUDIO_CACHE_DIR/<key>.part`，结束 rename。
+ */
+async function handleMusicStream(req, res, id, uid) {
+  const meta = await queryModule('music', 'streamMeta', { id, uid });
+  const range = req.headers.range;
+  const up = await openUpstream({
+    url: meta.url,
+    headers: meta.headers,
+    range,
+    channel: meta.channel,
+    proxies: meta.proxies,
+  });
+  if (up.status >= 400) {
+    try { up.abort(); } catch { /* ignore */ }
+    throw new AppError(ERR.CMD_FAILED, `上游返回错误状态（${up.status}）`);
+  }
+  if (up.status !== 200 && up.status !== 206) {
+    // 仅承认 200（整段）与 206（Range）为成功；重定向 / 1xx 等一律按上游异常处理。
+    try { up.abort(); } catch { /* ignore */ }
+    throw new AppError(ERR.CMD_FAILED, `上游返回非预期状态（${up.status}）`);
+  }
+
+  const built = buildStreamResponseHeaders({ status: up.status, upstreamHeaders: up.headers, ext: meta.ext });
+
+  // 边听边存：仅整段播放才缓存（Range 分片不落缓存）。
+  const parsedRange = parseRangeHeader(range);
+  const isFull = !range || !!(parsedRange && parsedRange.isFull);
+  let cacheStream = null;
+  let partPath = null;
+  let finalPath = null;
+  let finalized = false;
+  if (isFull && meta.cacheKey) {
+    try {
+      fs.mkdirSync(paths.MUSIC_AUDIO_CACHE_DIR, { recursive: true });
+      finalPath = path.join(paths.MUSIC_AUDIO_CACHE_DIR, meta.cacheKey);
+      partPath = `${finalPath}.part`;
+      cacheStream = fs.createWriteStream(partPath);
+      cacheStream.on('error', () => { try { cacheStream.destroy(); } catch { /* ignore */ } cacheStream = null; });
+    } catch { cacheStream = null; }
+  }
+
+  pipeUpstream(up, res, {
+    status: built.status,
+    headers: built.headers,
+    onData: (chunk) => { if (cacheStream) { try { cacheStream.write(chunk); } catch { /* ignore */ } } },
+    onEnd: () => {
+      if (cacheStream && partPath && finalPath) {
+        cacheStream.end(() => {
+          try { fs.rmSync(finalPath, { force: true }); fs.renameSync(partPath, finalPath); finalized = true; }
+          catch { /* ignore —— 缓存失败不影响播放 */ }
+        });
+      }
+    },
+    onCleanup: () => {
+      if (!finalized) {
+        if (cacheStream) { try { cacheStream.destroy(); } catch { /* ignore */ } }
+        if (partPath) { try { fs.rmSync(partPath, { force: true }); } catch { /* ignore */ } }
+      }
+    },
+  });
+}
+
+/**
+ * 处理 `GET /api/music/cover/:id/:uid`：成功 = 图片字节（透传 Content-Type）+ 长缓存；无封面 / uid 不存在 = 404。
+ * 同样遵守 SSRF 口径（封面 url 只来自快照解析结果）。
+ */
+async function handleMusicCover(req, res, id, uid) {
+  const meta = await queryModule('music', 'streamMeta', { id, uid });
+  if (!meta.hasCover || !meta.coverUrl) throw new AppError(ERR.NOT_FOUND, '该曲目没有可用封面');
+  const up = await openUpstream({ url: meta.coverUrl, headers: {}, channel: meta.channel, proxies: meta.proxies });
+  if (up.status < 200 || up.status >= 300) {
+    try { up.abort(); } catch { /* ignore */ }
+    throw new AppError(ERR.CMD_FAILED, `封面拉取失败（${up.status}）`);
+  }
+  const headers = buildCoverResponseHeaders(up.headers);
+  pipeUpstream(up, res, { status: 200, headers });
+}
+
 // ------------------------------ 路由 ------------------------------
 
 /**
@@ -384,11 +500,18 @@ async function handleApi(req, res, url) {
       musicChannel: body.channel,
       musicSources: body.sources,
       musicSaveLyrics: body.saveLyrics,
+      // 增强搜索（实验）：true = 搜索走第三方代理 API（更快、组合词更宽容，但依赖外部服务）
+      musicEnhancedSearch: body.enhancedSearch,
       // R0 · 代理配置（v2）：透传三个新增字段；非法地址由 writeMackit 抛 PARSE_FAILED → 422 且不写盘
       musicProxySource: body.proxySource,
       musicProxyHttp: body.proxyHttp,
       musicProxySocks5: body.proxySocks5,
+      // 在线播放缓存上限（MB）与下载并发度：非法值由 writeMackit 回落当前值（不抛错）
+      musicCacheMaxMb: body.cacheMaxMb,
+      musicDownloadConcurrency: body.downloadConcurrency,
     });
+    // 缓存上限可能被调小 → 立即按新上限裁剪音频缓存（best-effort，失败不影响响应）。
+    try { await queryModule('music', 'pruneAudio', {}); } catch { /* 模块缺失 / 失败忽略 */ }
     ok(res, await queryModule('music', 'config', {}));
     return;
   }
@@ -443,6 +566,32 @@ async function handleApi(req, res, url) {
     ok(res, await queryModule('music', 'searchPoll', {
       id: safeDecode(playlistPollMatch[1], '未找到该会话'),
       since: Number.parseInt(url.searchParams.get('since') || '0', 10) || 0,
+    }));
+    return;
+  }
+
+  // 在线播放 / 封面 / 歌词（音乐）：id、uid 由 safeDecode 解码（沿用既有方式），
+  // 模块内再校验 id 规则；url 一律由快照 uid 解析，**绝不接受任何外部 url 入参**（SSRF 口径）。
+  const musicStreamMatch = /^\/api\/music\/stream\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (method === 'GET' && musicStreamMatch) {
+    await handleMusicStream(req, res,
+      safeDecode(musicStreamMatch[1], '未找到该歌曲'),
+      safeDecode(musicStreamMatch[2], '未找到该歌曲'));
+    return;
+  }
+  const musicCoverMatch = /^\/api\/music\/cover\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (method === 'GET' && musicCoverMatch) {
+    await handleMusicCover(req, res,
+      safeDecode(musicCoverMatch[1], '未找到该歌曲'),
+      safeDecode(musicCoverMatch[2], '未找到该歌曲'));
+    return;
+  }
+  const musicLyricMatch = /^\/api\/music\/lyric\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (method === 'GET' && musicLyricMatch) {
+    // 歌词**全程 JSON 包络**：{ok:true, data:{has, synced, lrc}}；uid 不存在 → 404。
+    ok(res, await queryModule('music', 'lyric', {
+      id: safeDecode(musicLyricMatch[1], '未找到该歌曲'),
+      uid: safeDecode(musicLyricMatch[2], '未找到该歌曲'),
     }));
     return;
   }
@@ -665,6 +814,8 @@ async function main() {
   paths.ensureDirs();
   removeRuntime(); // 清理上一次可能残留的运行态
   await loadModules();
+  // 音乐音频缓存：启动时按配置上限裁剪一次（best-effort，绝不影响服务启动）。
+  try { await queryModule('music', 'pruneAudio', {}); } catch { /* 模块缺失 / 失败忽略 */ }
   server = http.createServer(handler);
 
   let port = paths.DEFAULT_PORT;

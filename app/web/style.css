@@ -584,4 +584,96 @@ label.check { display: inline-flex; align-items: center; gap: var(--space-2); cu
 .music-proxy__hint { font-size: 13px; }
 .music-proxy__acts { margin-top: var(--space-3); }
 
+/* ③c 结果表：封面缩略图列 + 试听列（C2 行内封面 / C1 行内 ▷） */
+.music-table .music-col-cover { width: 48px; }
+.music-table .music-col-play { width: 56px; text-align: center; }
+.music-cover-thumb {
+  display: block; width: 36px; height: 36px;
+  border-radius: var(--radius-sm); object-fit: cover; background: var(--bg-sunken);
+}
+.music-cover-thumb.is-empty {
+  display: grid; place-items: center;
+  border: 1px dashed var(--border); color: var(--fg-muted); font-size: 14px;
+}
+.music-cover-thumb.is-empty::after { content: '♪'; opacity: .6; }
+.music-playbtn { font-size: 13px; line-height: 1; }
+.music-playbtn:disabled { opacity: .35; cursor: not-allowed; }
+.music-playbtn--lg { font-size: 18px; padding: var(--space-1) var(--space-2); }
+
+/* ⑤ 性能设置（C3）：紧凑数字输入 + 行内标签 */
+.music-setrow { gap: var(--space-2); }
+.music-num {
+  width: 96px; flex: none;
+}
+
+/* ★ 播放条（C1）：内嵌在「结果」卡里（工具行与表头之间），是卡片的普通一行 ——
+   **不做 sticky / fixed**（用户明确要求：不要悬浮感，随页面正常滚动）。
+   故不要加 position / top / z-index / box-shadow / backdrop-filter。 */
+.music-player {
+  margin: 0 0 var(--space-3);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-elev);
+}
+.music-player__row {
+  display: flex; align-items: center; gap: var(--space-3);
+  padding: var(--space-2) var(--space-3); flex-wrap: wrap;
+}
+
+/* 内联单行歌词（进度条下方整行）：显示当前一句 */
+.music-np__lyric {
+  margin-top: var(--space-1);
+  padding: 0 var(--space-3) var(--space-2);
+  font-size: 13px; text-align: center;
+  color: var(--accent);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.music-np__lyric.is-muted { color: var(--fg-muted); font-size: 12px; }
+.music-np__lyric.is-hidden { display: none; }
+
+/* 当前曲目：封面 + 标题 / 歌手·专辑 */
+.music-np__coverwrap { flex: none; }
+.music-np__cover {
+  display: block; width: 44px; height: 44px;
+  border-radius: var(--radius-sm); object-fit: cover; background: var(--bg-sunken);
+}
+.music-np__cover.is-empty {
+  display: grid; place-items: center;
+  border: 1px dashed var(--border); color: var(--fg-muted);
+}
+.music-np__cover.is-empty::after { content: '♪'; opacity: .6; }
+.music-np__info { min-width: 120px; max-width: 240px; overflow: hidden; }
+.music-np__title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.music-np__meta { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 传输控制：上一首 / 播放暂停 / 下一首 */
+.music-np__controls { display: flex; align-items: center; gap: var(--space-1); flex: none; }
+
+/* 进度：当前时间 · 滑杆 · 总时长 */
+.music-prog { display: flex; align-items: center; gap: var(--space-2); flex: 1 1 260px; min-width: 200px; }
+.music-time { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--fg-muted); flex: none; }
+
+/* 右侧：音量 + 词 */
+.music-np__right { display: flex; align-items: center; gap: var(--space-2); flex: none; margin-left: auto; }
+.music-vol__label { font-size: 12px; }
+.music-vol { width: 96px; }
+.music-lyricbtn.is-active { border-color: var(--accent); color: var(--accent); }
+
+/* 原生 range 轻量美化（进度 / 音量共用；不引外链，纯 CSS） */
+.music-seek, .music-vol {
+  -webkit-appearance: none; appearance: none;
+  height: 4px; border-radius: 999px; background: var(--bg-sunken); cursor: pointer;
+}
+.music-seek { flex: 1; min-width: 120px; }
+.music-seek:disabled { opacity: .5; cursor: default; }
+.music-seek::-webkit-slider-thumb, .music-vol::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--accent); border: none; cursor: pointer;
+}
+.music-seek::-moz-range-thumb, .music-vol::-moz-range-thumb {
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--accent); border: none; cursor: pointer;
+}
+
+
 

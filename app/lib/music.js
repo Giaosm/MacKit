@@ -17,6 +17,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 import * as paths from './paths.js';
 import * as store from './store.js';
@@ -34,6 +35,15 @@ const { ERR, AppError } = exec;
 const CACHE_PREFIX = 'search-';
 /** 「查询音源」结果缓存时长（避免每次开页面都起一次 python） */
 const SOURCES_CACHE_TTL_MS = 10 * 60 * 1000;
+/** 在线播放元信息缓存：key `${id}:${uid}`，TTL 10 分钟、LRU 上限 200（避免浏览器 seek 时每个 Range 都起一次 python）。 */
+const STREAM_META_TTL_MS = 10 * 60 * 1000;
+const STREAM_META_MAX = 200;
+/** 音频缓存中 `.part` 崩溃孤儿的回收阈值：正常关闭会自删自己的 `.part`，残留超 24h 视为孤儿。 */
+const PART_ORPHAN_TTL_MS = 24 * 60 * 60 * 1000;
+/** 歌词时间轴正则（判定「同步歌词」）。 */
+const SYNCED_LRC_RE = /\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]/;
+/** stream / lyric 一次性子进程超时（只读快照解析，正常毫秒级返回）。 */
+const MUSIC_META_TIMEOUT_MS = 20_000;
 /** 下载安装类子进程超时 */
 const DOWNLOAD_TIMEOUT_MS = 900_000;
 const VENV_TIMEOUT_MS = 300_000;
@@ -55,6 +65,8 @@ const HEARTBEAT_MS = 15_000;
 const MUSICDL_TARGET_VERSION = '2.13.11';
 
 let sourcesCache = { at: 0, keys: null };
+/** 在线播放元信息内存缓存（LRU + TTL），见 STREAM_META_* 常量。 */
+const streamMetaCache = new Map();
 
 /**
  * 命名模板两套预设（R2，design v2 §A.7）——**单一事实源**由后端下发，前端不硬编码。
@@ -138,6 +150,66 @@ function cachePathFor(searchId) {
     throw new AppError(ERR.PARSE_FAILED, '搜索 id 非法');
   }
   return path.join(paths.MUSIC_SEARCH_CACHE_DIR, `${CACHE_PREFIX}${searchId}.json`);
+}
+
+/**
+ * 读取搜索快照里某 uid 的顶层记录（不深拷 clean）。
+ * 仅用于派生音频缓存键；解析失败 / 不存在返回 null（绝不抛错）。
+ * @param {string} searchId
+ * @param {string} uid
+ * @returns {object|null}
+ */
+function readSnapshotRec(searchId, uid) {
+  try {
+    const obj = JSON.parse(fs.readFileSync(cachePathFor(searchId), 'utf8'));
+    const songs = obj && obj.songs;
+    if (!songs || typeof songs !== 'object') return null;
+    const rec = songs[uid];
+    return rec && typeof rec === 'object' ? rec : null;
+  } catch { return null; }
+}
+
+/**
+ * 音频缓存键（纯函数）：由「来源 + 歌名 + 歌手 + 专辑 + 扩展名 + 文件大小」派生稳定键。
+ *
+ * `snd-<sha256(seed).slice(0,32)>.<ext>`，其中 seed 为上述字段以 `\u0000` 连接。
+ * 键与内容一一对应（同一首歌不同码率/大小 → 不同键），供边听边存与二次播放命中。
+ * @param {object|null} rec 快照记录（musicdl：顶层字段 + clean；proxy：顶层字段）
+ * @returns {string}
+ */
+export function audioCacheKey(rec) {
+  const r = rec && typeof rec === 'object' ? rec : {};
+  const source = String(r.source || '');
+  const song = String(r.song_name || '');
+  const singers = String(r.singers || '');
+  const album = String(r.album || '');
+  const ext = String(r.ext || '').replace(/^\./, '').toLowerCase();
+  // 文件大小：优先顶层（proxy 记录无 clean），回落到 clean.file_size_bytes（musicdl 记录），
+  // 以尽量区分「不同码率/大小」的同名同扩展名曲目，降低缓存键碰撞概率。
+  const size = r.filesize != null ? r.filesize
+    : (r.file_size_bytes != null ? r.file_size_bytes
+      : (r.clean && r.clean.file_size_bytes != null ? r.clean.file_size_bytes : 0));
+  const seed = [source, song, singers, album, ext, size].join('\u0000');
+  const digest = crypto.createHash('sha256').update(seed).digest('hex').slice(0, 32);
+  return `snd-${digest}.${ext || 'bin'}`;
+}
+
+/**
+ * 清理在线播放音频缓存（`~/.mackit/cache/music/audio`）。
+ *
+ * 走通用 {@link session.pruneDirByLru}：按 mtime 旧 → 新删至 `musicCacheMaxMb*1024*1024` 以内；
+ * 跳过点文件；`.part` 不计入容量预算，但 mtime 超过 24h 的（正常关闭会自删自己的 `.part`，
+ * 残留者多为崩溃孤儿）会被回收；全程静默（目录不存在 / 读取失败 / 删除失败都不打断调用方）。
+ * @returns {{removed:number, bytes:number}}
+ */
+export function pruneAudioCache() {
+  let maxBytes = 1024 * 1024 * 1024;
+  try { maxBytes = (Number(store.readMackit().musicCacheMaxMb) || 1024) * 1024 * 1024; } catch { /* 回落 1GB */ }
+  return session.pruneDirByLru(paths.MUSIC_AUDIO_CACHE_DIR, {
+    accept: (name) => !name.endsWith('.part'),
+    stalePartMs: PART_ORPHAN_TTL_MS,
+    maxBytes,
+  });
 }
 
 /**
@@ -358,6 +430,11 @@ function queryConfig() {
     channel: c.musicChannel,
     sources: c.musicSources,
     saveLyrics: c.musicSaveLyrics !== false,
+    // 在线播放 / 边听边存：音频缓存容量上限（MB）与下载并发度（B1/B2 回显）
+    cacheMaxMb: c.musicCacheMaxMb,
+    downloadConcurrency: c.musicDownloadConcurrency,
+    // 增强搜索（实验）：true 时搜索走第三方代理 API；前端据此渲染开关与状态提示
+    enhancedSearch: c.musicEnhancedSearch === true,
     templateVars: ['{歌手}', '{歌名}', '{专辑}', '{来源}', '{ext}'],
     // R0：代理配置回显（原样，供 UI 三选一/输入框回填）
     proxySource: c.musicProxySource,
@@ -398,6 +475,8 @@ async function querySearch(params = {}) {
     sources,
     perSource: Number.isInteger(params.perSource) ? params.perSource : undefined,
     threads: Number.isInteger(params.threads) ? params.threads : undefined,
+    // 增强搜索（实验）：true 时 bridge 走 musicsquare 式第三方代理后端
+    enhanced: params.enhanced === true,
     channel: ch.channel,
     proxies: ch.proxies,
     subprocEnv: ch.subprocEnv,
@@ -491,6 +570,108 @@ async function queryChooseFolder() {
   const dir = out.startsWith('OK:') ? out.slice(3).trim() : out;
   if (!dir) throw new AppError(ERR.CMD_FAILED, '未获取到目录路径，请手动输入');
   return { cancelled: false, path: dir, writable: dirWritable(dir) };
+}
+
+/**
+ * 在线播放元信息（内部 query，B2）：解析快照直链 + 请求头，供 stream 路由使用。
+ *
+ * ★ 命中内存 TTL 缓存则直接返回，避免浏览器 seek 时每个 Range 都起一次 python。
+ * ★ SSRF：只读「快照内 uid」的解析结果，绝不接受任何外部 url 入参；仅 http/https（bridge 侧保证）。
+ * @param {{id?:string, uid?:string}} params
+ * @returns {Promise<{url:string, ext:string, protocol:'HTTP'|'HLS', headers:object,
+ *                    hasCover:boolean, coverUrl:string|null, size:number,
+ *                    cacheKey:string, channel:'direct'|'proxy', proxies:object|null}>}
+ */
+async function queryStreamMeta(params = {}) {
+  const id = String(params.id || '');
+  const uid = String(params.uid || '');
+  if (!session.SEARCH_ID_RE.test(id)) throw new AppError(ERR.PARSE_FAILED, '搜索 id 非法');
+  if (!uid) throw new AppError(ERR.PARSE_FAILED, '缺少 uid');
+
+  const ck = `${id}:${uid}`;
+  const now = Date.now();
+  const hit = streamMetaCache.get(ck);
+  if (hit && now - hit.at < STREAM_META_TTL_MS) {
+    streamMetaCache.delete(ck);
+    streamMetaCache.set(ck, hit); // LRU touch
+    return hit.meta;
+  }
+
+  const cachePath = cachePathFor(id);
+  const res = await exec.runSafe(paths.MUSIC_VENV_PY, [paths.MUSIC_BRIDGE, 'stream'], {
+    stdin: JSON.stringify({ command: 'stream', uid, cache_path: cachePath }),
+    noMirror: true,
+    timeoutMs: MUSIC_META_TIMEOUT_MS,
+  });
+  let done = null;
+  let fatal = null;
+  for (const line of paths.lines(res.stdout)) {
+    const ev = parseLine(line);
+    if (!ev) continue;
+    if (ev.ev === 'error') fatal = ev;
+    else if (ev.ev === 'done' && ev.command === 'stream') done = ev;
+  }
+  if (fatal) throw toAppError(fatal);
+  if (!done) throw new AppError(ERR.CMD_FAILED, '未能解析播放直链', tail(res.stderr || res.stdout));
+
+  const ch = resolveProxy();
+  const meta = {
+    url: String(done.url || ''),
+    ext: String(done.ext || '').replace(/^\./, ''),
+    protocol: done.protocol === 'HLS' ? 'HLS' : 'HTTP',
+    headers: done.headers && typeof done.headers === 'object' ? done.headers : {},
+    hasCover: !!done.has_cover,
+    coverUrl: typeof done.cover_url === 'string' && done.cover_url ? done.cover_url : null,
+    size: Number.isFinite(done.size) ? done.size : 0,
+    cacheKey: audioCacheKey(readSnapshotRec(id, uid)),
+    channel: ch.channel,
+    proxies: ch.proxies,
+  };
+  if (!meta.url) throw new AppError(ERR.CMD_FAILED, '无可用在线播放直链');
+
+  streamMetaCache.set(ck, { meta, at: now });
+  while (streamMetaCache.size > STREAM_META_MAX) {
+    const oldest = streamMetaCache.keys().next().value;
+    streamMetaCache.delete(oldest);
+  }
+  return meta;
+}
+
+/**
+ * 歌词查询（内部 query）：从快照取词，返回 `{has, synced, lrc}`。
+ * @param {{id?:string, uid?:string}} params
+ * @returns {Promise<{has:boolean, synced:boolean, lrc:string}>}
+ */
+async function queryLyric(params = {}) {
+  const id = String(params.id || '');
+  const uid = String(params.uid || '');
+  if (!session.SEARCH_ID_RE.test(id)) throw new AppError(ERR.PARSE_FAILED, '搜索 id 非法');
+  if (!uid) throw new AppError(ERR.PARSE_FAILED, '缺少 uid');
+
+  const cachePath = cachePathFor(id);
+  const res = await exec.runSafe(paths.MUSIC_VENV_PY, [paths.MUSIC_BRIDGE, 'lyric'], {
+    stdin: JSON.stringify({ command: 'lyric', uid, cache_path: cachePath }),
+    noMirror: true,
+    timeoutMs: MUSIC_META_TIMEOUT_MS,
+  });
+  let done = null;
+  let fatal = null;
+  for (const line of paths.lines(res.stdout)) {
+    const ev = parseLine(line);
+    if (!ev) continue;
+    if (ev.ev === 'error') fatal = ev;
+    else if (ev.ev === 'done' && ev.command === 'lyric') done = ev;
+  }
+  if (fatal) throw toAppError(fatal);
+  if (!done) throw new AppError(ERR.CMD_FAILED, '未能读取歌词', tail(res.stderr || res.stdout));
+
+  const lrc = typeof done.lrc === 'string' && done.lrc ? done.lrc : '';
+  return { has: !!(done.has && lrc), synced: !!lrc && SYNCED_LRC_RE.test(lrc), lrc };
+}
+
+/** 音频缓存清理（内部 query）：启动 / 配置变更时由 server.js 触发。 */
+function queryPruneAudio() {
+  return pruneAudioCache();
 }
 
 // ------------------------------ 动作步骤 ------------------------------
@@ -676,10 +857,75 @@ function removeEnvStep() {
 }
 
 /**
- * 单曲下载步骤（一曲一步：每步一个 bridge 子进程）。
+ * 单曲下载（一个 bridge 子进程 → 一首歌）。
+ *
+ * 成功返回 'ok'，被跳过返回 'skip'；**失败抛错**（由调用方决定「是否拖垮整步」：
+ * concurrency=1 时抛出即步骤失败；批量并发时由批量步自行吞掉单曲失败）。
+ * @param {object} ctx runner 步骤上下文（含 ctx.exec / ctx.log）
+ * @param {string} uid
+ * @param {{searchId:string, dir:string, template:string, saveLyrics:boolean}} t
+ * @returns {Promise<'ok'|'skip'>}
+ */
+async function downloadSingle(ctx, uid, t) {
+  await requireReady();
+  const ch = resolveProxy();
+  const cachePath = cachePathFor(t.searchId);
+  const payload = {
+    command: 'download',
+    search_id: t.searchId,
+    cache_path: cachePath,
+    uids: [uid],
+    dir: t.dir,
+    template: t.template,
+    save_lyrics: t.saveLyrics !== false,
+    channel: ch.channel,
+    proxies: ch.proxies,
+  };
+  let fatal = null;
+  /** @type {object[]} */
+  const results = [];
+  const res = await ctx.exec.run(paths.MUSIC_VENV_PY, [paths.MUSIC_BRIDGE, 'download'], {
+    stdin: JSON.stringify(payload),
+    noMirror: true,
+    channel: ch.channel,
+    env: ch.subprocEnv, // ★ A-6：环境变量代理（HLS 子下载器 / trust_env 裸 requests），只摘 all_proxy
+    onLine: (line, which) => {
+      if (which === 'stdout') {
+        const ev = parseLine(line);
+        if (!ev) return;
+        if (ev.ev === 'result') results.push(ev);
+        else if (ev.ev === 'error') fatal = ev;
+      } else {
+        const text = String(line || '').trim();
+        if (text) ctx.log('warn', text);
+      }
+    },
+  });
+  if (fatal) throw toAppError(fatal);
+  if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, '下载子进程异常退出', tail(res.stderr));
+
+  const mine = results.find((r) => r.uid === uid) || results[0];
+  if (!mine) throw new AppError(ERR.CMD_FAILED, '下载未返回结果');
+  if (mine.status === 'ok') {
+    // R3a-2：日志四要素「编码 · 码率 · 采样率 · 大小」，缺项以 — 占位（C7）
+    const quality = [
+      fmtCodec(mine.codec),
+      fmtMeasuredBitrate(mine.bitrate),
+      fmtSamplerate(mine.samplerate),
+      fmtBytes(mine.bytes),
+    ].join(' · ');
+    ctx.log('ok', `已下载：${mine.file}（${quality}${mine.lyrics ? ' · 含歌词' : ''}）`);
+    return 'ok';
+  }
+  if (mine.status === 'skip') return 'skip';
+  throw new AppError(ERR.CMD_FAILED, `下载失败：${mine.error || '未知原因'}`);
+}
+
+/**
+ * 单曲下载步骤（**concurrency=1 时使用**：每曲一步，与历史行为完全一致）。
  * @param {number} i 序号
  * @param {string} uid 曲目 uid
- * @param {{searchId:string, dir:string, template:string}} t 下载上下文
+ * @param {{searchId:string, dir:string, template:string, saveLyrics:boolean}} t 下载上下文
  */
 function downloadStep(i, uid, t) {
   return {
@@ -687,58 +933,74 @@ function downloadStep(i, uid, t) {
     title: `下载曲目 ${i + 1}`,
     timeoutMs: DOWNLOAD_TIMEOUT_MS,
     run: async (ctx) => {
-      await requireReady();
-      const ch = resolveProxy();
-      const cachePath = cachePathFor(t.searchId);
-      const payload = {
-        command: 'download',
-        search_id: t.searchId,
-        cache_path: cachePath,
-        uids: [uid],
-        dir: t.dir,
-        template: t.template,
-        save_lyrics: t.saveLyrics !== false,
-        channel: ch.channel,
-        proxies: ch.proxies,
-      };
-      let fatal = null;
-      /** @type {object[]} */
-      const results = [];
-      const res = await ctx.exec.run(paths.MUSIC_VENV_PY, [paths.MUSIC_BRIDGE, 'download'], {
-        stdin: JSON.stringify(payload),
-        noMirror: true,
-        channel: ch.channel,
-        env: ch.subprocEnv, // ★ A-6：环境变量代理（HLS 子下载器 / trust_env 裸 requests），只摘 all_proxy
-        onLine: (line, which) => {
-          if (which === 'stdout') {
-            const ev = parseLine(line);
-            if (!ev) return;
-            if (ev.ev === 'result') results.push(ev);
-            else if (ev.ev === 'error') fatal = ev;
-          } else {
-            const text = String(line || '').trim();
-            if (text) ctx.log('warn', text);
-          }
-        },
-      });
-      if (fatal) throw toAppError(fatal);
-      if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, '下载子进程异常退出', tail(res.stderr));
+      const r = await downloadSingle(ctx, uid, t);
+      if (r === 'skip') throw new AppError('SKIP', `已跳过：${uid}`);
+    },
+  };
+}
 
-      const mine = results.find((r) => r.uid === uid) || results[0];
-      if (!mine) throw new AppError(ERR.CMD_FAILED, '下载未返回结果');
-      if (mine.status === 'ok') {
-        // R3a-2：日志四要素「编码 · 码率 · 采样率 · 大小」，缺项以 — 占位（C7）
-        const quality = [
-          fmtCodec(mine.codec),
-          fmtMeasuredBitrate(mine.bitrate),
-          fmtSamplerate(mine.samplerate),
-          fmtBytes(mine.bytes),
-        ].join(' · ');
-        ctx.log('ok', `已下载：${mine.file}（${quality}${mine.lyrics ? ' · 含歌词' : ''}）`);
-        return;
+/** 读取下载并发度（配置缺失/非法一律回落 1 = 每曲一步）。 */
+function readDownloadConcurrency() {
+  try {
+    const n = Number(store.readMackit().musicDownloadConcurrency);
+    if (Number.isFinite(n)) return Math.min(5, Math.max(1, Math.trunc(n)));
+  } catch { /* 回落 1 */ }
+  return 1;
+}
+
+/**
+ * 固定并发子进程池：把 items 分给至多 size 个 worker 并发跑。
+ * worker 必须自行吞掉异常（否则会中断整轮 Promise.all）——本函数只保证调度。
+ * @param {any[]} items
+ * @param {number} size
+ * @param {(item:any) => Promise<void>} worker
+ */
+async function runPool(items, size, worker) {
+  const queue = items.slice();
+  const n = Math.max(1, Math.min(Math.trunc(size) || 1, queue.length));
+  const runners = [];
+  for (let i = 0; i < n; i++) {
+    runners.push((async () => {
+      while (queue.length > 0) {
+        const item = queue.shift();
+        await worker(item);
       }
-      if (mine.status === 'skip') throw new AppError('SKIP', `已跳过：${uid}`);
-      throw new AppError(ERR.CMD_FAILED, `下载失败：${mine.error || '未知原因'}`);
+    })());
+  }
+  await Promise.all(runners);
+}
+
+/**
+ * 批量下载步骤（**concurrency>1 时使用**）：一批 uids 并发跑（子进程池 = concurrency）。
+ *
+ * 计数口径沿用 runner.countSteps（**以步为单位**）：本批只要有一首成功或被跳过，就不算整步失败；
+ * 仅当**整批全失败**时抛错（与 finalizeDownloads「全部失败才算失败」的口径一致）。
+ * @param {number} idx 批序号
+ * @param {string[]} batch 本批 uids
+ * @param {object} t 下载上下文
+ * @param {number} concurrency 并发度
+ */
+function downloadBatchStep(idx, batch, t, concurrency) {
+  return {
+    id: `dl_batch_${idx}`,
+    title: batch.length > 1 ? `下载曲目 ${idx * concurrency + 1}–${idx * concurrency + batch.length}` : `下载曲目 ${idx * concurrency + 1}`,
+    timeoutMs: DOWNLOAD_TIMEOUT_MS,
+    run: async (ctx) => {
+      /** @type {Array<'ok'|'skip'|'fail'>} */
+      const outcomes = [];
+      await runPool(batch, concurrency, async (uid) => {
+        try {
+          outcomes.push(await downloadSingle(ctx, uid, t));
+        } catch (err) {
+          if (err && err.code === 'SKIP') { outcomes.push('skip'); return; }
+          outcomes.push('fail');
+          ctx.log('error', `下载失败：${uid} —— ${(err && err.message) || err}`);
+        }
+      });
+      const anySuccessOrSkip = outcomes.some((o) => o === 'ok' || o === 'skip');
+      if (!anySuccessOrSkip && outcomes.length > 0) {
+        throw new AppError(ERR.CMD_FAILED, '本批曲目全部下载失败');
+      }
     },
   };
 }
@@ -753,7 +1015,13 @@ function downloadSteps(params) {
 
   const { dir, template, saveLyrics } = resolveTargets(params);
   const t = { searchId, dir, template, saveLyrics };
-  return uids.map((uid, i) => downloadStep(i, uid, t));
+
+  const concurrency = readDownloadConcurrency();
+  // ★ E1：concurrency=1 → 「每曲一步」与现状完全一致；>1 → 按并发度切批，批内子进程池并发。
+  if (concurrency <= 1) return uids.map((uid, i) => downloadStep(i, uid, t));
+  const batches = [];
+  for (let i = 0; i < uids.length; i += concurrency) batches.push(uids.slice(i, i + concurrency));
+  return batches.map((batch, idx) => downloadBatchStep(idx, batch, t, concurrency));
 }
 
 /** 下载类动作终态：只要不是「全部失败」即算成功（复用 runner.countSteps 口径，§3.3）。 */
@@ -858,6 +1126,10 @@ export default {
     searchCancel: querySearchCancel,
     playlist: queryPlaylist,
     chooseFolder: queryChooseFolder,
+    // 在线播放：元信息（内部）+ 歌词 + 缓存清理（启动 / 配置变更触发）
+    streamMeta: queryStreamMeta,
+    lyric: queryLyric,
+    pruneAudio: queryPruneAudio,
   },
   /**
    * 优雅退出钩子（server.js gracefulShutdown 经 registry 可选调用）：

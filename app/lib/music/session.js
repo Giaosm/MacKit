@@ -64,6 +64,71 @@ function sweepTtl() {
 }
 
 /**
+ * 通用「目录按 mtime 的 LRU 清理」——音乐模块两个缓存目录共用（搜索快照 / 在线播放音频）。
+ *
+ * 读目录 → 逐项：跳过点文件 → `statSync` → ：
+ *   ① `.part` 崩溃孤儿回收：`stalePartMs>0` 且 mtime 早于 `now-stalePartMs` 的删除
+ *      （正常关闭会自删自己的 `.part`，残留超时者视为孤儿）；
+ *   ② `ttlMs>0` 且 mtime 早于 `now-ttlMs` 的删除；
+ *   ③ 其余经 `accept(name)` 过滤后归集：先按 `maxBytes`（累计 size，旧→新删至不超限）、
+ *      再按 `maxEntries`（保留 mtime 最新的 N 个）做 LRU 收敛。
+ * 目录不存在 / 读取失败 / 删除失败一律静默（绝不打断调用方）。
+ * @param {string} dir 目标目录
+ * @param {{accept?:(name:string)=>boolean, ttlMs?:number, stalePartMs?:number, maxEntries?:number, maxBytes?:number}} [opts]
+ * @returns {{removed:number, bytes:number}} 删除数 + 存活项累计字节
+ */
+export function pruneDirByLru(dir, opts = {}) {
+  const accept = typeof opts.accept === 'function' ? opts.accept : () => true;
+  const ttlMs = Number(opts.ttlMs) || 0;
+  const stalePartMs = Number(opts.stalePartMs) || 0;
+  const maxEntries = Number(opts.maxEntries) || 0;
+  const maxBytes = Number(opts.maxBytes) || 0;
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return { removed: 0, bytes: 0 }; }
+  const now = Date.now();
+  /** @type {Array<{path:string, mtime:number, size:number}>} */
+  const kept = [];
+  let total = 0;
+  let removed = 0;
+  for (const name of names) {
+    if (name.startsWith('.')) continue;
+    const full = path.join(dir, name);
+    let st;
+    try { st = fs.statSync(full); } catch { continue; }
+    if (!st.isFile()) continue;
+    // ① `.part` 崩溃孤儿回收
+    if (name.endsWith('.part') && stalePartMs > 0 && now - st.mtimeMs > stalePartMs) {
+      try { fs.rmSync(full, { force: true }); removed += 1; } catch { /* ignore */ }
+      continue;
+    }
+    if (!accept(name)) continue;
+    // ② TTL
+    if (ttlMs > 0 && now - st.mtimeMs > ttlMs) {
+      try { fs.rmSync(full, { force: true }); removed += 1; } catch { /* ignore */ }
+      continue;
+    }
+    kept.push({ path: full, mtime: st.mtimeMs, size: st.size });
+    total += st.size;
+  }
+  // ③ 尺寸预算：旧 → 新 删到累计 size ≤ maxBytes
+  if (maxBytes > 0 && total > maxBytes) {
+    kept.sort((a, b) => a.mtime - b.mtime);
+    for (const f of kept) {
+      if (total <= maxBytes) break;
+      try { fs.rmSync(f.path, { force: true }); total -= f.size; removed += 1; } catch { /* ignore */ }
+    }
+  }
+  // ④ 条目预算：保留 mtime 最新的 maxEntries 个
+  if (maxEntries > 0 && kept.length > maxEntries) {
+    kept.sort((a, b) => b.mtime - a.mtime);
+    for (const f of kept.slice(maxEntries)) {
+      try { fs.rmSync(f.path, { force: true }); removed += 1; } catch { /* ignore */ }
+    }
+  }
+  return { removed, bytes: total };
+}
+
+/**
  * 清理搜索 / 歌单快照目录（`~/.mackit/cache/music/search/search-<id>.json`）。
  *
  * 策略（设计 §3.3 快照的落盘副作用，原设计未覆盖其回收）：**7 天 TTL** 优先，
@@ -71,28 +136,11 @@ function sweepTtl() {
  * 目录不存在（从未搜过）或读取失败一律静默跳过，绝不打断会话。
  */
 function pruneSearchCache() {
-  let names;
-  try { names = fs.readdirSync(paths.MUSIC_SEARCH_CACHE_DIR); }
-  catch { return; }
-  const now = Date.now();
-  /** @type {Array<{path:string, mtime:number}>} */
-  const kept = [];
-  for (const name of names) {
-    if (!name.startsWith('search-') || !name.endsWith('.json')) continue;
-    const full = path.join(paths.MUSIC_SEARCH_CACHE_DIR, name);
-    let st;
-    try { st = fs.statSync(full); } catch { continue; }
-    if (now - st.mtimeMs > CACHE_TTL_MS) {
-      try { fs.rmSync(full, { force: true }); } catch { /* ignore */ }
-      continue;
-    }
-    kept.push({ path: full, mtime: st.mtimeMs });
-  }
-  if (kept.length <= CACHE_KEEP_FILES) return;
-  kept.sort((a, b) => b.mtime - a.mtime); // 新的在前
-  for (const f of kept.slice(CACHE_KEEP_FILES)) {
-    try { fs.rmSync(f.path, { force: true }); } catch { /* ignore */ }
-  }
+  pruneDirByLru(paths.MUSIC_SEARCH_CACHE_DIR, {
+    accept: (name) => name.startsWith('search-') && name.endsWith('.json'),
+    ttlMs: CACHE_TTL_MS,
+    maxEntries: CACHE_KEEP_FILES,
+  });
 }
 
 function pushStderr(s, line) {
@@ -110,12 +158,15 @@ function append(s, ev) {
       s.sourcesTotal = Number.isInteger(ev.sources_total) ? ev.sources_total : s.sourcesTotal;
       break;
     case 'source':
-      s.currentSource = null; // 该源已出结果（ok/fail），清除「正在搜索」指示
+      // 该源已出结果（ok/fail/timeout），从「正在搜索」集合移除
+      s.runningSources.delete(String(ev.source || ''));
+      if (s.currentSource === String(ev.source || '')) s.currentSource = null;
       if (ev.status === 'ok') s.counts.sourcesOk += 1;
       else s.counts.sourcesFail += 1;
       break;
     case 'source_start':
-      // bridge 串行搜每个源前都会先发本事件：某源挂住时前端能显示卡在谁身上
+      // 并行搜索：每个源开搜前发本事件；集合里保留所有仍在跑的源，前端据此显示「正在搜索：A / B / C」
+      s.runningSources.add(String(ev.source || ''));
       s.currentSource = String(ev.source || '');
       break;
     case 'song': {
@@ -137,6 +188,11 @@ function append(s, ev) {
         hasEpisodes: !!ev.has_episodes,
         childrenCount: Number.isFinite(ev.children_count) ? ev.children_count : 0,
       };
+      // ★ A3：在线播放口径（三处投影必须一致，见 bridge.py project_song / cmd_search_proxy）。
+      //   ★ 硬约束：download_url / 直链绝不投影进 row、绝不下发前端。
+      row.has_cover = !!ev.has_cover;
+      row.protocol = ev.protocol === 'HLS' ? 'HLS' : 'HTTP';
+      row.playable = !!ev.playable;
       s.rows.push(row);
       s.rowByUid.set(row.uid, row);
       s.counts.songs += 1;
@@ -199,6 +255,7 @@ export function start(opts) {
     rowByUid: new Map(),
     counts: { sourcesOk: 0, sourcesFail: 0, songs: 0 },
     currentSource: null,
+    runningSources: new Set(), // ★ 并行搜索：仍在跑的音源集合（source_start 加、source 出结果删）
     status: 'running',
     error: null,
     doneSeen: false,
@@ -216,6 +273,8 @@ export function start(opts) {
       command: 'playlist',
       url,
       sources,
+      // 增强搜索（实验）：true 时 bridge 走 musicsquare 式第三方代理后端
+      enhanced: opts.enhanced === true,
       channel: opts.channel === 'proxy' ? 'proxy' : 'direct',
       proxies: opts.proxies && typeof opts.proxies === 'object' ? opts.proxies : null,
       search_id: id,
@@ -227,6 +286,8 @@ export function start(opts) {
       sources,
       per_source: Number.isInteger(opts.perSource) && opts.perSource > 0 ? opts.perSource : 5,
       threads: Number.isInteger(opts.threads) && opts.threads > 0 ? opts.threads : 8,
+      // 增强搜索（实验）：true 时 bridge 走 musicsquare 式第三方代理后端
+      enhanced: opts.enhanced === true,
       channel: opts.channel === 'proxy' ? 'proxy' : 'direct',
       proxies: opts.proxies && typeof opts.proxies === 'object' ? opts.proxies : null,
       search_id: id,
@@ -304,6 +365,7 @@ export function poll(id, since) {
     rows: s.rows,
     counts: { ...s.counts },
     currentSource: s.currentSource || null,
+    currentSources: [...s.runningSources],
     error: s.error,
     nextSince: s.events.length,
     total: s.events.length,
@@ -343,14 +405,4 @@ export function cancelAllSessions() {
     try { s.controller.abort(); n += 1; } catch { /* ignore */ }
   }
   return n;
-}
-
-/** 会话快照（调试 / 测试用）。 */
-export function get(id) {
-  const s = sessions.get(id);
-  if (!s) return null;
-  return {
-    id: s.id, command: s.command, keyword: s.keyword, url: s.url, status: s.status,
-    counts: { ...s.counts }, rows: s.rows.slice(), events: s.events.length,
-  };
 }

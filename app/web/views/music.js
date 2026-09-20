@@ -67,7 +67,253 @@ function closeSource(es) {
   sseSources.delete(es);
 }
 
-/** 统一回收：所有 interval + 所有实时流 + 实时态（unmount / 重新 mount 时调用）。 */
+// ============================== 播放引擎（模块级单例，跨视图存活） ==============================
+/**
+ * 播放引擎单例：**跨视图存活** —— 切换模块不停播；切回时无缝接管 UI。
+ *
+ * 地基：app.js 用动态 `import()` 加载视图模块，同一模块只求值一次 → 顶层 `let/const` 跨切换存活；
+ *       `<audio>` 被移出文档后仍继续播放（只要 JS 持有引用）。
+ * · ui        ：当前已挂载视图的播放条 DOM 引用集合；**null = 视图未挂载（后台播放中）**。
+ * · ctx       ：最近一次 mount 的上下文（el / api / ui.toast 用；unmount 后仍保留，后台可用）。
+ * · sessId    ：**正在播放**曲目所属的 searchId（stream / lyric 路由用）。
+ * · viewSessId：当前视图结果集所属的 searchId（用于 playRow 建立播放列表）。
+ * · rows      ：当前视图结果行（供 playableTracks / 播放回退用）。
+ */
+const player = {
+  audio: null, uid: null, row: null, list: [], index: -1,
+  volume: 1, dragging: false, duration: 0, currentTime: 0, playing: false,
+  ui: null, ctx: null, sessId: null, viewSessId: null, rows: [],
+  lyric: { open: true, uid: null, lines: [], active: -1, synced: false, loading: false, error: null, cache: new Map() },
+};
+
+/**
+ * 歌词缓存上限（有界 LRU）：cache 为模块级 Map，跨视图整页存活；每播放一首就写入一条，
+ * 不设上限会在长会话里无限增长。超限时按插入序逐出最旧条目。
+ */
+const LYRIC_CACHE_MAX = 60;
+
+/** 会话快照：unmount 时保存，切回时恢复（**仅内存**，不落 localStorage）。 */
+let lastSession = null;
+/** 当前实例的 saveSession（unmount 时从模块级入口调用）。 */
+let saveSessionFn = null;
+
+/** 视图卸载时只解绑 UI 引用（**绝不** pause / 清 src / remove audio —— 后台继续播放）。 */
+function detachPlayerUI() { player.ui = null; }
+
+/** 封面路由 URL（uid 必含 `#` → 必须 encodeURIComponent）。 */
+function coverUrlFor(sessId, uid) {
+  return `/api/music/cover/${encodeURIComponent(sessId || '')}/${encodeURIComponent(uid)}`;
+}
+/** 播放路由 URL（裸二进制流；uid 必 encodeURIComponent，否则 `#` 会被当 URL 片段丢弃）。 */
+function streamUrlFor(sessId, uid) {
+  return `/api/music/stream/${encodeURIComponent(sessId || '')}/${encodeURIComponent(uid)}`;
+}
+
+/** 播放相关提示（视图未挂载时静默）。 */
+function playerToast(level, text) {
+  try { if (player.ctx && player.ctx.ui) player.ctx.ui.toast(level, text); } catch { /* ignore */ }
+}
+
+/** 惰性创建 <audio> 并绑定事件（**只建一次**，跨视图复用；元素本身不显形）。 */
+function ensureAudio() {
+  if (player.audio) return player.audio;
+  const el = player.ctx && player.ctx.el;
+  if (!el) return null; // 尚未 mount（正常流程不会：首次播放一定发生在视图内）
+  const a = el('audio', { preload: 'metadata' });
+  a.volume = player.volume;
+  a.addEventListener('play', () => { player.playing = true; syncPlayButton(); });
+  a.addEventListener('pause', () => { player.playing = false; syncPlayButton(); });
+  a.addEventListener('ended', () => playAdjacent(1)); // 放完自动下一首（视图未挂载也照走）
+  a.addEventListener('timeupdate', () => {
+    player.currentTime = a.currentTime;
+    player.duration = Number.isFinite(a.duration) ? a.duration : 0;
+    syncProgress();
+    syncLyric(); // ★ 即使视图未挂载也推进歌词索引 → 切回时正停在当前句
+  });
+  a.addEventListener('loadedmetadata', () => {
+    player.duration = Number.isFinite(a.duration) ? a.duration : 0;
+    syncProgress();
+  });
+  a.addEventListener('error', () => {
+    if (player.uid) playerToast('err', '播放失败：该音源可能已失效或被限流');
+    syncPlayButton();
+  });
+  player.audio = a;
+  return a;
+}
+
+/** 可播放曲目（按当前结果表顺序；排除专辑行 / 无直链 / HLS）。 */
+function playableTracks() {
+  return (player.rows || []).filter((r) => r.kind === 'track' && r.playable !== false && r.protocol !== 'HLS');
+}
+
+/** 播放某行（重建播放列表 = 当前结果顺序；列表本身不落前端，直链由路由取）。 */
+function playRow(row) {
+  if (!row || row.kind !== 'track') return;
+  if (row.protocol === 'HLS') { playerToast('warn', '该音源为 HLS，暂不支持在线试听'); return; }
+  if (row.playable === false) { playerToast('warn', '该曲目没有可用的在线播放直链'); return; }
+  const list = playableTracks();
+  let idx = list.findIndex((x) => x.uid === row.uid);
+  if (idx < 0) { list.push(row); idx = list.length - 1; }
+  player.list = list; player.index = idx;
+  player.sessId = player.viewSessId; // 记住本曲所属会话（后台自动下一首时仍用它取直链）
+  loadCurrent(true);
+}
+
+/** 加载并（可选）播放当前索引曲目。 */
+function loadCurrent(autoplay) {
+  const row = player.list[player.index];
+  if (!row) return;
+  const a = ensureAudio();
+  if (!a) return;
+  player.uid = row.uid; player.row = row;
+  a.src = streamUrlFor(player.sessId, row.uid); // 每次切歌换 src；浏览器 seek 自动发 Range，服务端已支持 206
+  renderNowPlaying();
+  loadLyric(row.uid); // 内联歌词行默认显示：无条件加载（按 uid 缓存，切歌成本可控）
+  if (autoplay !== false) { const p = a.play(); if (p && p.catch) p.catch(() => { /* 自动播放被拒：保留暂停态 */ }); }
+  syncPlayButton();
+}
+
+/** 上一首（dir=-1）/ 下一首（dir=+1），循环。 */
+function playAdjacent(dir) {
+  if (player.list.length === 0) return;
+  player.index = (player.index + dir + player.list.length) % player.list.length;
+  loadCurrent(true);
+}
+
+function togglePlay() {
+  const a = player.audio;
+  if (!a || !player.uid) {
+    const first = playableTracks()[0];
+    if (first) playRow(first); else playerToast('warn', '没有可播放的曲目（先搜索，且音源需支持试听）');
+    return;
+  }
+  if (a.paused) { const p = a.play(); if (p && p.catch) p.catch(() => {}); }
+  else a.pause();
+}
+
+/** 播放/暂停图标（视图未挂载时不动 DOM）。 */
+function syncPlayButton() {
+  const ui = player.ui;
+  if (!ui || !ui.playBtn) return;
+  const playing = !!(player.audio && !player.audio.paused && player.uid);
+  ui.playBtn.textContent = playing ? '‖' : '▶';
+  ui.playBtn.title = playing ? '暂停' : '播放';
+}
+
+/** 进度 / 时间标签同步（拖动中不抢占；视图未挂载时仅更新状态，不碰 DOM）。 */
+function syncProgress() {
+  const a = player.audio;
+  if (!a) return;
+  const dur = Number.isFinite(a.duration) ? a.duration : 0;
+  player.currentTime = a.currentTime; player.duration = dur;
+  const ui = player.ui;
+  if (!ui) return; // 后台播放：不碰 DOM
+  if (ui.seekEl && !player.dragging) {
+    ui.seekEl.value = String(dur > 0 ? Math.round((a.currentTime / dur) * 1000) : 0);
+    ui.seekEl.disabled = !(dur > 0);
+  }
+  if (ui.curTimeEl) ui.curTimeEl.textContent = fmtClock(a.currentTime);
+  if (ui.durTimeEl) ui.durTimeEl.textContent = fmtClock(dur);
+}
+
+/** 播放条「当前曲目」区（标题 / 歌手·专辑 / 封面）。 */
+function renderNowPlaying() {
+  const ui = player.ui;
+  if (!ui) return;
+  const el = player.ctx.el;
+  const row = player.row;
+  if (ui.npTitleEl) ui.npTitleEl.textContent = row ? (row.songname || '（未知曲目）') : '未在播放';
+  if (ui.npMetaEl) ui.npMetaEl.textContent = row ? ([row.singers, row.album].filter(Boolean).join(' · ') || '—') : '';
+  if (!ui.npCoverEl) return;
+  ui.npCoverEl.innerHTML = '';
+  if (row && row.has_cover) {
+    const im = el('img', { class: 'music-np__cover', src: coverUrlFor(player.sessId, row.uid), alt: '' });
+    im.addEventListener('error', () => { im.replaceWith(el('div', { class: 'music-np__cover is-empty' })); });
+    ui.npCoverEl.append(im);
+  } else {
+    ui.npCoverEl.append(el('div', { class: 'music-np__cover is-empty' }));
+  }
+}
+
+/** 内联单行歌词（播放条内、进度条下方）：五态（未播放 / 加载中 / 失败 / 无歌词 / 当前句）。 */
+function renderLyricLine() {
+  const ui = player.ui;
+  if (!ui || !ui.npLyricEl) return;
+  const box = ui.npLyricEl;
+  const lyric = player.lyric;
+  box.classList.toggle('is-hidden', !lyric.open);
+  let text = '—';
+  let muted = true;
+  if (!player.uid) { text = '未在播放'; }
+  else if (lyric.loading) { text = '歌词加载中…'; }
+  else if (lyric.error) { text = lyric.error; }
+  else if (!lyric.lines.length) { text = '该曲目无歌词'; }
+  else if (lyric.active < 0) { text = '…'; }
+  else { text = lyric.lines[lyric.active].text || '…'; muted = false; }
+  box.textContent = text;
+  box.classList.toggle('is-muted', muted);
+}
+
+/** 显示 / 隐藏内联单行歌词（不再有展开面板）。 */
+function toggleLyric(force) {
+  const lyric = player.lyric;
+  lyric.open = (force === undefined) ? !lyric.open : !!force;
+  const ui = player.ui;
+  if (ui && ui.lyricBtn) ui.lyricBtn.classList.toggle('is-active', lyric.open);
+  renderLyricLine();
+}
+
+/** 拉取并解析当前曲目歌词（带 uid 级缓存；切歌竞态用 lyric.uid 兜住）。 */
+async function loadLyric(uid) {
+  const lyric = player.lyric;
+  if (!uid) return;
+  lyric.uid = uid;
+  const cached = lyric.cache.get(uid);
+  if (cached) {
+    lyric.lines = cached.lines; lyric.synced = cached.synced;
+    lyric.active = -1; lyric.loading = false; lyric.error = null;
+    renderLyricLine(); syncLyric();
+    return;
+  }
+  lyric.lines = []; lyric.synced = false; lyric.active = -1; lyric.loading = true; lyric.error = null;
+  renderLyricLine();
+  const api = player.ctx && player.ctx.api;
+  let data;
+  try { data = await api('GET', `/api/music/lyric/${encodeURIComponent(player.sessId || '')}/${encodeURIComponent(uid)}`); }
+  catch (err) {
+    if (lyric.uid !== uid) return; // 已切歌：丢弃过期响应
+    lyric.loading = false; lyric.error = (err && err.message) || '歌词加载失败';
+    renderLyricLine();
+    return;
+  }
+  if (lyric.uid !== uid) return; // 已切歌：丢弃过期响应
+  const lines = parseLrc(data && data.lrc);
+  const synced = !!(data && data.synced) || lines.length > 0;
+  lyric.cache.set(uid, { lines, synced });
+  // 有界 LRU：Map 按插入序迭代，超上限逐出最旧；不逐出刚写入、后续立即要读的 uid。
+  while (lyric.cache.size > LYRIC_CACHE_MAX) {
+    const oldest = lyric.cache.keys().next().value;
+    if (oldest === uid) break;
+    lyric.cache.delete(oldest);
+  }
+  lyric.lines = lines; lyric.synced = synced; lyric.loading = false; lyric.error = null;
+  lyric.active = -1;
+  renderLyricLine(); syncLyric();
+}
+
+/** 依 currentTime 计算当前句索引（timeupdate 驱动），变化时刷新内联行（未挂载则只更索引）。 */
+function syncLyric() {
+  const lyric = player.lyric;
+  const a = player.audio;
+  const t = a ? a.currentTime : 0;
+  let idx = -1;
+  for (let i = 0; i < lyric.lines.length; i++) { if (lyric.lines[i].t <= t + 0.05) idx = i; else break; }
+  if (idx !== lyric.active) { lyric.active = idx; renderLyricLine(); }
+}
+
+/** 统一回收：所有 interval + 所有实时流 + 实时态（unmount / 重新 mount 时调用）。
+    ★ 播放器**不在此回收**：跨视图继续播放由模块级 player 单例持有。 */
 function clearTimers() {
   for (const h of timers) clearInterval(h);
   timers.clear();
@@ -167,6 +413,46 @@ function applyTemplate(tmpl, row) {
     .split('{ext}').join(r.ext || 'mp3');
 }
 
+/** 秒 → m:ss（播放条时间；非法 / 负值 → 0:00）。 */
+function fmtClock(sec) {
+  const s = Number(sec);
+  if (!Number.isFinite(s) || s < 0) return '0:00';
+  const m = Math.floor(s / 60);
+  const r = Math.floor(s % 60);
+  return `${m}:${String(r).padStart(2, '0')}`;
+}
+
+/**
+ * 解析 LRC 歌词文本 → `[{ t, text }]`（按时间升序）。
+ *
+ * 支持 `[mm:ss]` / `[mm:ss.xx]` / `[m:ss.xxx]`，一行多时间轴（`[00:01.00][00:10.00]词`）展开为多条；
+ * 无时间轴的行与元数据标签（`[ar:…]` / `[ti:…]`）一律忽略。空文本 → `[]`。
+ * @param {string} text
+ * @returns {Array<{t:number, text:string}>}
+ */
+function parseLrc(text) {
+  const out = [];
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const times = [];
+    let last = 0;
+    const re = /\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/g;
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+      const min = Number(m[1]);
+      const sec = Number(m[2]);
+      const frac = m[3] ? Number(m[3]) / (10 ** m[3].length) : 0;
+      times.push(min * 60 + sec + frac);
+      last = re.lastIndex;
+    }
+    if (times.length === 0) continue;
+    const lyric = raw.slice(last).trim();
+    if (!lyric) continue;
+    for (const t of times) out.push({ t, text: lyric });
+  }
+  out.sort((a, b) => a.t - b.t);
+  return out;
+}
+
 // ============================== 主视图 ==============================
 export default {
   id: 'music',
@@ -174,11 +460,17 @@ export default {
 
   async mount(root, ctx) {
     clearTimers();
+    player.ctx = ctx; // 记住本次上下文（el / api / ui.toast）——后台播放时仍可用
     const app = createApp(root, ctx);
     await app.start();
   },
 
-  unmount() { clearTimers(); },
+  // ★ 切走时**不停播**：只回收本视图的 interval/SSE、解绑播放条 UI 引用，并快照会话状态。
+  unmount() {
+    clearTimers();
+    detachPlayerUI();
+    if (typeof saveSessionFn === 'function') { try { saveSessionFn(); } catch { /* ignore */ } }
+  },
 };
 
 /**
@@ -213,6 +505,8 @@ function createApp(root, ctx) {
     selected: new Map(), // uid -> row（自建表的选中态，跨增量刷新保持）
     expanded: new Set(), // 已展开的专辑 uid
     sort: { key: null, dir: 'desc' }, // R3a/ P1-2：结果表排序（key: 'quality' | 'size' | null）
+    sortThs: {}, // R3a/ P1-2：可排序表头的 DOM 引用（key -> { th, arrowEl }），供 syncSortIndicators 刷新箭头
+    restoredSession: false, // 切回本视图时是否已灌入会话快照（只恢复一次）
     // 任务队列
     tasks: [],
     taskTimer: null,
@@ -236,7 +530,39 @@ function createApp(root, ctx) {
     submitting: false,
     elapsedNodes: [],
     elapsedTimer: null,
+    // 性能设置输入（C3）
+    cacheMaxInput: null, concInput: null,
   };
+
+  // ------------------------------ 会话快照（切回本模块恢复搜索结果） ------------------------------
+  /** 保存当前会话快照（unmount 时由模块级入口调用）。 */
+  function saveSession() {
+    if (!app.sess) return;
+    lastSession = {
+      sess: app.sess,
+      lastKeyword: app.lastKeyword,
+      lastPerSource: app.lastPerSource,
+      selSources: new Set(app.selSources),
+      selected: new Map(app.selected),
+      expanded: new Set(app.expanded),
+      sort: { ...app.sort },
+    };
+  }
+  saveSessionFn = saveSession;
+
+  /** 切回时把快照灌回新实例（只做一次；灌完即清）。 */
+  function restoreSession() {
+    const s = lastSession;
+    if (!s) return;
+    app.sess = s.sess;
+    app.lastKeyword = s.lastKeyword;
+    app.lastPerSource = s.lastPerSource;
+    app.selSources = new Set(s.selSources);
+    app.selected = new Map(s.selected);
+    app.expanded = new Set(s.expanded);
+    app.sort = { ...s.sort };
+    lastSession = null;
+  }
 
   // 音源键名 → 中文标签（loadMeta 时从音源目录回填；未命中回落去后缀缩写）。
   // ★ 必须留在 createApp 闭包内：函数体引用闭包变量 app。放在模块顶层会因 app 未定义
@@ -248,6 +574,96 @@ function createApp(root, ctx) {
     if (lbl) return lbl;
     return s.replace(/MusicClient$/, '') || '—';
   };
+
+  // ------------------------------ 播放器 UI（引擎状态在模块级 player 单例） ------------------------------
+  /** 封面路由 URL（视图结果表用；uid 必含 `#` → 必须 encodeURIComponent）。 */
+  function coverUrl(uid) {
+    return coverUrlFor(app.sess.id, uid);
+  }
+
+  /** 行内封面缩略图：有封面才建 <img>，加载失败回落占位。 */
+  function coverThumb(row) {
+    if (row.kind !== 'track' || !row.has_cover) return el('div', { class: 'music-cover-thumb is-empty', title: '无封面' });
+    const img = el('img', { class: 'music-cover-thumb', src: coverUrl(row.uid), alt: '', loading: 'lazy' });
+    img.addEventListener('error', () => {
+      const ph = el('div', { class: 'music-cover-thumb is-empty', title: '封面加载失败' });
+      if (img.parentNode) img.parentNode.replaceChild(ph, img);
+    });
+    return img;
+  }
+
+  /** 播放单元格：▷ 试听；HLS / 无直链 → 禁用并给出原因。专辑行留空。 */
+  function playCell(row) {
+    if (row.kind !== 'track') return el('td', { class: 'music-col-play' });
+    const hls = row.protocol === 'HLS';
+    const bad = row.playable === false;
+    const btn = el('button', {
+      class: 'btn btn--icon btn--sm music-playbtn', type: 'button', text: '▶',
+      title: hls ? '该音源为 HLS，暂不支持在线试听' : (bad ? '无可用在线播放直链' : '在线试听'),
+      disabled: hls || bad,
+      on: (hls || bad) ? {} : { click: (e) => { e.stopPropagation(); playRow(row); } },
+    });
+    return el('td', { class: 'music-col-play' }, [btn]);
+  }
+
+  /** 播放条（结果卡顶部常驻，sticky）：封面 + 曲目 + 上一首/播放/下一首 + 进度 + 音量 + 词；其下为内联单行歌词。 */
+  function renderPlayerBar() {
+    const prevBtn = el('button', { class: 'btn btn--icon', type: 'button', text: '|◀', title: '上一首', on: { click: () => playAdjacent(-1) } });
+    const playBtn = el('button', { class: 'btn btn--icon music-playbtn music-playbtn--lg', type: 'button', text: '▶', title: '播放', on: { click: () => togglePlay() } });
+    const nextBtn = el('button', { class: 'btn btn--icon', type: 'button', text: '▶|', title: '下一首', on: { click: () => playAdjacent(1) } });
+
+    const npCoverEl = el('div', { class: 'music-np__coverwrap' });
+    const npTitleEl = el('div', { class: 'music-np__title', text: '未在播放' });
+    const npMetaEl = el('div', { class: 'music-np__meta muted' });
+    const npInfo = el('div', { class: 'music-np__info' }, [npTitleEl, npMetaEl]);
+
+    const seekEl = el('input', { class: 'music-seek', type: 'range', min: 0, max: 1000, value: 0, disabled: true, 'aria-label': '播放进度' });
+    seekEl.addEventListener('pointerdown', () => { player.dragging = true; });
+    seekEl.addEventListener('pointerup', () => { player.dragging = false; });
+    seekEl.addEventListener('change', () => { player.dragging = false; });
+    seekEl.addEventListener('input', () => {
+      const a = player.audio;
+      if (a && Number.isFinite(a.duration) && a.duration > 0) {
+        a.currentTime = (Number(seekEl.value) / 1000) * a.duration;
+        syncProgress();
+      }
+    });
+    const curTimeEl = el('span', { class: 'music-time mono', text: '0:00' });
+    const durTimeEl = el('span', { class: 'music-time mono', text: '0:00' });
+    const prog = el('div', { class: 'music-prog' }, [curTimeEl, seekEl, durTimeEl]);
+
+    const volEl = el('input', { class: 'music-vol', type: 'range', min: 0, max: 100, value: String(Math.round(player.volume * 100)), title: '音量', 'aria-label': '音量' });
+    volEl.addEventListener('input', () => { player.volume = Number(volEl.value) / 100; if (player.audio) player.audio.volume = player.volume; });
+
+    const lyricBtn = el('button', { class: 'btn btn--sm music-lyricbtn', type: 'button', text: '词', title: '歌词（点击显示/隐藏当前句）', on: { click: () => toggleLyric() } });
+
+    const npLyricEl = el('div', { class: 'music-np__lyric' });
+    const bar = el('div', { class: 'music-player' }, [
+      el('div', { class: 'music-player__row' }, [
+        npCoverEl,
+        npInfo,
+        el('div', { class: 'music-np__controls' }, [prevBtn, playBtn, nextBtn]),
+        prog,
+        el('div', { class: 'music-np__right' }, [el('span', { class: 'muted music-vol__label', text: '音量' }), volEl, lyricBtn]),
+      ]),
+      npLyricEl,
+    ]);
+    // ★ 绝不把 audio 插入视图 DOM！
+    //   原因：切走时 app.js 的 route() 会执行 `dom.main.innerHTML = ''` 清空视图 DOM，
+    //   而 Chrome 会暂停「被移出 document 的正在播放媒体元素」→ 表现为「切模块停播」（QA 第 4 轮实测复现）。
+    //   audio 由 ensureAudio()（本文件 ensureAudio）用 ctx.el('audio', …) 一次性创建后**始终保持 detached**，
+    //   仅由模块级 player.audio 强引用持有（不会被 GC），故永远不会被移出 document、也不会被暂停。
+    app.playerBar = bar;
+    // ★ 绑定本视图播放条 DOM 引用：切回时引擎据 player.ui 无缝接管；切走时 detachPlayerUI 置 null。
+    player.ui = { playBtn, npCoverEl, npTitleEl, npMetaEl, seekEl, curTimeEl, durTimeEl, volEl, lyricBtn, npLyricEl, playerBar: bar };
+    renderNowPlaying();
+    if (lyricBtn) lyricBtn.classList.toggle('is-active', player.lyric.open);
+    renderLyricLine();
+    syncPlayButton();
+    syncProgress();
+    syncLyric();
+    return bar;
+  }
 
   // ------------------------------ 数据加载 ------------------------------
   /** 加载音源目录 + 配置，并初始化音源勾选。 */
@@ -266,6 +682,7 @@ function createApp(root, ctx) {
       downloadDir: '', nameTemplate: '{歌手} - {歌名}.{ext}', channel: 'auto', sources: [], templateVars: [],
       proxySource: 'homebrew', proxyHttp: '', proxySocks5: '',
       proxyHomebrew: { http: '127.0.0.1:7897', socks5: '127.0.0.1:7897' },
+      enhancedSearch: false,
       templatePresets: [
         { id: 'singer-song', label: '歌手 - 歌名', value: '{歌手} - {歌名}.{ext}' },
         { id: 'song-singer', label: '歌名 - 歌手', value: '{歌名} - {歌手}.{ext}' },
@@ -478,6 +895,9 @@ function createApp(root, ctx) {
   // ------------------------------ 绘制：外壳 ------------------------------
   function paint() {
     body.innerHTML = '';
+    // ★ 重绘会销毁旧播放条 DOM：先解绑 UI 引用（引擎继续后台播放，不停、不清 src）；
+    //   本次渲染末尾的 renderPlayerBar() 会重新绑定到新 DOM → 切回即无缝接管。
+    detachPlayerUI();
     app.envBarNode = null;
     app.resEls = null;
     app.queueEl = null;
@@ -493,6 +913,9 @@ function createApp(root, ctx) {
       return;
     }
 
+    // ★ 切回本视图：把离开时的会话快照灌回（仅一次）——搜索结果 / 勾选 / 音源 / 排序整段还原，无需重新搜索。
+    if (lastSession && !app.restoredSession) { restoreSession(); app.restoredSession = true; }
+
     app.envBarNode = renderEnvBar();
     body.append(app.envBarNode);
     body.append(renderSearchCard());
@@ -504,6 +927,12 @@ function createApp(root, ctx) {
     updateSearchStatus();
     renderResults();
     renderQueue();
+
+    // ★ 离开时会话仍在跑：切回后无缝续接轮询（服务端会话未中断，这里只续前端增量拉取）。
+    if (app.sess.status === 'running' && app.pollTimer == null) {
+      app.pollTimer = addTimer(pollSession, 1000);
+      pollSession();
+    }
   }
 
   // ------------------------------ ① 部署区（未就绪 / 损坏） ------------------------------
@@ -706,7 +1135,7 @@ function createApp(root, ctx) {
     const perSource = Number(app.perSourceSel && app.perSourceSel.value) || 5;
     app.lastPerSource = perSource;
     let res;
-    try { res = await api('POST', '/api/music/search', { keyword, sources, perSource }); }
+    try { res = await api('POST', '/api/music/search', { keyword, sources, perSource, enhanced: app.config.enhancedSearch === true }); }
     catch (err) { ctx.ui.toast('err', err.message || '搜索失败'); return; }
     startSession('search', res);
   }
@@ -723,6 +1152,7 @@ function createApp(root, ctx) {
 
   function startSession(kind, res) {
     stopPoll();
+    lastSession = null; // ★ 发起新会话即作废旧快照：切回时不应再恢复上一次的搜索结果
     app.resPage = 1; // 新会话回到结果第一页
     app.sess = {
       id: res.searchId, kind, since: 0, status: 'running',
@@ -758,6 +1188,7 @@ function createApp(root, ctx) {
     app.sess.status = data.status || app.sess.status;
     app.sess.counts = data.counts || app.sess.counts;
     app.sess.currentSource = data.currentSource || null;
+    app.sess.currentSources = Array.isArray(data.currentSources) ? data.currentSources : [];
     app.sess.rows = Array.isArray(data.rows) ? data.rows : app.sess.rows;
     app.sess.error = data.error || null;
     renderResults();
@@ -800,10 +1231,15 @@ function createApp(root, ctx) {
     const total = app.sess.sourcesTotal || 0;
     const songs = (app.sess.rows || []).length;
     if (app.sess.status === 'running') {
-      const cur = app.sess.currentSource ? ` · 正在搜索：${shortSource(app.sess.currentSource)}` : '';
+      // 并行搜索：可能有多个源同时在跑，全部列出；无则回退单源指示
+      const running = (app.sess.currentSources || []).map((x) => shortSource(x));
+      const cur = running.length
+        ? ` · 正在搜索：${running.join(' / ')}`
+        : (app.sess.currentSource ? ` · 正在搜索：${shortSource(app.sess.currentSource)}` : '');
+      const enhTag = (app.config && app.config.enhancedSearch) ? '增强 · ' : '';
       s.textContent = kind === 'playlist'
         ? `正在解析歌单… 已解析 ${songs} 首`
-        : `搜索中：已返回 ${done}/${total} 个音源${cur} · 命中 ${songs} 首`;
+        : `${enhTag}搜索中：已返回 ${done}/${total} 个音源${cur} · 命中 ${songs} 首`;
     } else if (app.sess.status === 'done') {
       s.textContent = kind === 'playlist'
         ? `解析完成：共 ${songs} 首（勾选后点「下载选中」）`
@@ -897,25 +1333,38 @@ function createApp(root, ctx) {
   // ------------------------------ ③ 结果区（自建表） ------------------------------
   /** 可点击排序的表头（R3a/ P1-2）：点击切换 升/降，箭头指示当前态。 */
   function sortableTh(label, key) {
-    const active = app.sort.key === key;
-    const arrow = active ? (app.sort.dir === 'asc' ? ' ↑' : ' ↓') : ' ⇅';
-    const th = el('th', { class: `music-th-sort${active ? ' is-active' : ''}`, title: '点击排序' }, [
-      el('span', { text: label }), el('span', { class: 'music-th-sort__arrow', text: arrow }),
-    ]);
+    // ★ 箭头单独建 <span> 并登记引用：表头只在卡片渲染时创建一次，箭头需后续由
+    //   syncSortIndicators() 显式刷新（点击只重绘 tbody，不会重建表头）。
+    const arrowEl = el('span', { class: 'music-th-sort__arrow' });
+    const th = el('th', { class: 'music-th-sort', title: '点击排序' }, [el('span', { text: label }), arrowEl]);
+    (app.sortThs || {})[key] = { th, arrowEl };
     th.addEventListener('click', () => {
       if (app.sort.key === key) app.sort.dir = app.sort.dir === 'asc' ? 'desc' : 'asc';
       else { app.sort.key = key; app.sort.dir = 'desc'; }
       app.resPage = 1; // 排序改变顺序，回到第一页
-      renderResults();
+      renderResults(); // 箭头由 renderResults 内的 syncSortIndicators() 统一刷新
     });
     return th;
   }
 
+  /** 依 app.sort 刷新表头排序指示（⇅ / ↑ / ↓）。表头只在卡片渲染时建一次，故必须显式同步。 */
+  function syncSortIndicators() {
+    const map = app.sortThs || {};
+    for (const key of Object.keys(map)) {
+      const { th, arrowEl } = map[key];
+      const active = app.sort.key === key;
+      arrowEl.textContent = active ? (app.sort.dir === 'asc' ? ' ↑' : ' ↓') : ' ⇅';
+      th.classList.toggle('is-active', active);
+    }
+  }
+
   function renderResultsCard() {
+    app.sortThs = {}; // ★ 卡片可能被 paint() 重建：先清掉指向已销毁节点的旧表头引用
     const tbody = el('tbody');
     const table = el('table', { class: 'table music-table' }, [
       el('thead', {}, [el('tr', {}, [
         el('th', { class: 'music-col-check' }, []),
+        el('th', { class: 'music-col-cover', text: '封面' }),
         el('th', { text: '歌曲' }),
         el('th', { text: '歌手' }),
         el('th', { text: '专辑' }),
@@ -923,6 +1372,7 @@ function createApp(root, ctx) {
         sortableTh('格式 / 码率', 'quality'),
         sortableTh('大小', 'size'),
         el('th', { text: '来源' }),
+        el('th', { class: 'music-col-play', text: '试听' }),
       ])]),
       tbody,
     ]);
@@ -940,7 +1390,13 @@ function createApp(root, ctx) {
 
     app.resEls = { tbody, countEl, dlBtn, pagerEl };
 
-    return el('div', { class: 'section' }, [ctx.ui.card('结果', el('div', {}, [toolbar, el('div', { class: 'table__scroll' }, [table]), pagerEl]))]);
+    // ★ C1/C2：播放条常驻在结果卡「工具行」与「表头/表格」之间（用户指定位置，sticky top 保持滚动可见）。
+    return el('div', { class: 'section' }, [ctx.ui.card('结果', el('div', {}, [
+      toolbar,
+      renderPlayerBar(),
+      el('div', { class: 'table__scroll' }, [table]),
+      pagerEl,
+    ]))]);
   }
 
   function childTracks(uid) {
@@ -967,6 +1423,13 @@ function createApp(root, ctx) {
     const cb = el('input', { type: 'checkbox', checked: isRowChecked(r) });
     cb.addEventListener('change', (e) => toggleSelect(r, e.target.checked));
     tr.append(el('td', { class: 'music-col-check' }, [cb]));
+    tr.append(el('td', { class: 'music-col-cover' }, [coverThumb(r)]));
+    // 双击结果行 → 在线试听（仅曲目行；点按钮 / 勾选框 / 缩略图不触发）
+    tr.addEventListener('dblclick', (e) => {
+      if (r.kind !== 'track') return;
+      if (e.target && e.target.closest && e.target.closest('button, input, a, img')) return;
+      playRow(r);
+    });
 
     const nameCell = el('td', { class: depth > 0 ? 'music-indent' : '' });
     if (r.kind === 'album') {
@@ -995,6 +1458,7 @@ function createApp(root, ctx) {
     tr.append(qCell);
     tr.append(el('td', { class: 'nowrap mono', text: fmtSize(r.filesize) }));
     tr.append(el('td', { class: 'nowrap', text: shortSource(r.source) }));
+    tr.append(playCell(r)); // ★ C1：行内「试听」列（专辑行留空；不可播放则禁用）
     return tr;
   }
 
@@ -1034,7 +1498,13 @@ function createApp(root, ctx) {
   }
 
   function renderResults() {
+    // ★ 让模块级引擎始终掌握「本视图结果集」：播放列表顺序 / 直链路由据此构建（切视图后仍正确）。
+    player.viewSessId = app.sess.id;
+    player.rows = app.sess.rows || [];
     const R = app.resEls;
+    // ★ 表头只在 renderResultsCard() 创建一次；排序 / 翻页 / 增量刷新 / 切回（快照恢复 app.sort）
+    //   四条路径都经此刷新箭头，否则箭头恒为创建时的快照（既有小瑕疵）。
+    syncSortIndicators();
     if (!R) return;
     R.tbody.innerHTML = '';
     const rows = app.sess.rows || [];
@@ -1042,7 +1512,7 @@ function createApp(root, ctx) {
     const tops = sortedRows(rows.filter((r) => !r.parentUid));
     if (tops.length === 0) {
       app.resPage = 1;
-      R.tbody.append(el('tr', {}, [el('td', { colspan: '8' }, [el('div', { class: 'muted music-empty-cell', text: emptyResultText() })])]));
+      R.tbody.append(el('tr', {}, [el('td', { colspan: '10' }, [el('div', { class: 'muted music-empty-cell', text: emptyResultText() })])]));
     } else {
       // 分页展示（每页 10 首），翻页控件渲染在表格底部
       const pages = Math.max(1, Math.ceil(tops.length / RESULTS_PER_PAGE));
@@ -1486,7 +1956,37 @@ function createApp(root, ctx) {
     ]);
     lyrCheck.addEventListener('change', () => doSetSaveLyrics(lyrCheck.checked));
 
-    const children = [dirField, tmplField, chField, lyrField];
+    // 增强搜索（实验）：走第三方代理 API，更快、支持「歌手 - 歌名」组合词；默认关（依赖外部服务）
+    const enhCheck = el('input', { type: 'checkbox', checked: c.enhancedSearch === true, id: 'music-enhsearch' });
+    const enhField = el('div', { class: 'field' }, [
+      el('label', { class: 'check', for: 'music-enhsearch' }, [enhCheck, el('span', { text: '增强搜索（实验）' })]),
+      el('div', { class: 'muted music-enh-hint', text: '走第三方代理：搜索更快、支持「歌手 - 歌名」组合词；但依赖外部服务（可能限流/失效），且下载的歌曲不含封面，歌词仅存为 .lrc（不写入音频）。默认关闭，保持离线优先。' }),
+    ]);
+    enhCheck.addEventListener('change', () => doSetEnhancedSearch(enhCheck.checked));
+
+    // ★ C3：性能设置（缓存上限 + 下载并发）。合法域与后端 store.js 的夹取口径一致：
+    //   缓存 128–5120 MB（默认 1024）、并发 1–5（默认 3）。非法输入前端先拦，后端仍会夹取兜底。
+    app.cacheMaxInput = el('input', {
+      type: 'number', class: 'music-num', min: 128, max: 5120, step: 128,
+      value: String(Number.isFinite(c.cacheMaxMb) ? c.cacheMaxMb : 1024),
+    });
+    app.concInput = el('input', {
+      type: 'number', class: 'music-num', min: 1, max: 5, step: 1,
+      value: String(Number.isFinite(c.downloadConcurrency) ? c.downloadConcurrency : 3),
+    });
+    const perfField = el('div', { class: 'field' }, [
+      el('label', { text: '性能设置' }),
+      el('div', { class: 'row music-setrow' }, [
+        el('span', { class: 'muted', text: '缓存上限 (MB)' }), app.cacheMaxInput,
+        el('span', { class: 'muted', text: '下载并发' }), app.concInput,
+      ]),
+      el('div', { class: 'row' }, [
+        el('button', { class: 'btn btn--sm btn--primary', type: 'button', text: '保存性能设置', on: { click: () => doSetPerf() } }),
+        el('span', { class: 'muted music-enh-hint', text: '缓存上限 128–5120 MB（在线试听的音频临时缓存，超额按最旧清理）；下载并发 1–5。' }),
+      ]),
+    ]);
+
+    const children = [dirField, tmplField, chField, lyrField, enhField, perfField];
     // Q8：代理设置子区仅在通道=「走代理」时展开
     if (c.channel === 'proxy') children.push(renderProxySubarea());
 
@@ -1511,6 +2011,24 @@ function createApp(root, ctx) {
     if (next) ctx.ui.toast('ok', next.saveLyrics ? '将同时保存歌词（对之后的下载生效）' : '将不再保存歌词（对之后的下载生效）');
   }
 
+  async function doSetEnhancedSearch(value) {
+    const next = await saveConfig({ enhancedSearch: value === true });
+    if (next) ctx.ui.toast('ok', next.enhancedSearch ? '已开启增强搜索（实验）：走第三方代理，更快且支持组合词' : '已关闭增强搜索，恢复离线 musicdl 搜索');
+  }
+
+  /** ★ C3：保存性能设置（缓存上限 / 下载并发）。前端先校验范围，后端仍会夹取兜底。 */
+  async function doSetPerf() {
+    const cache = Number(app.cacheMaxInput && app.cacheMaxInput.value);
+    const conc = Number(app.concInput && app.concInput.value);
+    if (!Number.isFinite(cache) || cache < 128 || cache > 5120) { ctx.ui.toast('warn', '缓存上限需在 128 – 5120 MB 之间'); return; }
+    if (!Number.isFinite(conc) || conc < 1 || conc > 5) { ctx.ui.toast('warn', '下载并发需在 1 – 5 之间'); return; }
+    const next = await saveConfig({ cacheMaxMb: Math.round(cache), downloadConcurrency: Math.round(conc) });
+    if (next) {
+      ctx.ui.toast('ok', `性能设置已保存：缓存上限 ${next.cacheMaxMb} MB · 并发 ${next.downloadConcurrency}`);
+      rerenderDirCard(); // 回显（含后端夹取后的实际值）
+    }
+  }
+
   async function saveConfig(patch) {
     const c = app.config || {};
     const bodyReq = {
@@ -1519,6 +2037,7 @@ function createApp(root, ctx) {
       channel: ('channel' in patch) ? patch.channel : c.channel,
       sources: ('sources' in patch) ? patch.sources : [...app.selSources],
       saveLyrics: ('saveLyrics' in patch) ? patch.saveLyrics === true : c.saveLyrics !== false,
+      enhancedSearch: ('enhancedSearch' in patch) ? patch.enhancedSearch === true : c.enhancedSearch !== false,
     };
     // R0：**仅当本次 patch 显式包含代理字段时**才转发三键（不再无条件回填）。
     // 目的：音乐页自身的「无关保存」（改下载目录 / 切模板 / 切通道）**不得触发后端代理校验**。
@@ -1530,6 +2049,9 @@ function createApp(root, ctx) {
       bodyReq.proxyHttp = ('proxyHttp' in patch) ? patch.proxyHttp : c.proxyHttp;
       bodyReq.proxySocks5 = ('proxySocks5' in patch) ? patch.proxySocks5 : c.proxySocks5;
     }
+    // C3：同代理口径 —— 仅当本次 patch 显式包含性能键时才转发，避免无关保存覆盖后端当前值。
+    if ('cacheMaxMb' in patch) bodyReq.cacheMaxMb = patch.cacheMaxMb;
+    if ('downloadConcurrency' in patch) bodyReq.downloadConcurrency = patch.downloadConcurrency;
     let next;
     try { next = await api('PUT', '/api/music/config', bodyReq); }
     catch (err) { ctx.ui.toast('err', err.message || '保存失败'); return null; }

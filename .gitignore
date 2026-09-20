@@ -13,5 +13,9 @@
 node_modules/
 *.log
 
+# Python 字节码（bridge.py 运行期自动生成）
+__pycache__/
+*.pyc
+
 # 本地智能体工作区（含本地笔记，不随开源发布）
 .workbuddy/

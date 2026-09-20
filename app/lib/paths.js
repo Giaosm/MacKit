@@ -341,6 +341,8 @@ export const MUSIC_PIP_CACHE = path.join(PY_DIR, 'cache');
 export const MUSIC_BRIDGE = path.join(APP_DIR, 'lib', 'music', 'bridge.py');
 /** ~/.mackit/cache/music/search（搜索结果快照 search-<id>.json） */
 export const MUSIC_SEARCH_CACHE_DIR = path.join(CACHE_DIR, 'music', 'search');
+/** ~/.mackit/cache/music/audio（边听边存：在线播放的音频按内容键缓存，供二次播放命中） */
+export const MUSIC_AUDIO_CACHE_DIR = path.join(CACHE_DIR, 'music', 'audio');
 /** 默认下载目录 ~/Music/MacKit */
 export const MUSIC_DEFAULT_DIR = path.join(HOME, 'Music', 'MacKit');
 /** 建 venv 用的 python3.12 固定候选（Homebrew 两代前缀；exec 白名单精确放行） */
