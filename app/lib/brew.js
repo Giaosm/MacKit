@@ -74,6 +74,204 @@ async function runPolicy(ctx, policy, desc, args, opts = {}) {
   return res;
 }
 
+// ------------------------------ brew 仓库 git 锁自愈（Task A） ------------------------------
+
+/** git 锁视为「陈旧」的阈值：活着的 git 操作绝不修复（10 分钟内不动）。 */
+export const STALE_LOCK_MAX_AGE_MS = 10 * 60 * 1000;
+/** 扫描 `*.lock` 的最大目录深度（相对 `.git`）：`refs/remotes/origin/main.lock` 恰好落在第 4 层。 */
+const LOCK_SCAN_MAX_DEPTH = 4;
+/** 未完成的 rebase 现场目录名。 */
+const REBASE_DIRS = ['rebase-merge', 'rebase-apply'];
+
+/**
+ * 判定一次 brew update 失败是否是「上次更新被中断留下的 git 锁 / rebase 现场」。
+ *
+ * 纯函数（只看文本），便于单测。命中任一形态即视为疑似可自愈：
+ *   · could not lock config file
+ *   · cannot lock ref
+ *   · Another git process seems to be running
+ *   · already a rebase-merge directory
+ *   · index.lock + File exists（两段需同时出现）
+ * @param {{message?:string, detail?:string}} err
+ * @returns {boolean}
+ */
+export function looksLikeStaleGitLock(err) {
+  const text = `${(err && err.message) || ''}\n${(err && err.detail) || ''}`;
+  if (!text.trim()) return false;
+  const simple = [
+    'could not lock config file',
+    'cannot lock ref',
+    'Another git process seems to be running',
+    'already a rebase-merge directory',
+  ];
+  if (simple.some((s) => text.includes(s))) return true;
+  return text.includes('index.lock') && text.includes('File exists');
+}
+
+/**
+ * 扫描 brew 仓库 `.git` 里的 `*.lock` 与未完成的 rebase 现场。
+ *
+ * 锁只有在 **mtime 距今超过 10 分钟** 才算陈旧 —— 活着的 git 操作必须被保留。
+ * 默认目录取 `paths.BREW_PREFIX/.git`（不硬编码路径）；测试可传 `opts.gitDir` 指向临时目录，
+ * 绝不触碰真实 `/opt/homebrew`。
+ * @param {{gitDir?:string, now?:number, maxAgeMs?:number, maxDepth?:number}} [opts]
+ * @returns {{stale:Array<{path:string,mtimeMs:number,ageMs:number}>, freshLocks:Array<{path:string,mtimeMs:number,ageMs:number}>, rebaseDir:string|null}}
+ */
+export function detectStaleGitLocks(opts = {}) {
+  const gitDir = opts.gitDir || path.join(paths.BREW_PREFIX, '.git');
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const maxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : STALE_LOCK_MAX_AGE_MS;
+  const maxDepth = Number.isFinite(opts.maxDepth) ? opts.maxDepth : LOCK_SCAN_MAX_DEPTH;
+  const stale = [];
+  const freshLocks = [];
+  let rebaseDir = null;
+
+  const walk = (dir, rel, depth) => {
+    if (depth > maxDepth) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      const relPath = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        // rebase 现场整体作为一个单元处理（repair 会整目录移走），不在锁扫描里重复展开
+        if (REBASE_DIRS.includes(e.name)) continue;
+        walk(full, relPath, depth + 1);
+        continue;
+      }
+      if (!e.name.endsWith('.lock')) continue;
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      const item = { path: full, mtimeMs: st.mtimeMs, ageMs: now - st.mtimeMs };
+      if (item.ageMs > maxAgeMs) stale.push(item);
+      else freshLocks.push(item);
+    }
+  };
+  walk(gitDir, '', 1);
+
+  for (const name of REBASE_DIRS) {
+    const full = path.join(gitDir, name);
+    let st;
+    try { st = fs.statSync(full); } catch { continue; }
+    if (st.isDirectory()) { rebaseDir = full; break; }
+  }
+  return { stale, freshLocks, rebaseDir };
+}
+
+/**
+ * 把检测到的陈旧锁 / rebase 现场移进恢复备份目录，并清掉未完成的 rebase。
+ *
+ * ★ 只 **move**（`fs.renameSync`），绝不 `rm` —— 完全可回滚。rename 受限（跨卷 / EPERM）时
+ *   退化为 `fs.cpSync` + 删原件（仍可回滚，只是非原子），并记日志说明。
+ * @param {{log:(level:string,text:string)=>void, exec:{run:Function}}} ctx
+ * @param {{gitDir?:string, repoDir?:string, report?:{stale:Array<{path:string,mtimeMs:number,ageMs:number}>, rebaseDir:string|null}, timeoutMs?:number}} [opts]
+ * @returns {{backupDir:string, moved:string[], rebaseAction:string|null, verified:boolean}}
+ */
+export async function repairStaleGitState(ctx, opts = {}) {
+  const gitDir = opts.gitDir || path.join(paths.BREW_PREFIX, '.git');
+  const repoDir = opts.repoDir || paths.BREW_PREFIX;
+  const report = opts.report || detectStaleGitLocks({ gitDir });
+  // ★ 首轮只移「锁」：rebase 目录必须**先**留给 git 自己收尾（`rebase --abort` 需要它还在）
+  const targets = report.stale.map((s) => s.path);
+  if (targets.length === 0 && !report.rebaseDir) {
+    return { backupDir: '', moved: [], rebaseAction: null, verified: true };
+  }
+
+  // 恢复备份目录不做自动清理：单次只有几个 KB 且极少发生，保留现场便于排查 / 回滚。
+  const backupDir = path.join(paths.CACHE_DIR, 'brew-git-recovery', new Date().toISOString().replace(/[:.]/g, '-'));
+  fs.mkdirSync(backupDir, { recursive: true });
+
+  /** move 一项进备份目录；返回实际使用的方式（rename / cp+rm）。 */
+  const moveTo = (src, dst) => {
+    try { fs.renameSync(src, dst); return 'rename'; }
+    catch (err) {
+      fs.cpSync(src, dst, { recursive: true });
+      fs.rmSync(src, { recursive: true, force: true });
+      return `cp+rm（rename 失败：${err && err.code || err && err.message}）`;
+    }
+  };
+  const moved = [];
+  for (const src of targets) {
+    const dst = path.join(backupDir, path.relative(gitDir, src).replace(/\//g, '__'));
+    try {
+      const how = moveTo(src, dst);
+      moved.push(src);
+      ctx.log('info', `已移走陈旧锁 ${src} → ${dst}（${how}）`);
+    } catch (err) {
+      ctx.log('warn', `移走陈旧锁失败（保留原状）：${src} — ${err && err.message}`);
+    }
+  }
+
+  // rebase 现场优先交给 git 自己收尾（目录还在 → abort 才可能成功）；每次尝试各自如实记日志
+  let rebaseAction = null;
+  if (report.rebaseDir) {
+    const timeoutMs = opts.timeoutMs || 30_000;
+    const abort = await ctx.exec.run('git', ['-C', repoDir, 'rebase', '--abort'], { timeoutMs });
+    ctx.log('info', `git -C ${repoDir} rebase --abort → 退出码 ${abort.code}`);
+    if (abort.code === 0) {
+      rebaseAction = 'rebase --abort';
+    } else {
+      const quit = await ctx.exec.run('git', ['-C', repoDir, 'rebase', '--quit'], { timeoutMs });
+      ctx.log('info', `git -C ${repoDir} rebase --quit → 退出码 ${quit.code}`);
+      rebaseAction = `rebase --quit（退出码 ${quit.code}；--abort 退出码 ${abort.code}）`;
+    }
+  }
+
+  // abort / quit 没能清掉 rebase 目录时（极端损坏），整体移进备份
+  let cur = detectStaleGitLocks({ gitDir });
+  if (cur.rebaseDir) {
+    const dst = path.join(backupDir, path.relative(gitDir, cur.rebaseDir).replace(/\//g, '__'));
+    try {
+      const how = moveTo(cur.rebaseDir, dst);
+      moved.push(cur.rebaseDir);
+      ctx.log('info', `已移走 rebase 现场 ${cur.rebaseDir} → ${dst}（${how}）`);
+    } catch (err) {
+      ctx.log('warn', `移走 rebase 现场失败：${cur.rebaseDir} — ${err && err.message}`);
+    }
+    cur = detectStaleGitLocks({ gitDir });
+  }
+
+  // ★ 验证不通过就不重试：把剩余路径原样报给用户，让用户手动 rebase --abort
+  if (cur.stale.length > 0 || cur.rebaseDir) {
+    const remain = [...cur.stale.map((s) => s.path), cur.rebaseDir].filter(Boolean);
+    throw new AppError(ERR.CMD_FAILED, 'Homebrew 仓库的陈旧 git 锁未能自动清除',
+      `残留：\n  ${remain.join('\n  ')}\n请手动执行：git -C ${repoDir} rebase --abort 后重试`);
+  }
+  return { backupDir, moved, rebaseAction, verified: true };
+}
+
+/**
+ * brew_update 专用：识别「中断残留的 git 锁」→ 安全修复 → 重试一次。
+ * 只服务 brew_update（upgrade / install 带 HOMEBREW_NO_AUTO_UPDATE=1，不触碰仓库）。
+ * @param {{log:(level:string,text:string)=>void, exec:{run:Function}}} ctx
+ */
+async function runPolicyWithSelfHeal(ctx) {
+  const args = ['update'];
+  try {
+    await runPolicy(ctx, 'proxy_first', 'Homebrew 更新', args);
+  } catch (err) {
+    if (!looksLikeStaleGitLock(err)) throw err;
+    const report = detectStaleGitLocks();
+    if (report.stale.length === 0 && !report.rebaseDir) throw err;
+    const names = [...report.stale.map((s) => s.path), report.rebaseDir].filter(Boolean).map((p) => path.basename(p));
+    ctx.log('warn', `上次更新被中断，留下了 git 锁（${names.join('、')}）—— 自动修复后重试`);
+    await repairStaleGitState(ctx, { report });
+    try {
+      await runPolicy(ctx, 'proxy_first', 'Homebrew 更新', args);
+      ctx.log('ok', '已自动修复 Homebrew 仓库的陈旧锁并完成更新');
+    } catch (retryErr) {
+      // 重试仍失败：若依旧是锁问题（或现场又出现），给出可操作的手动命令；否则原样上抛
+      const again = detectStaleGitLocks();
+      if (looksLikeStaleGitLock(retryErr) || again.stale.length > 0 || again.rebaseDir) {
+        const remain = [...again.stale.map((s) => s.path), again.rebaseDir].filter(Boolean);
+        throw new AppError(ERR.CMD_FAILED, `Homebrew 更新失败（自动修复后仍有陈旧 git 锁：${remain.length ? remain.join('、') : '锁问题未消除'}）`,
+          `请手动执行：git -C ${paths.BREW_PREFIX} rebase --abort 后重试\n${retryErr.detail || retryErr.message}`);
+      }
+      throw retryErr;
+    }
+  }
+}
+
 /**
  * 批量动作终态：只要不是「全部失败」，任务算 ok（批量操作不中断语义）。
  * ★ 自动清理收尾步骤（id='autoclean'）的成败不计入「软件包成功数」：
@@ -726,12 +924,12 @@ function installSteps(items, kind) {
 // ------------------------------ 动作定义 ------------------------------
 const actions = {
 
-  /** brew 本体更新（proxy_first） */
+  /** brew 本体更新（proxy_first）。★ 失败若是「中断残留的 git 锁」→ 安全修复后重试一次（Task A 自愈） */
   brew_update: {
     title: '更新 Homebrew 本体',
     steps: () => [{
       id: 'brew_update', title: '更新 Homebrew 本体', channelPolicy: 'proxy_first', timeoutMs: UPGRADE_TIMEOUT,
-      run: async (ctx) => { await runPolicy(ctx, 'proxy_first', 'Homebrew 更新', ['update']); },
+      run: async (ctx) => { await runPolicyWithSelfHeal(ctx); },
     }],
   },
   /** 逐项选择通道升级（A6：由 params.items 动态生成步骤，非 stdin） */

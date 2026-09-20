@@ -335,22 +335,31 @@ function safeConfig() {
 
 /**
  * 注入代理环境变量（只写小写三键 http_proxy / https_proxy / all_proxy）。
+ *
+ * ★ 大小写清理（2026-09-20 教训）：buildEnv 会整体继承 process.env，而 libcurl/git 既认
+ *   小写也认**大写**的 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY。此前只删小写键，宿主的
+ *   大写代理变量会原样漏进「直连」子进程 —— 名义直连，实际仍走代理。因此：
+ *     · `direct`：把 http(s)_proxy / all_proxy / no_proxy **大小写不敏感**全部删除；
+ *     · `proxy`：先做同样的清理（删大写 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY 与
+ *       no_proxy/NO_PROXY），再写入小写三键 —— 让配置的通道成为唯一权威，
+ *       且 NO_PROXY 不能悄悄把某些主机排除在代理之外。
+ *   注意：`opts.env` 的显式覆盖发生在本函数之后（buildEnv 里 applyProxyEnv → env 合并），
+ *   所以 music/stream.js 里**有意**给 curl 注入大写 HTTP_PROXY/HTTPS_PROXY 的路径不受影响。
  * @param {Record<string,string|undefined>} env
  * @param {'direct'|'proxy'} channel
  * @param {{httpPort:number,socksPort:number}} cfg
  */
-function applyProxyEnv(env, channel, cfg) {
+export function applyProxyEnv(env, channel, cfg) {
+  // 大小写不敏感地摘掉全部代理相关键（http_proxy/https_proxy/all_proxy/no_proxy 各自的大小写形态）
+  for (const k of Object.keys(env)) {
+    if (/^(https?_proxy|all_proxy|no_proxy)$/i.test(k)) delete env[k];
+  }
   if (channel === 'proxy') {
     const host = paths.PROXY_HOST;
     const httpUrl = `http://${host}:${cfg.httpPort}`;
     env.http_proxy = httpUrl;
     env.https_proxy = httpUrl;
     env.all_proxy = `socks5://${host}:${cfg.socksPort}`;
-  } else if (channel === 'direct') {
-    // direct：显式删除（不是置空），确保真的不走代理
-    delete env.http_proxy;
-    delete env.https_proxy;
-    delete env.all_proxy;
   }
 }
 
