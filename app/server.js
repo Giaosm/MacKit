@@ -751,7 +751,10 @@ async function handleApi(req, res, url) {
   }
 
   // 扫描 /Applications：被隔离且无法打开的应用
+  // ★ 这是**有可见副作用**的 GET（一轮约几十个子进程、数秒），与 chooseFolder 同一道闸：
+  //   跨站 `<img src>` 之类不带 Origin 的子资源请求不得触发它（否则任意网页可反复打满 syspolicyd）。
   if (method === 'GET' && pathname === '/api/unseal/scan') {
+    requireUiTriggered(req, '扫描应用');
     ok(res, await queryModule('unseal', 'scan', {}));
     return;
   }

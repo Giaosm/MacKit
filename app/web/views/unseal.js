@@ -6,13 +6,15 @@
  * 契约：
  *   - GET /api/unseal/precheck?paths=a|b|c → { items:[{input,path,exists,isDir,hasQuarantine,
  *                                              needsAdmin,note?,discovered?}] }（多路径用 | 连接并 encodeURIComponent）
- *   - GET /api/unseal/scan → { items:[{name,path,reason,icon}], total, quarantined, blocked }
+ *   - GET /api/unseal/scan → { items:[{name,path,reason,icon}], total, quarantined, blocked, unevaluated }
+ *     （unevaluated = 隔离了但 spctl 评估失败、无法判定的项数，如实显示不猜结论）
  *   - unseal.unseal_paths{ paths } → 逐项 xattr -dr；普通权限失败才降级 osascript 授权框
  *   - 结果三分类：ok / skip（授权被取消 = AUTH_CANCELLED，**黄色**，不是失败）/ fail（可复制路径）
  *
  * 单卡片布局：顶部工具条（一键扫描 + 手工粘贴），下方依次为「扫描结果（图标网格）」、
  * 「手工粘贴（列表）」、「结果」。浏览器安全限制：拿不到绝对路径时明确降级提示，绝不伪造路径。
  * 拖拽能力已移除（浏览器无法可靠读取拖入项绝对路径，实用性为零）。
+ * 结果卡的「完整路径」直接读 step.path（后端随 step 下发）；不再依赖日志行的位置重建。
  */
 
 export default {
@@ -21,7 +23,7 @@ export default {
 
   mount(root, ctx) {
     const { el, ui, api } = ctx;
-    const S = { paths: [], items: null, selected: new Set(), logPaths: [], scan: null, scanning: false, scanSelected: new Set(), scanUnsealing: false };
+    const S = { paths: [], items: null, selected: new Set(), scan: null, scanning: false, scanSelected: new Set(), scanUnsealing: false };
     let updateStart = () => {};
     let updateScanBtn = () => {};
 
@@ -41,6 +43,18 @@ export default {
     const pendingBox = el('div');
     const resultBox = el('div');
 
+    // 「解隔离选中」计数 + 扫描忙碌态。
+    // ★ 2026-09-21 修：updateScanBtn 此前只声明 `let updateScanBtn = () => {}` 却从未赋值 ——
+    //   死代码，导致按钮既没有已选数量、也不会在扫描中禁用（可以连点出多轮 spctl 风暴）。
+    updateScanBtn = () => {
+      const n = S.scanSelected.size;
+      scanUnsealBtn.textContent = `解隔离选中（${n}）`;
+      scanUnsealBtn.disabled = n === 0;
+      scanBtn.disabled = S.scanning;
+      scanBtn.textContent = S.scanning ? '扫描中…' : '检查 /Applications';
+    };
+    updateScanBtn();
+
     root.append(ui.card('解隔离', el('div', {}, [
       el('div', { class: 'toolbar' }, [scanBtn, el('div', { class: 'grow' }, [pasteBox]), addBtn]),
       scanArea,
@@ -50,7 +64,8 @@ export default {
 
     // ============================ 逻辑 ============================
     async function runScan() {
-      S.scanning = true; S.scan = null; renderScan();
+      if (S.scanning) return; // 双保险：后端也有 in-flight 去重，且按钮会同时被禁用
+      S.scanning = true; S.scan = null; updateScanBtn(); renderScan();
       try {
         const data = await api('GET', '/api/unseal/scan');
         S.scan = data || { items: [] };
@@ -58,7 +73,7 @@ export default {
       } catch (err) {
         S.scan = { error: (err && err.message) || String(err) };
       } finally {
-        S.scanning = false; renderScan();
+        S.scanning = false; updateScanBtn(); renderScan();
       }
     }
 
@@ -75,6 +90,8 @@ export default {
           ui.badge(`应用总数 ${s.total}`, 'muted'),
           ui.badge(`隔离 ${s.quarantined}`, 'warn'),
           ui.badge(`无法打开 ${s.blocked}`, s.blocked > 0 ? 'err' : 'ok'),
+          // 隔离了但 spctl 评估失败（超时等）→ 如实显示，不猜"能打开"也不猜"打不开"
+          s.unevaluated > 0 ? ui.badge(`未评估 ${s.unevaluated}`, 'muted') : null,
         ]),
       ]);
       let body;
@@ -186,7 +203,6 @@ export default {
       });
       if (!ok) return;
       if (fromScan) S.scanUnsealing = true;
-      S.logPaths = [];
       try { await ctx.runTask('unseal', 'unseal_paths', { paths: pathsToUnseal }); }
       catch { /* runTask 内部已 toast */ }
       // 结果卡只由 done 订阅（下方 ctx.on('done')）重建一次；此处不再重复 renderResult()。
@@ -197,14 +213,14 @@ export default {
       const t = ctx.state.task;
       if (!t || t.module !== 'unseal') return;
       const steps = t.steps || [];
-      const pathOf = resolvePaths(steps);
       const by = (st) => steps.filter((s) => s.status === st);
+      const of = (s) => stepPath(s);
       const skipped = by('skip').concat(by('cancelled'));
       const authCancelled = skipped.filter((s) => s.error && s.error.code === 'AUTH_CANCELLED');
       const otherSkip = skipped.filter((s) => !(s.error && s.error.code === 'AUTH_CANCELLED'));
       const failed = by('fail');
       const okList = by('ok');
-      const names = (arr) => el('ul', {}, arr.map((s) => el('li', { class: 'mono', text: pathOf.get(s.id) || s.title })));
+      const names = (arr) => el('ul', {}, arr.map((s) => el('li', { class: 'mono', text: of(s) })));
       resultBox.append(
         el('div', { class: 'row row--between section' }, [
           el('span', { class: 'unseal-sub', text: '结果' }),
@@ -215,35 +231,31 @@ export default {
           ]),
         ]),
         okList.length ? el('div', {}, [el('div', { class: 'muted', text: '✅ 成功：' }), names(okList)]) : null,
-        authCancelled.length ? el('div', { class: 'warn-box section' }, [`⏭ 已跳过（授权被取消）：${authCancelled.map((s) => pathOf.get(s.id) || s.title).join('、')}`]) : null,
+        authCancelled.length ? el('div', { class: 'warn-box section' }, [`⏭ 已跳过（授权被取消）：${authCancelled.map((s) => of(s)).join('、')}`]) : null,
         otherSkip.length ? el('div', { class: 'section' }, [el('div', { class: 'muted', text: '⏭ 其他跳过：' }), names(otherSkip)]) : null,
         failed.length ? el('div', { class: 'err-box section' }, [
           el('div', { text: '❌ 失败（可复制路径后重试）：' }),
           el('ul', {}, failed.map((s) => el('li', {}, [
-            el('span', { class: 'mono', text: pathOf.get(s.id) || s.title }), ' ',
-            el('button', { class: 'btn btn--sm', type: 'button', text: '复制路径', on: { click: () => ui.copy(pathOf.get(s.id) || s.title, '已复制路径') } }),
+            el('span', { class: 'mono', text: of(s) }), ' ',
+            el('button', { class: 'btn btn--sm', type: 'button', text: '复制路径', on: { click: () => ui.copy(of(s), '已复制路径') } }),
           ]))),
         ]) : null,
       );
     }
 
-    /** 把 step 映射到完整路径：unseal 步骤按顺序取捕获的「正在处理:」日志；缺失项直接用标题里的全路径。 */
-    function resolvePaths(steps) {
-      const map = new Map(); let k = 0;
-      for (const s of steps) {
-        const ttl = String(s.title || '');
-        if (ttl.startsWith('路径不存在')) map.set(s.id, ttl.replace(/^路径不存在\s*/, ''));
-        else map.set(s.id, S.logPaths[k++] || ttl.replace(/^解隔离\s*/, ''));
-      }
-      return map;
+    /**
+     * step → 完整路径：后端把完整路径随 step 下发（`step.path`，runner 会展开自定义字段）。
+     * ★ 2026-09-21 修：此前是「按顺序取捕获到的『正在处理:』日志行」（`S.logPaths[k++]`），
+     *   只要丢一行日志 / 切视图重挂载 / 刷新页面，整列路径就会错位，结果卡显示别人的路径。
+     *   旧历史任务没有 `path` 字段 → 回退到标题（basename 或「路径不存在 <全路径>」）。
+     */
+    function stepPath(s) {
+      if (s && typeof s.path === 'string' && s.path) return s.path;
+      const ttl = String((s && s.title) || '');
+      if (ttl.startsWith('路径不存在')) return ttl.replace(/^路径不存在\s*/, '');
+      return ttl.replace(/^解隔离\s*/, '');
     }
 
-    // 捕获逐项完整路径（用于失败项复制）；只认本视图任务，避免别的模块日志污染 S.logPaths
-    ctx.on('log', (line) => {
-      if (!ctx.state.task || ctx.state.task.module !== 'unseal') return;
-      const m = /^正在处理:\s*(.+)$/.exec((line && line.text) || '');
-      if (m) S.logPaths.push(m[1].trim());
-    });
     // 终态结果卡只由 done 重建一次；扫描解隔离完成后顺手刷新一次扫描结果（让刚解隔离的项消失）
     ctx.on('done', (t) => {
       if (t && t.module === 'unseal') {
