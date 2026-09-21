@@ -750,6 +750,12 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  // 扫描 /Applications：被隔离且无法打开的应用
+  if (method === 'GET' && pathname === '/api/unseal/scan') {
+    ok(res, await queryModule('unseal', 'scan', {}));
+    return;
+  }
+
   // WebDAV 备份（配置 / 列表走同步接口；上传 / 恢复 / 删除走任务流 POST /api/tasks）
   if (method === 'GET' && pathname === '/api/webdav/config') {
     const c = store.publicWebdav();

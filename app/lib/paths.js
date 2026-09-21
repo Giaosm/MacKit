@@ -277,6 +277,10 @@ export const OSASCRIPT_BIN = firstExisting(['/usr/bin/osascript'], '/usr/bin/osa
  */
 export const OPEN_BIN = firstExisting(['/usr/bin/open'], '/usr/bin/open');
 export const CURL_BIN = firstExisting(['/usr/bin/curl'], '/usr/bin/curl');
+/** spctl 可执行文件（Gatekeeper 评估：判断应用能否通过打开校验） */
+export const SPCTL_BIN = firstExisting(['/usr/sbin/spctl'], '/usr/sbin/spctl');
+/** sips 可执行文件（图标格式转换：icns → png） */
+export const SIPS_BIN = firstExisting(['/usr/bin/sips'], '/usr/bin/sips');
 /**
  * bash 可执行文件：仅用于执行 Homebrew 官方安装脚本（install.sh 需要 bash 解释器）。
  * 以绝对路径形式登记在 exec.js 的 ABSOLUTE_ALLOWED 中，不允许其他用途。

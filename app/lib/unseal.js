@@ -22,6 +22,7 @@ import * as exec from './exec.js';
 const { ERR, AppError } = exec;
 
 const QUARANTINE = 'com.apple.quarantine';
+const QTN_FLAG_USER_APPROVED = 0x40; // 用户在 Gatekeeper 弹窗点过「打开」后置位
 const MAX_DEPTH = 5;
 const XATTR_TIMEOUT = 120_000;
 const ADMIN_TIMEOUT = 180_000;
@@ -215,10 +216,161 @@ const actions = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// 只读查询：扫描 /Applications，找出「被隔离且无法打开」的应用
+// ---------------------------------------------------------------------------
+
+/**
+ * 递归列出目录下的 .app（≤ maxDepth 层）；命中 .app 后不再深入其内部。
+ * @param {string} dir
+ * @param {number} maxDepth
+ * @returns {string[]}
+ */
+function listApps(dir, maxDepth) {
+  const out = [];
+  const walk = (d, depth) => {
+    if (depth > maxDepth) return;
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      const full = path.join(d, e.name);
+      if (!e.isDirectory()) continue;
+      if (e.name.endsWith('.app')) { out.push(full); continue; }
+      walk(full, depth + 1);
+    }
+  };
+  walk(dir, 1);
+  return out;
+}
+
+/**
+ * 简易并发限流：最多 limit 个 fn 同时进行。
+ * @template T
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item:T, i:number) => Promise<void>} fn
+ */
+async function mapLimit(items, limit, fn) {
+  let i = 0;
+  const worker = async () => {
+    while (i < items.length) {
+      const idx = i++;
+      await fn(items[idx], idx);
+    }
+  };
+  const n = Math.min(Math.max(limit, 1), items.length || 1);
+  await Promise.all(Array.from({ length: n }, () => worker()));
+}
+
+/**
+ * 读取 .app 的 quarantine flags（十六进制位掩码）。
+ * 返回值：
+ *   - null：无隔离属性；
+ *   - NaN：有隔离属性但格式无法解析；
+ *   - 整数：解析后的 flags。
+ * 通过 `xattr -px` 读取，把 hex 转回字符串后取第一段分号前的 flags。
+ * @param {string} app
+ * @returns {Promise<number|null>}
+ */
+async function readQuarantineFlags(app) {
+  try {
+    const r = await exec.run('xattr', ['-px', QUARANTINE, app], { noMirror: true, timeoutMs: 10_000 });
+    if (r.code !== 0) return null;
+    const hex = r.stdout.replace(/\s+/g, '');
+    if (!hex) return NaN;
+    const str = Buffer.from(hex, 'hex').toString('utf8');
+    const token = str.split(';')[0];
+    const flags = parseInt(token, 16);
+    return Number.isNaN(flags) ? NaN : flags;
+  } catch { return null; }
+}
+
+/**
+ * 取应用主图标，转成 PNG 的 data URI（sips 把最大的 .icns 缩放至 128px）。
+ * 取不到（无 .icns / 转换失败）→ null，前端回退到字母头像。
+ * @param {string} app
+ * @returns {Promise<string|null>}
+ */
+async function appIconDataUri(app) {
+  const resDir = path.join(app, 'Contents', 'Resources');
+  /** @type {{full:string, size:number}[]} */
+  let candidates = [];
+  try {
+    const walk = (d, depth) => {
+      if (depth > 2) return;
+      let entries;
+      try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (e.name.startsWith('.')) continue;
+        const full = path.join(d, e.name);
+        try {
+          if (e.isDirectory()) { walk(full, depth + 1); continue; }
+          if (e.name.toLowerCase().endsWith('.icns')) {
+            const st = fs.statSync(full);
+            if (st.size > 0) candidates.push({ full, size: st.size });
+          }
+        } catch { /* ignore */ }
+      }
+    };
+    walk(resDir, 1);
+  } catch { /* ignore */ }
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.size - a.size);
+  const icns = candidates[0].full;
+  const tmp = path.join(paths.MACKIT_DIR, `.mackit-icon-${process.pid}-${Date.now()}.png`);
+  try {
+    paths.ensureDirs();
+    const r = await exec.run('sips', ['-s', 'format', 'png', icns, '--resampleHeightWidth', '128', '128', '--out', tmp], { noMirror: true, timeoutMs: 15_000 });
+    if (r.code !== 0) return null;
+    const buf = fs.readFileSync(tmp);
+    return `data:image/png;base64,${buf.toString('base64')}`;
+  } catch { return null; }
+  finally { try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ } }
+}
+
+/**
+ * GET /api/unseal/scan → { items:[{name,path,reason,icon}], total, quarantined, blocked }
+ *
+ * 判定口径：
+ *   - 隔离：`xattr -p com.apple.quarantine <app>` 退出码 0（属性存在）。
+ *   - 已批准：quarantine flags 的 0x40 位（USER_APPROVED）置位，表示用户已在 Gatekeeper
+ *     弹窗点过「打开」或系统设置里点过「仍要打开」——这类应用实际能打开，直接跳过。
+ *   - 无法打开：Gatekeeper 评估 `spctl -a -t exec` 退出码非 0（被拦截 / 无签名 / 损坏）。
+ *   三者都满足（隔离 + 未批准 + spctl 拒绝）才纳入。
+ */
+async function scanApplications() {
+  const apps = listApps('/Applications', 4);
+  /** @type {{app:string,flags:number|null}[]} */
+  const quarantined = [];
+  // ① 快查隔离属性并解析 flags（xattr -px 输出 hex，解析成位掩码）
+  await mapLimit(apps, 24, async (app) => {
+    const flags = await readQuarantineFlags(app);
+    if (flags != null) quarantined.push({ app, flags });
+  });
+  // ② 对隔离且未获用户批准的应用做 Gatekeeper 评估（并发限流，避免一次性起上百个 spctl）
+  /** @type {object[]} */
+  const blocked = [];
+  await mapLimit(quarantined, 16, async ({ app, flags }) => {
+    // 用户已批准：Gatekeeper 弹窗已被放行，实际能打开，不再误报
+    // flags 为 NaN 表示解析失败，此时回退到 spctl 评估，避免漏判
+    if (Number.isFinite(flags) && (flags & QTN_FLAG_USER_APPROVED)) return;
+    const r = await exec.run('spctl', ['-a', '-t', 'exec', '-vv', app], { noMirror: true, timeoutMs: 15_000 });
+    if (r.code === 0) return; // 能过 Gatekeeper → 实际能打开，跳过
+    const raw = (r.stderr || r.stdout || '').trim();
+    const reason = raw ? raw.split('\n').filter(Boolean).pop() || 'Gatekeeper 拦截' : 'Gatekeeper 拦截';
+    const icon = await appIconDataUri(app);
+    blocked.push({ name: path.basename(app), path: app, reason, icon });
+  });
+  blocked.sort((a, b) => a.name.localeCompare(b.name));
+  return { items: blocked, total: apps.length, quarantined: quarantined.length, blocked: blocked.length };
+}
+
 export default {
   id: 'unseal',
   actions,
   queries: {
     precheck: queryPrecheck,
+    scan: scanApplications,
   },
 };

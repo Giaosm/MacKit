@@ -102,6 +102,8 @@ const BIN_MAP = Object.freeze({
   security: paths.SECURITY_BIN,
   osascript: paths.OSASCRIPT_BIN,
   curl: paths.CURL_BIN,
+  spctl: paths.SPCTL_BIN,
+  sips: paths.SIPS_BIN,
   node: paths.NODE_BIN,
   npm: paths.NPM_BIN,
   pnpm: paths.PNPM_BIN,

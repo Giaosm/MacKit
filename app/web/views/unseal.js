@@ -6,10 +6,13 @@
  * 契约：
  *   - GET /api/unseal/precheck?paths=a|b|c → { items:[{input,path,exists,isDir,hasQuarantine,
  *                                              needsAdmin,note?,discovered?}] }（多路径用 | 连接并 encodeURIComponent）
+ *   - GET /api/unseal/scan → { items:[{name,path,reason,icon}], total, quarantined, blocked }
  *   - unseal.unseal_paths{ paths } → 逐项 xattr -dr；普通权限失败才降级 osascript 授权框
  *   - 结果三分类：ok / skip（授权被取消 = AUTH_CANCELLED，**黄色**，不是失败）/ fail（可复制路径）
  *
- * 三种输入：拖拽 / 手工粘贴（多行）。浏览器安全限制：拿不到绝对路径时明确降级提示，绝不伪造路径。
+ * 单卡片布局：顶部工具条（一键扫描 + 手工粘贴），下方依次为「扫描结果（图标网格）」、
+ * 「手工粘贴（列表）」、「结果」。浏览器安全限制：拿不到绝对路径时明确降级提示，绝不伪造路径。
+ * 拖拽能力已移除（浏览器无法可靠读取拖入项绝对路径，实用性为零）。
  */
 
 export default {
@@ -18,48 +21,89 @@ export default {
 
   mount(root, ctx) {
     const { el, ui, api } = ctx;
-    const S = { paths: [], items: null, selected: new Set(), logPaths: [] };
+    const S = { paths: [], items: null, selected: new Set(), logPaths: [], scan: null, scanning: false, scanSelected: new Set(), scanUnsealing: false };
     let updateStart = () => {};
+    let updateScanBtn = () => {};
 
     // ============================ 头部 ============================
     root.append(el('div', { class: 'view-head' }, [
-      el('div', {}, [el('h1', { text: '应用解隔离' }), el('div', { class: 'muted', text: '移除 com.apple.quarantine（拖拽 / 粘贴 · 预检 · 批量）' })]),
-      el('button', { class: 'btn btn--ghost', type: 'button', text: '清空', on: { click: () => { S.paths = []; S.items = null; S.selected = new Set(); render(); } } }),
+      el('div', {}, [el('h1', { text: '应用解隔离' }), el('div', { class: 'muted', text: '检查 /Applications 中被隔离且打不开的应用，或手工粘贴任意路径，批量移除 com.apple.quarantine。' })]),
+      el('button', { class: 'btn btn--ghost', type: 'button', text: '清空', on: { click: () => { S.paths = []; S.items = null; S.selected = new Set(); S.scan = null; render(); } } }),
     ]));
 
-    // ============================ 拖拽区 ============================
-    const dz = el('div', {
-      class: 'dropzone',
-      on: {
-        dragover: (e) => { e.preventDefault(); dz.classList.add('is-over'); },
-        dragleave: () => dz.classList.remove('is-over'),
-        drop: (e) => { e.preventDefault(); dz.classList.remove('is-over'); onDrop(e); },
-      },
-    }, [
-      el('div', { text: '把 .app 或文件夹拖到这里（支持多选；文件夹会自动递归发现 .app）' }),
-      el('div', { class: 'muted', style: 'margin-top:8px; font-size:12px', text: '浏览器出于安全限制通常无法读取拖入项的绝对路径；若无法获取，请改用手工粘贴。' }),
-    ]);
+    // ============================ 单一内容卡片 ============================
+    const scanBtn = el('button', { class: 'btn btn--primary', type: 'button', text: '检查 /Applications', on: { click: () => runScan() } });
+    const scanUnsealBtn = el('button', { class: 'btn', type: 'button', text: '解隔离选中', on: { click: () => unsealPaths(Array.from(S.scanSelected), true) } });
+    const pasteBox = el('textarea', { rows: '2', placeholder: '或手工粘贴路径（每行一个，如 /Applications/Some.app 或 ~/Downloads/Bundle）', style: 'width:100%; font-family:var(--font-mono); font-size:12px; resize:vertical' });
+    const addBtn = el('button', { class: 'btn', type: 'button', text: '添加', on: { click: () => { addPaths(pasteBox.value.split(/\r?\n/)); pasteBox.value = ''; } } });
 
-    // ============================ 手工粘贴 ============================
-    const pasteBox = el('textarea', { rows: '4', placeholder: '每行一个路径，例如：\n/Applications/Some.app\n~/Downloads/Bundle/', style: 'width:100%; font-family:var(--font-mono); font-size:12px' });
-    const addBtn = el('button', { class: 'btn btn--primary', type: 'button', text: '添加到待处理', on: { click: () => { addPaths(pasteBox.value.split(/\r?\n/)); pasteBox.value = ''; } } });
-
-    // ============================ 动态容器 ============================
+    const scanArea = el('div');
     const pendingBox = el('div');
     const resultBox = el('div');
-    root.append(dz, ui.card('手工粘贴路径', el('div', {}, [pasteBox, el('div', { class: 'row section' }, [addBtn, el('span', { class: 'muted', text: '路径会被规范化（剥离引号 / 去空白 / 展开 ~）；空路径与不存在项在预检阶段即给出明确提示。' })])])), pendingBox, resultBox);
+
+    root.append(ui.card('解隔离', el('div', {}, [
+      el('div', { class: 'toolbar' }, [scanBtn, el('div', { class: 'grow' }, [pasteBox]), addBtn]),
+      scanArea,
+      pendingBox,
+      resultBox,
+    ])));
 
     // ============================ 逻辑 ============================
-    function onDrop(e) {
-      const dt = e.dataTransfer;
-      const files = dt && dt.files ? Array.from(dt.files) : [];
-      const got = [];
-      let blocked = false;
-      for (const f of files) { if (typeof f.path === 'string' && f.path) got.push(f.path); else blocked = true; }
-      if (!got.length) { ui.toast('warn', '浏览器无法获取拖入项的绝对路径，请改用手工粘贴路径'); return; }
-      if (blocked) ui.toast('warn', '部分项未能获取绝对路径，已忽略（可手工粘贴补齐）');
-      addPaths(got);
-      ui.toast('ok', `已添加 ${got.length} 个路径`);
+    async function runScan() {
+      S.scanning = true; S.scan = null; renderScan();
+      try {
+        const data = await api('GET', '/api/unseal/scan');
+        S.scan = data || { items: [] };
+        S.scanSelected = new Set((S.scan.items || []).map((it) => it.path));
+      } catch (err) {
+        S.scan = { error: (err && err.message) || String(err) };
+      } finally {
+        S.scanning = false; renderScan();
+      }
+    }
+
+    function renderScan() {
+      scanArea.innerHTML = '';
+      if (S.scanning) { scanArea.append(el('div', { class: 'view-loading', text: '正在扫描应用并评估 Gatekeeper（首次可能要十几秒）…' })); return; }
+      const s = S.scan;
+      if (!s) return;
+      if (s.error) { scanArea.append(el('div', { class: 'err-box', text: `扫描失败：${s.error}` })); return; }
+      const items = s.items || [];
+      const head = el('div', { class: 'row row--between section' }, [
+        el('span', { class: 'unseal-sub', text: '扫描结果' }),
+        el('span', { class: 'row' }, [
+          ui.badge(`应用总数 ${s.total}`, 'muted'),
+          ui.badge(`隔离 ${s.quarantined}`, 'warn'),
+          ui.badge(`无法打开 ${s.blocked}`, s.blocked > 0 ? 'err' : 'ok'),
+        ]),
+      ]);
+      let body;
+      if (items.length === 0) {
+        body = ui.empty({ icon: '✅', title: '没有无法打开的应用', text: '当前 /Applications 里被隔离的应用都能正常通过 Gatekeeper 打开。' });
+      } else {
+        const grid = el('div', { class: 'app-grid' }, items.map((it) => {
+          const checked = S.scanSelected.has(it.path);
+          const avatar = it.icon
+            ? el('img', { src: it.icon, alt: it.name, class: 'app-icon', width: 48, height: 48 })
+            : el('div', { class: 'app-icon app-icon--fallback', text: (it.name[0] || '?').toUpperCase() });
+          return el('label', { class: 'app-card' }, [
+            avatar,
+            el('div', { class: 'app-card__body' }, [
+              el('div', { class: 'app-card__name', text: it.name }),
+              el('div', { class: 'app-card__reason', text: it.reason || '' }),
+            ]),
+            el('input', {
+              type: 'checkbox', checked,
+              on: { change: (e) => { if (e.target.checked) S.scanSelected.add(it.path); else S.scanSelected.delete(it.path); updateScanBtn(); } },
+            }),
+          ]);
+        }));
+        body = el('div', {}, [
+          grid,
+          el('div', { class: 'row section' }, [scanUnsealBtn, el('span', { class: 'muted', text: '勾选需要解隔离的应用（默认全选），移除其 com.apple.quarantine 后即可正常打开。' })]),
+        ]);
+      }
+      scanArea.append(head, body);
     }
 
     function addPaths(raws) {
@@ -94,10 +138,7 @@ export default {
     function renderPending() {
       pendingBox.innerHTML = '';
       const items = S.items || [];
-      if (!items.length) {
-        pendingBox.append(ui.card('待处理', ui.empty({ icon: '📥', title: '尚未添加任何路径', text: '拖入 .app / 文件夹，或在上方手工粘贴路径后点击「添加到待处理」。' })));
-        return;
-      }
+      if (!items.length) return;
       const list = el('ul', { class: 'filelist' }, items.map((it) => {
         const actionable = it.exists && it.hasQuarantine !== false;
         const cb = el('input', {
@@ -121,31 +162,33 @@ export default {
           it.discovered && it.discovered.length ? el('ul', { class: 'filelist', style: 'margin-top:4px' }, it.discovered.map((p) => el('li', { class: 'mono muted', text: p }))) : null,
         ]);
       }));
-      const startBtn = el('button', { class: 'btn btn--primary', type: 'button', text: '开始解隔离', on: { click: start } });
+      const startBtn = el('button', { class: 'btn btn--primary', type: 'button', text: '开始解隔离', on: { click: () => unsealPaths(Array.from(S.selected), false) } });
       updateStart = () => { const n = S.selected.size; startBtn.textContent = `开始解隔离（${n}）`; startBtn.disabled = n === 0; };
       updateStart();
       const noQuarantine = items.filter((it) => it.exists && it.hasQuarantine === false).length;
       const missing = items.filter((it) => !it.exists).length;
-      pendingBox.append(ui.card(`待处理（${items.length}）`, el('div', {}, [
+      pendingBox.append(
+        el('div', { class: 'row row--between section' }, [el('span', { class: 'unseal-sub', text: `手工粘贴（${items.length}）` }), startBtn]),
         list,
-        el('div', { class: 'row section' }, [startBtn, el('span', { class: 'muted', text: `已自动勾选可处理项；无隔离属性 ${noQuarantine} 个（不进入执行队列）、路径不存在 ${missing} 个会被跳过。` })]),
-      ])));
+        el('div', { class: 'muted', style: 'font-size:12px' }, `已自动勾选可处理项；无隔离属性 ${noQuarantine} 个（不进入执行队列）、路径不存在 ${missing} 个会被跳过。`),
+      );
     }
 
-    async function start() {
-      const paths = Array.from(S.selected);
-      if (!paths.length) { ui.toast('warn', '请先勾选要处理的目标'); return; }
+    async function unsealPaths(pathsToUnseal, fromScan) {
+      if (!pathsToUnseal.length) { ui.toast('warn', '请先选择要处理的目标'); return; }
       const ok = await ui.confirmDialog({
-        title: `确认解除隔离（${paths.length} 个）`, confirmLabel: '开始',
+        title: `确认解除隔离（${pathsToUnseal.length} 个）`, confirmLabel: '开始',
         body: el('div', {}, [
           el('p', { text: '将对以下目标递归移除 com.apple.quarantine 隔离属性：' }),
-          el('ul', {}, paths.map((p) => el('li', { class: 'mono', text: p }))),
+          el('ul', {}, pathsToUnseal.map((p) => el('li', { class: 'mono', text: p }))),
           el('p', { class: 'muted', text: '个别项必要时会弹出系统管理员授权框；取消授权将被记为「已跳过」，不影响其余项。' }),
         ]),
       });
       if (!ok) return;
+      if (fromScan) S.scanUnsealing = true;
       S.logPaths = [];
-      try { await ctx.runTask('unseal', 'unseal_paths', { paths }); } catch { /* runTask 内部已 toast */ }
+      try { await ctx.runTask('unseal', 'unseal_paths', { paths: pathsToUnseal }); }
+      catch { /* runTask 内部已 toast */ }
       // 结果卡只由 done 订阅（下方 ctx.on('done')）重建一次；此处不再重复 renderResult()。
     }
 
@@ -162,11 +205,14 @@ export default {
       const failed = by('fail');
       const okList = by('ok');
       const names = (arr) => el('ul', {}, arr.map((s) => el('li', { class: 'mono', text: pathOf.get(s.id) || s.title })));
-      resultBox.append(ui.card('结果', el('div', {}, [
-        el('div', { class: 'row section' }, [
-          ui.badge(`✅ 成功 ${okList.length}`, 'ok'),
-          ui.badge(`⏭ 跳过 ${skipped.length}`, 'warn'),
-          ui.badge(`❌ 失败 ${failed.length}`, 'err'),
+      resultBox.append(
+        el('div', { class: 'row row--between section' }, [
+          el('span', { class: 'unseal-sub', text: '结果' }),
+          el('span', { class: 'row' }, [
+            ui.badge(`✅ 成功 ${okList.length}`, 'ok'),
+            ui.badge(`⏭ 跳过 ${skipped.length}`, 'warn'),
+            ui.badge(`❌ 失败 ${failed.length}`, 'err'),
+          ]),
         ]),
         okList.length ? el('div', {}, [el('div', { class: 'muted', text: '✅ 成功：' }), names(okList)]) : null,
         authCancelled.length ? el('div', { class: 'warn-box section' }, [`⏭ 已跳过（授权被取消）：${authCancelled.map((s) => pathOf.get(s.id) || s.title).join('、')}`]) : null,
@@ -178,7 +224,7 @@ export default {
             el('button', { class: 'btn btn--sm', type: 'button', text: '复制路径', on: { click: () => ui.copy(pathOf.get(s.id) || s.title, '已复制路径') } }),
           ]))),
         ]) : null,
-      ])));
+      );
     }
 
     /** 把 step 映射到完整路径：unseal 步骤按顺序取捕获的「正在处理:」日志；缺失项直接用标题里的全路径。 */
@@ -198,9 +244,13 @@ export default {
       const m = /^正在处理:\s*(.+)$/.exec((line && line.text) || '');
       if (m) S.logPaths.push(m[1].trim());
     });
-    // 终态结果卡只由 done 重建一次：后端在 done 之前先 emit('task')，两个订阅都调 renderResult
-    // 会让同一终态重复重建结果卡（task 订阅已删）。
-    ctx.on('done', (t) => { if (t && t.module === 'unseal') renderResult(); });
+    // 终态结果卡只由 done 重建一次；扫描解隔离完成后顺手刷新一次扫描结果（让刚解隔离的项消失）
+    ctx.on('done', (t) => {
+      if (t && t.module === 'unseal') {
+        renderResult();
+        if (S.scanUnsealing) { S.scanUnsealing = false; runScan(); }
+      }
+    });
 
     render();
   },

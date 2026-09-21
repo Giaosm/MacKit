@@ -540,6 +540,41 @@ label.check { display: inline-flex; align-items: center; gap: var(--space-2); cu
 }
 .dropzone.is-over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 
+/* ------------------------------ 解隔离：扫描结果图标网格 ------------------------------ */
+.app-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.app-card {
+  display: flex; flex-direction: column; align-items: center; gap: var(--space-2);
+  padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-elev); cursor: pointer; text-align: center;
+  transition: border-color .15s, box-shadow .15s, transform .12s, background .15s;
+}
+.app-card:hover { border-color: color-mix(in srgb, var(--accent) 34%, var(--border)); box-shadow: var(--shadow); transform: translateY(-2px); }
+.app-card:has(input:checked) {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-elev));
+}
+.app-icon {
+  width: 48px; height: 48px; border-radius: var(--radius-sm); object-fit: contain;
+  background: var(--bg-sunken);
+}
+.app-icon--fallback {
+  display: grid; place-items: center;
+  font-family: var(--font-display); font-weight: 600; font-size: 22px; color: var(--fg-muted);
+  border: 1px dashed var(--border);
+}
+.app-card__body { min-width: 0; width: 100%; }
+.app-card__name { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-card__reason { font-size: 11px; color: var(--err); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+.app-card input[type="checkbox"] { margin-top: 2px; accent-color: var(--accent); }
+
+/* 单卡片内的子分区标题（工具条下方：扫描结果 / 手工粘贴 / 结果） */
+.unseal-sub { font-weight: 600; font-size: 13px; margin: var(--space-4) 0 var(--space-2); }
+
 /* ------------------------------ WebDAV 备份（备份中心增量） ------------------------------ */
 .wvd-list { border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
 .wvd-item { padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border); }
