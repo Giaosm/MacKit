@@ -22,6 +22,15 @@ export default {
     const envBtn = el('button', { class: 'btn btn--ghost', type: 'button', text: '⟳ 重新体检', on: { click: () => load(true) } });
     // MacKit 自身更新按钮（状态由 /api/selfupdate/status 驱动）
     const updBtn = el('button', { class: 'btn', type: 'button', text: '检查 MacKit 更新', on: { click: () => onUpdate() } });
+    // ★「⟳ 重新检查」：自更新检查结果有 10 分钟磁盘缓存（selfupdate.js 的 CHECK_TTL_MS），
+    //   而 behind===0 时主按钮是**禁用**的 —— 于是「刚被推了代码 / 刚在远端提交」的用户最长 10 分钟内
+    //   没有任何入口强制重查，重启项目也没用（缓存在磁盘上）。这个按钮走 ?force=1 绕过缓存
+    //   （后端 /api/selfupdate/status 本来就支持 force，只是界面一直没有入口）。
+    const recheckBtn = el('button', {
+      class: 'btn btn--ghost', type: 'button', text: '⟳ 重新检查',
+      title: '绕过 10 分钟缓存，重新 fetch 比较远端',
+      on: { click: () => loadUpdate(true) },
+    });
 
     const head = el('div', { class: 'view-head' }, [
       el('div', {}, [el('h1', { text: '总览' }), el('div', { class: 'muted', text: '环境体检' })]),
@@ -29,6 +38,7 @@ export default {
         envCheckedAt,
         envBtn,
         updBtn,
+        recheckBtn,
       ]),
     ]);
     root.append(head, grid);
@@ -197,7 +207,12 @@ export default {
       const s = updateState;
       updBtn.className = 'btn';
       updBtn.title = '';
-      if (!s || s.checking) { updBtn.textContent = '检查 MacKit 更新…'; updBtn.disabled = true; return; }
+      // ★ 用严格布尔：`!s || s.checking` 在「有 s 但没有 checking 字段」时求值为 undefined
+      //   （浏览器里被 WebIDL 转成 false 看不出问题，但赋值语义不严谨）。
+      const checking = !s || s.checking === true;
+      recheckBtn.disabled = checking;
+      recheckBtn.textContent = checking ? '检查中…' : '⟳ 重新检查';
+      if (checking) { updBtn.textContent = '检查 MacKit 更新…'; updBtn.disabled = true; return; }
       if (!s.managed) {
         updBtn.textContent = '无法自动更新';
         updBtn.disabled = true;
@@ -214,7 +229,8 @@ export default {
       if (s.behind === 0) {
         updBtn.textContent = '已是最新';
         updBtn.disabled = true;
-        updBtn.title = `已与 ${s.upstream || '远端'} 同步${s.checkedAt ? `（${ctx.fmtTime(s.checkedAt)} 检查）` : ''}`;
+        updBtn.title = `已与 ${s.upstream || '远端'} 同步${s.checkedAt ? `（${ctx.fmtTime(s.checkedAt)} 检查）` : ''}`
+          + '；检查结果缓存 10 分钟，可用右侧「重新检查」强制刷新';
         return;
       }
       // behind === null：没查到（fetch 失败 / 网络问题）
