@@ -33,7 +33,23 @@ export default {
     ]);
     root.append(head, grid);
 
+    /** 最近一次 /api/env 结果（brewmeta 事件到达时要用它重渲染卡片）。 */
+    let lastEnv = null;
+
     function lightOf(st) { return ['ok', 'warn', 'error'].includes(st) ? st : 'warn'; }
+
+    /**
+     * 「元数据同步于 X」一行：brew 元数据是「可更新」的判定依据，只由 `brew update` 刷新
+     * （启动后服务端会自动同步，实测 1.7~3.2s）。显性化它，用户才知道这个数字有多新。
+     */
+    function metaLine() {
+      const bm = ctx.state.brewMeta;
+      if (!bm) return null;
+      if (bm.refreshing) return el('div', { class: 'muted', text: '⟳ 正在同步元数据…' });
+      const at = bm.refreshedAt ? `元数据同步于 ${ctx.fmtTime(bm.refreshedAt)}` : '元数据尚未同步过';
+      if (bm.lastError) return el('div', { class: 'warn-box', text: `${at} · ⚠ 上次同步失败：${bm.lastError}` });
+      return el('div', { class: 'muted', text: bm.stale ? `${at}（已过期，可在 Homebrew 管家点「重查可更新项」同步）` : at });
+    }
     function netRows(label, p) {
       const rows = [ui.kv(`${label}连通`, p && p.ok ? '🟢 正常' : '🔴 不可达')];
       if (p && p.ok) rows.push(ui.kv(`${label}出口 IP`, [p.ip || 'IP 信息获取失败', p.location ? ` · ${p.location}` : ''].join('')));
@@ -98,6 +114,7 @@ export default {
         ui.kv('可更新', outdated > 0 ? `${outdated} 项` : '0 项'),
       ]);
       if (outdated === 0) brewRows.append(el('div', { class: 'empty', style: 'padding:12px' }, [el('div', { class: 'empty__title', text: '🎉 所有 Homebrew 软件包均为最新' }), el('div', { class: 'muted', text: '无需更新' })]));
+      brewRows.append(metaLine());   // 「元数据同步于 X」：说明这个数字有多新
       if (b.tapEmpty) brewRows.append(el('div', { class: 'muted', text: 'ℹ Homebrew 7 默认不再显式列出 core / cask 等内置源，属正常现象。' }));
       grid.append(ui.card('🍺 Homebrew', brewRows, { light: lightOf(b.status) }));
 
@@ -236,7 +253,8 @@ export default {
       loadUpdate(true);
     }
 
-    ctx.on('env', (e) => render(e)); // 订阅由 app.js 在视图卸载时统一回收
+    ctx.on('env', (e) => { lastEnv = e; render(e); });          // 订阅由 app.js 在视图卸载时统一回收
+    ctx.on('brewmeta', () => render(lastEnv));                    // 元数据同步状态变化 → 重渲染那一行
     load(false);
     loadDsh();
     loadUpdate(false);

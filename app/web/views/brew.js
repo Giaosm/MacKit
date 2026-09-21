@@ -37,11 +37,14 @@ export default {
     // 体检反馈：右上角「上次体检 时间」+ 按钮忙碌态。
     // 修复「点了没反应」：刷新前后卡片数值往往完全一致，若不给任何可见反馈，用户会以为按钮失效。
     const envMeta = el('span', { class: 'view-head__meta' });
+    // 「元数据同步于 X」：brew 元数据是「可更新」判定的真相来源，它只由 `brew update` 刷新
+    // （启动后服务端会自动同步一次，实测 1.7~3.2s）。把它显性化，用户才能判断这个数字有多新。
+    const metaSync = el('span', { class: 'view-head__meta' });
     const envBtn = el('button', { class: 'btn btn--ghost', type: 'button', text: '⟳ 重新体检', on: { click: () => loadEnv(true) } });
 
     root.append(el('div', { class: 'view-head' }, [
       el('div', {}, [el('h1', { text: 'Homebrew 管家' }), el('div', { class: 'muted', text: '升级 · 卸载 · 设置' })]),
-      el('div', { class: 'row' }, [envMeta, envBtn]),
+      el('div', { class: 'row' }, [metaSync, envMeta, envBtn]),
     ]), envBox, tabsBox, panelBox);
 
     const TABS = [['upgrade', '升级列表'], ['download', '软件下载'], ['uninstall', '卸载管理'], ['settings', '设置']];
@@ -137,6 +140,16 @@ export default {
       ]), { light: 'warn' });
     }
 
+    /** 元数据同步状态一行文案（同步中 / 同步于 X / 同步失败）。 */
+    function renderMetaSync() {
+      const bm = ctx.state.brewMeta;
+      if (!bm) { metaSync.textContent = ''; return; }
+      if (bm.refreshing) { metaSync.textContent = '⟳ 正在同步元数据…'; return; }
+      const at = bm.refreshedAt ? `元数据同步于 ${ctx.fmtTime(bm.refreshedAt)}` : '元数据未同步过';
+      if (bm.lastError && !bm.refreshing) metaSync.textContent = `${at} · ⚠ 上次同步失败`;
+      else metaSync.textContent = bm.stale ? `${at}（已过期）` : at;
+    }
+
     async function loadEnv(force) {
       if (envBusy) return;
       envBusy = true;
@@ -218,6 +231,27 @@ export default {
         decisions.clear();
         draw();
       }
+
+      /**
+       * 「重查可更新项」：若元数据已过期，**先同步一次**（`brew update`，≈2s）再重算 ——
+       * 用户对「重查」的直觉就是「拿到新的」；元数据没过期时它就是纯重算（<1s，不联网）。
+       * ★ 必须定义在 panelUpgrade 内：它要用本面板的 load()（mock 在 mount 作用域会 ReferenceError）。
+       */
+      async function recheck(btn) {
+        const bm = ctx.state.brewMeta || {};
+        let refreshed = false;
+        if (bm.stale && bm.enabled !== false && !bm.refreshing) {
+          const idle = btn.textContent;
+          btn.disabled = true; btn.textContent = '同步元数据…';
+          try { await api('POST', '/api/brew/meta/refresh'); refreshed = true; }
+          catch (err) { ui.toast('warn', `元数据同步失败（仍按现有数据重算）：${err.message || err}`); }
+          finally { btn.disabled = false; btn.textContent = idle; }
+        }
+        load();
+        // 同步过就顺带刷一次体检，避免顶部「可更新 N 项」与下面的列表数字打架
+        if (refreshed) loadEnv(false);
+      }
+
       function setMode(key, m) {
         // 互斥；再次点击已选模式 → 取消选择（未选 = 不更新）
         if (decisions.get(key) === m) decisions.delete(key); else decisions.set(key, m);
@@ -289,7 +323,7 @@ export default {
         topBar.innerHTML = '';
         topBar.append(
           el('button', { class: 'btn btn--primary', type: 'button', text: '⬆ 一键更新本体并刷新索引（代理优先）', on: { click: () => { ctx.runTask('brew', 'brew_update').catch(() => {}); } } }),
-          el('button', { class: 'btn', type: 'button', text: '⟳ 重查可更新项', on: { click: load } }),
+          el('button', { class: 'btn', type: 'button', text: '⟳ 重查可更新项', on: { click: (e) => recheck(e.target) } }),
           el('span', { class: 'grow' }),
           searchI,
         );
@@ -544,7 +578,15 @@ export default {
           el('div', { class: 'row section' }, [el('button', { class: 'btn', type: 'button', text: '🧹 立即清理缓存', on: { click: () => { ctx.runTask('brew', 'cleanup').catch(() => {}); } } })]),
         ]));
 
-        host.append(el('div', { class: 'grid grid--2' }, [portCard, chCard]), mirrorCard, cleanCard, hintBox);
+        // Homebrew 元数据自动同步（默认开）：启动后若元数据过期就自动 `brew update`（≈2s），
+        // 让「可更新」重开即为真值；关掉后需手动点「重查可更新项」或「一键更新本体」。
+        const metaChk = el('input', { type: 'checkbox', checked: mk.brewAutoRefreshMeta !== false, on: { change: (e) => saveConfig({ brewAutoRefreshMeta: e.target.checked }, e.target.checked ? '已开启启动时自动同步元数据' : '已关闭启动时自动同步元数据') } });
+        const metaCard = ui.card('🔄 元数据同步', el('div', { class: 'card__rows' }, [
+          el('label', { class: 'check' }, [metaChk, el('span', { text: '启动时自动同步 Homebrew 元数据（brew update，实测 1.7~3.2 秒）' })]),
+          el('div', { class: 'muted', text: '元数据是「可更新 N 项」的判定依据，只由 brew update 刷新。开启后重开项目约 2 秒即为真值；关闭后该数字仅反映本机已有元数据，需手动点「重查可更新项」或「一键更新本体并刷新索引」。' }),
+        ]));
+
+        host.append(el('div', { class: 'grid grid--2' }, [portCard, chCard]), mirrorCard, cleanCard, metaCard, hintBox);
       }
       async function saveConfig(patch, msg) {
         try { config = await api('PUT', '/api/config', patch); ui.toast('ok', msg || '已保存'); draw(); } catch (err) { ui.toast('err', err.message || '保存失败'); }
@@ -597,7 +639,8 @@ export default {
     }
 
     ctx.on('env', () => { if (env) renderEnv(); });
-    renderTabs(); loadEnv(false);
+    ctx.on('brewmeta', () => renderMetaSync());
+    renderTabs(); renderMetaSync(); loadEnv(false);
     // 无条件首屏渲染（active 默认 'upgrade'）——不可依赖 active 判断，否则会整片空白。
     renderPanel();
     (async () => {

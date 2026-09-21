@@ -29,7 +29,7 @@ import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
 import * as env from './env.js';
-import { countSteps } from './runner.js';
+import { countSteps, isBusy as runnerIsBusy } from './runner.js';
 
 const { ERR, AppError } = exec;
 
@@ -266,6 +266,7 @@ async function runPolicyWithSelfHeal(ctx) {
   const args = ['update'];
   try {
     await runPolicy(ctx, 'proxy_first', 'Homebrew 更新', args);
+    markMetaRefreshed(); // `brew update` 成功 = 元数据已是最新，记时间戳避免启动自动同步再跑一遍
   } catch (err) {
     if (!looksLikeStaleGitLock(err)) throw err;
     const report = detectStaleGitLocks();
@@ -275,6 +276,7 @@ async function runPolicyWithSelfHeal(ctx) {
     await repairStaleGitState(ctx, { report });
     try {
       await runPolicy(ctx, 'proxy_first', 'Homebrew 更新', args);
+      markMetaRefreshed();
       ctx.log('ok', '已自动修复 Homebrew 仓库的陈旧锁并完成更新');
     } catch (retryErr) {
       // 重试仍失败：若依旧是锁问题（或现场又出现），给出可操作的手动命令；否则原样上抛
@@ -1092,6 +1094,113 @@ function finalizeSync(task, { log }) {
   try { env.invalidate(); } catch { /* ignore */ }
 }
 
+// ------------------------------ Homebrew 元数据自动同步（2026-09-21 新增） ------------------------------
+/**
+ * 「有没有软件需要更新」的唯一真相来源是本机 brew **元数据**（`brew outdated` 读的
+ * `~/Library/Caches/Homebrew/api/internal/packages.<平台>.jws.json`），而它只由 `brew update` 刷新。
+ * 实测（用户 22:16 / 22:19 / 22:25 三次任务日志）：`brew update` **1.7~3.2s**；
+ * 而「一键更新」里的两份索引下载是 4~173s —— 索引只服务搜索匹配、对更新判定毫无贡献。
+ * 所以启动时只做这 2 秒的一步，让总览/管家重开即为真值，不必等用户自己点按钮。
+ */
+/** 元数据视为「过期」的窗口：超过它就值得再 `brew update` 一次（上游发布粒度约 10 分钟）。 */
+const META_TTL_MS = 30 * 60 * 1000;
+/** 失败后的静默窗口：断网 / 代理没开时不要每隔一分钟重试。 */
+const META_FAIL_BACKOFF_MS = 5 * 60 * 1000;
+/** 单次 `brew update` 的超时（实测 1.7~3.2s，给足余量）。 */
+const META_TIMEOUT_MS = 120_000;
+
+const metaState = { refreshing: false, inflight: null, failedAt: 0, lastError: null };
+
+/** 同步成功时记录时间戳（节流依据；写盘失败不影响本次结果）。 */
+function markMetaRefreshed() {
+  try { store.writeMackit({ brewMetaRefreshedAt: Date.now() }); } catch { /* ignore */ }
+}
+
+/**
+ * 元数据同步状态（供 /api/health 与前端展示）。
+ * @returns {{enabled:boolean, refreshing:boolean, refreshedAt:number|null, stale:boolean,
+ *            ttlMs:number, failedAt:number|null, lastError:string|null}}
+ */
+export function brewMetaStatus() {
+  const c = cfg();
+  const at = typeof c.brewMetaRefreshedAt === 'number' ? c.brewMetaRefreshedAt : null;
+  return {
+    enabled: c.brewAutoRefreshMeta !== false,
+    refreshing: metaState.refreshing,
+    refreshedAt: at,
+    stale: !at || (Date.now() - at) >= META_TTL_MS,
+    ttlMs: META_TTL_MS,
+    failedAt: metaState.failedAt || null,
+    lastError: metaState.lastError,
+  };
+}
+
+/**
+ * 刷新 brew 元数据（`brew update`）。
+ *
+ * 跳过条件（按顺序）：开关关闭（除非 force）→ 未过期（除非 force）→ 失败静默期内（除非 force）
+ * → 有任务在跑（避免与升级/安装抢 index.lock，除非 force=user 点击时也仍然跳过并如实告知）
+ * → 已有在途刷新（复用同一个 Promise）。
+ *
+ * @param {{force?:boolean, maxAgeMs?:number, run?:Function, isBusy?:Function,
+ *          log?:(level:string,text:string)=>void}} [opts]
+ *   run / isBusy 可注入，便于单测与桩件验证。
+ * @returns {Promise<{ok?:boolean, skipped?:string, error?:string}&object>}
+ */
+export async function refreshBrewMeta(opts = {}) {
+  const log = typeof opts.log === 'function' ? opts.log : () => {};
+  const force = opts.force === true;
+  const maxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : META_TTL_MS;
+  const isBusy = typeof opts.isBusy === 'function' ? opts.isBusy : runnerIsBusy;
+  const run = typeof opts.run === 'function'
+    ? opts.run
+    : (policy, desc, bin, args, o) => exec.runWithChannel(policy, desc, bin, args, o);
+
+  const c = cfg();
+  if (c.brewAutoRefreshMeta === false && !force) return { skipped: 'disabled', ...brewMetaStatus() };
+  const at = typeof c.brewMetaRefreshedAt === 'number' ? c.brewMetaRefreshedAt : null;
+  if (!force && at && (Date.now() - at) < maxAgeMs) return { skipped: 'fresh', ...brewMetaStatus() };
+  if (!force && metaState.failedAt && (Date.now() - metaState.failedAt) < META_FAIL_BACKOFF_MS) return { skipped: 'backoff', ...brewMetaStatus() };
+  if (isBusy()) return { skipped: 'busy', ...brewMetaStatus() };
+  if (metaState.inflight) return metaState.inflight; // 并发去重（自动同步与用户点击共用同一把锁）
+
+  metaState.refreshing = true;
+  metaState.inflight = (async () => {
+    try {
+      await run('proxy_first', '同步 Homebrew 元数据', 'brew', ['update'], { timeoutMs: META_TIMEOUT_MS, env: BREW_ENV });
+      markMetaRefreshed();
+      metaState.failedAt = 0;
+      metaState.lastError = null;
+      log('ok', '已同步 Homebrew 元数据（brew update）');
+      // 作废环境体检缓存：下一次 /api/env 就会用新元数据重算「可更新 N 项」
+      try { env.invalidate(); } catch { /* ignore */ }
+      return { ok: true, ...brewMetaStatus() };
+    } catch (err) {
+      metaState.failedAt = Date.now();
+      metaState.lastError = (err && (err.detail || err.message)) || String(err);
+      log('warn', `同步 Homebrew 元数据失败（不影响其它功能，稍后重试）：${metaState.lastError}`);
+      return { ok: false, error: metaState.lastError, ...brewMetaStatus() };
+    } finally {
+      metaState.refreshing = false;
+      metaState.inflight = null;
+    }
+  })();
+  return metaState.inflight;
+}
+
+/**
+ * 启动时调用：过期就同步；若正有任务在跑（busy）则 60s 后重试，最多 3 次。
+ * 绝不阻塞启动 —— 调用方不应 await 它（fire-and-forget + catch）。
+ */
+export async function maybeAutoRefreshMeta(opts = {}) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const r = await refreshBrewMeta(opts);
+    if (!r || r.skipped !== 'busy') return r;
+    if (attempt < 2) await new Promise((res) => { const t = setTimeout(res, 60_000); if (t.unref) t.unref(); });
+  }
+  return { skipped: 'busy' };
+}
+
 // ------------------------------ 动作定义 ------------------------------
 const actions = {
 
@@ -1362,5 +1471,13 @@ export default {
     installed: queryInstalled,
     info: queryInfo,
     packageSearch: queryPackageSearch,
+    /** 元数据同步状态（只读；供 /api/health 与界面显示「元数据同步于 X」） */
+    metaStatus: () => brewMetaStatus(),
+    /** 手动触发一次元数据同步并等待完成（供「重查可更新项」在过期时先同步） */
+    refreshMeta: (params) => refreshBrewMeta({ force: !(params && params.force === false) }),
+    /** 启动时的自动同步（无 ctx，日志写 server.out；fire-and-forget） */
+    autoRefreshMeta: () => maybeAutoRefreshMeta({
+      log: (level, text) => console.log(`[MacKit]${level === 'warn' ? ' ⚠' : ''} ${text}`),
+    }),
   },
 };

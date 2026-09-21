@@ -526,6 +526,9 @@ async function buildSnapshot(gen) {
 /**
  * 清空环境快照缓存（并作废正在构建中的那一次，见 buildSnapshot 的 gen 校验）。
  */
+/** 是否正在构建体检快照（供 server.js 决定「brew 元数据同步」的时机，避免两边抢 brew 锁）。 */
+export function isBuilding() { return inflight !== null; }
+
 export function invalidate() {
   generation += 1;
   try { store.setCached(CACHE_KEY, null); } catch { /* ignore */ }

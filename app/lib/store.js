@@ -20,6 +20,11 @@ import * as paths from './paths.js';
 // ★ 本对象是**唯一**默认值事实源：readMackit 的每一处回落都必须引用它，不得写字面量。
 const MACKIT_DEFAULTS = Object.freeze({
   defaultChannel: 'auto', autoFallback: true, autoCleanup: true, lastCheckedAt: null, version: 1,
+  // Homebrew 元数据自动同步（2026-09-21）：启动后若元数据过期就自动跑一次 `brew update`（实测 1.7~3.2s），
+  // 让「可更新 N 项」重开项目即为真值，而不是等用户自己点按钮。可关（计量网络 / 公司代理场景）。
+  brewAutoRefreshMeta: true,
+  // 上次**成功**同步 brew 元数据的时间戳（节流依据；null = 从未成功过）
+  brewMetaRefreshedAt: null,
   // 音乐模块（第 8 模块）配置：默认下载目录 / 命名模板 / 网络通道 / 已选音源
   musicDownloadDir: paths.MUSIC_DEFAULT_DIR,
   musicNameTemplate: '{歌手} - {歌名}.{ext}',
@@ -309,6 +314,8 @@ export function readMackit() {
     // 升级完成后是否自动清理缓存：默认 true（对齐用户要求「默认开」）
     autoCleanup: typeof raw.autoCleanup === 'boolean' ? raw.autoCleanup : MACKIT_DEFAULTS.autoCleanup,
     lastCheckedAt: typeof raw.lastCheckedAt === 'number' ? raw.lastCheckedAt : MACKIT_DEFAULTS.lastCheckedAt,
+    brewAutoRefreshMeta: typeof raw.brewAutoRefreshMeta === 'boolean' ? raw.brewAutoRefreshMeta : MACKIT_DEFAULTS.brewAutoRefreshMeta,
+    brewMetaRefreshedAt: typeof raw.brewMetaRefreshedAt === 'number' ? raw.brewMetaRefreshedAt : MACKIT_DEFAULTS.brewMetaRefreshedAt,
     // 音乐模块。缺失/类型不符一律回落默认值（缺省下载目录、命名模板、通道、音源）。
     musicDownloadDir: typeof raw.musicDownloadDir === 'string' && raw.musicDownloadDir.trim()
       ? raw.musicDownloadDir : MACKIT_DEFAULTS.musicDownloadDir,
@@ -352,6 +359,8 @@ export function writeMackit(patch = {}) {
     next.autoCleanup = !!patch.autoCleanup;
   }
   if (patch.lastCheckedAt !== undefined) next.lastCheckedAt = typeof patch.lastCheckedAt === 'number' ? patch.lastCheckedAt : null;
+  if (patch.brewAutoRefreshMeta !== undefined) next.brewAutoRefreshMeta = !!patch.brewAutoRefreshMeta;
+  if (patch.brewMetaRefreshedAt !== undefined) next.brewMetaRefreshedAt = typeof patch.brewMetaRefreshedAt === 'number' ? patch.brewMetaRefreshedAt : null;
   // 音乐模块配置（缺失字段 = 不改写；空串回落默认值）
   if (patch.musicDownloadDir !== undefined) {
     const v = String(patch.musicDownloadDir || '').trim();

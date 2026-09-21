@@ -536,12 +536,17 @@ async function handleApi(req, res, url) {
       changedFiles: code.files,
       // 前端资源最近改动时刻：页面据此判断「自己是否已过期」（见 latestWebMtime 注释）
       webChangedAt: code.webChangedAt,
+      // Homebrew 元数据同步状态：前端据此显示「元数据同步于 X」，并在同步完成时自动刷新体检
+      brewMeta: brewMetaSafe(),
     });
     return;
   }
 
   if (method === 'GET' && pathname === '/api/env') {
-    ok(res, await env.snapshot({ force: url.searchParams.get('force') === '1' }));
+    const snap = await env.snapshot({ force: url.searchParams.get('force') === '1' });
+    ok(res, snap);
+    // 首屏体检已经出过一次 → 现在同步元数据不会和它抢锁（详见 tryKickMetaAutoSync 注释）
+    tryKickMetaAutoSync('首屏体检之后');
     return;
   }
 
@@ -558,11 +563,23 @@ async function handleApi(req, res, url) {
         mirror: typeof body.mirror === 'string' ? body.mirror : undefined,
       });
     }
-    if (body.defaultChannel !== undefined || body.autoFallback !== undefined || body.autoCleanup !== undefined || body.lastCheckedAt !== undefined) {
-      store.writeMackit({ defaultChannel: body.defaultChannel, autoFallback: body.autoFallback, autoCleanup: body.autoCleanup, lastCheckedAt: body.lastCheckedAt });
+    if (body.defaultChannel !== undefined || body.autoFallback !== undefined || body.autoCleanup !== undefined
+      || body.lastCheckedAt !== undefined || body.brewAutoRefreshMeta !== undefined) {
+      store.writeMackit({
+        defaultChannel: body.defaultChannel, autoFallback: body.autoFallback, autoCleanup: body.autoCleanup,
+        lastCheckedAt: body.lastCheckedAt, brewAutoRefreshMeta: body.brewAutoRefreshMeta,
+      });
     }
     env.invalidate();
     ok(res, { brewgo: store.readBrewgo(), mackit: store.readMackit() });
+    return;
+  }
+
+  // Homebrew 元数据同步状态 / 手动同步（同步是有可见副作用的操作，带同源闸）
+  if (method === 'GET' && pathname === '/api/brew/meta') { ok(res, await queryModule('brew', 'metaStatus', {})); return; }
+  if (method === 'POST' && pathname === '/api/brew/meta/refresh') {
+    requireUiTriggered(req, '同步 Homebrew 元数据');
+    ok(res, await queryModule('brew', 'refreshMeta', { force: true }));
     return;
   }
 
@@ -903,6 +920,51 @@ function requireUiTriggered(req, what) {
   checkApiOrigin(req);
 }
 
+/**
+ * brew 元数据自动同步的触发控制。
+ *
+ * 为什么不能「启动就到点跑」：`/api/env`（首屏体检）自己也要跑 5 条 brew 命令，两边同时开会抢
+ * Homebrew 的锁互相拖慢（本机实测首屏从 21s 变 36s；固定 20s 兜底也仍会撞上慢体检 → 45s）。
+ * 所以判据不是时间，而是**体检是否在构建中**（env.isBuilding()）：在构建就让开，2s 后再看。
+ * 于是「用户打开界面」这条路径上，同步总是发生在首屏出完之后，互不干扰。
+ * 全程 fire-and-forget：失败只记日志、绝不影响服务；模块内还有 30 分钟节流与 5 分钟失败退避。
+ */
+let metaAutoSyncDone = false;
+let metaAutoSyncTimer = null;
+function tryKickMetaAutoSync(reason, attempt = 0) {
+  if (metaAutoSyncDone) return;
+  if (env.isBuilding()) {
+    // 让开首屏体检：最多等 120s（60 × 2s），仍不行就在下一个空闲窗口重试
+    if (attempt >= 60) { log('brew 元数据自动同步：体检持续占用，推迟到下次启动'); return; }
+    metaAutoSyncTimer = setTimeout(() => tryKickMetaAutoSync(reason, attempt + 1), 2000);
+    if (metaAutoSyncTimer.unref) metaAutoSyncTimer.unref();
+    return;
+  }
+  metaAutoSyncDone = true;
+  if (metaAutoSyncTimer) { clearTimeout(metaAutoSyncTimer); metaAutoSyncTimer = null; }
+  queryModule('brew', 'autoRefreshMeta', {})
+    .then((r) => {
+      if (r && r.ok === false) log(`brew 元数据自动同步未成功（${reason}）：${r.error || ''}`);
+      else if (r && r.skipped) log(`brew 元数据自动同步已跳过（${reason}）：${r.skipped}`);
+      else log(`brew 元数据自动同步完成（${reason}）`);
+    })
+    .catch((err) => log('brew 元数据自动同步失败：', err && err.message));
+}
+function scheduleMetaAutoSync() {
+  // 首次检查放在 2s 后：若此刻界面刚开始体检，上面的 isBuilding() 会让它继续等
+  metaAutoSyncTimer = setTimeout(() => tryKickMetaAutoSync('启动后首次空闲'), 2000);
+  if (metaAutoSyncTimer.unref) metaAutoSyncTimer.unref();
+}
+
+/** brew 元数据同步状态：模块未加载 / 查询抛错时返回 null（健康接口绝不因此失败）。 */
+function brewMetaSafe() {
+  try {
+    const m = registry.get('brew');
+    if (!m || !m.queries || typeof m.queries.metaStatus !== 'function') return null;
+    return m.queries.metaStatus();
+  } catch { return null; }
+}
+
 async function handler(req, res) {
   try {
     // 解析必须放在 try 内：`new URL('//', base)` 会抛 Invalid URL（`//` 被当作
@@ -1186,6 +1248,11 @@ async function main() {
   });
 
   server.listen(port, paths.LOOPBACK);
+
+  // ★ 启动后同步一次 brew 元数据（`brew update`，实测 1.7~3.2s），让「可更新 N 项」重开即为真值。
+  //   实际触发时机见 scheduleMetaAutoSync()：等首屏体检出过一次再跑 —— 两边都要跑 brew 命令，
+  //   同时开会抢 Homebrew 的锁互相拖慢（本机实测 /api/env 从 21s 变成 36s）。
+  scheduleMetaAutoSync();
 }
 
 process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });

@@ -16,6 +16,7 @@
  */
 
 import { fmtRel } from './reltime.js';
+import { diffMetaState } from './meta-state.js';
 
 // ============================== 常量 ==============================
 const DEFAULT_PORT = 18080;
@@ -82,6 +83,8 @@ const state = {
   task: null,
   running: false, currentTaskId: null, history: [],
   view: null, viewInstance: null,
+  /** Homebrew 元数据同步状态（/api/health 的 brewMeta；视图用 ctx.state.brewMeta 读、订 'brewmeta' 事件） */
+  brewMeta: null,
 };
 
 // ============================== 事件总线 ==============================
@@ -534,6 +537,21 @@ async function pollHealth() {
     const d = await api('GET', '/api/health');
     lastHealth = d;
     syncHealthBanners();
+    // Homebrew 元数据自动同步（启动后服务端会跑一次 `brew update`，实测 1.7~3.2s）：
+    //   ① 状态广播给视图（显示「元数据同步于 X」/「正在同步」/「上次同步失败」）；
+    //   ② 元数据**刚被同步成功**时强制重算体检 —— 于是「可更新 N 项」当场变真值，
+    //      用户重开项目什么都不用点。判定用纯函数（比较时间戳，不看 refreshing 跳变，
+    //      原因见 meta-state.js：15s 轮询大概率错过 ~2s 的中间态）。
+    const prevMeta = state.brewMeta;
+    state.brewMeta = d.brewMeta || null;
+    emit('brewmeta', state.brewMeta);
+    const dm = diffMetaState(prevMeta, state.brewMeta);
+    if (dm.refreshed) {
+      toast('ok', 'Homebrew 元数据已同步');
+      refreshEnv(true).catch(() => { /* 体检失败已有 toast */ });
+    } else if (dm.failed) {
+      toast('warn', `Homebrew 元数据同步失败：${(state.brewMeta && state.brewMeta.lastError) || '原因见服务日志'}`);
+    }
     // 服务回来了，页面却还停在「服务已关闭」遮罩上 —— 说明用户点了关闭服务后，
     // 又从启动台/Dock 把 MacKit 打开了，而浏览器复用的就是这个旧标签页（启动器会优先
     // 聚焦已打开同一地址的标签）。页面自己不会醒，这里推一把重载回正常界面。
