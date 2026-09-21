@@ -23,8 +23,16 @@ import * as git from './git.js';
 
 const { ERR, AppError } = exec;
 
-/** 远端比较结果的缓存时长（10 分钟） */
-const CHECK_TTL_MS = 10 * 60 * 1000;
+/**
+ * 非强制查询的**防抖**间隔（30 秒）。
+ *
+ * ★ 2026-09-21 改（原为「结果缓存 10 分钟」）：那个值的唯一作用是避免每次进总览都跑一次
+ *   `git fetch`，但代价是「远端刚有提交 → 界面最长 10 分钟仍显示『已是最新』，而且重启项目
+ *   也没用（缓存在磁盘上）」，用户只能干等 —— 实测被这个坑到过。
+ *   现在语义是「**每次打开都重新检查**」，只留 30 秒防抖：在视图之间来回切换不会连发 fetch，
+ *   而人对 30 秒无感。「⟳ 重新检查」按钮（force）连这 30 秒也绕过。
+ */
+const CHECK_MIN_INTERVAL_MS = 30 * 1000;
 const CHECK_CACHE_KEY = 'selfupdate-check';
 /** 状态查询里的 fetch 超时（每个通道；runWithChannel 最多试两个通道） */
 const CHECK_FETCH_TIMEOUT_MS = 15_000;
@@ -40,6 +48,10 @@ const PULL_TIMEOUT_MS = 120_000;
  * 并照 lib/env.js 的 snapshot() 那样在 `.finally()` 里清空。
  */
 let checkInflight = null;
+/** 上次**尝试**检查的时刻（成功/失败都算；仅进程内）—— 供 30s 防抖使用。 */
+let lastAttemptAt = 0;
+/** 上次检查结果（含失败），防抖窗口内直接复用它（否则离线时每次进总览都要干等一次超时）。 */
+let lastResult = null;
 
 /**
  * 在**仓库目录里**跑一条 git 命令。
@@ -130,20 +142,24 @@ async function findConflicts(upstream, porcelain) {
  * @returns {Promise<{value:any, cached:boolean}>}
  */
 async function checkRemote(opts = {}) {
-  // 缓存命中路径（force 时跳过）：并发去重放在其后，让热点路径保持同步返回、不进任何锁。
-  if (opts.force !== true) {
-    const cached = store.getCached(CHECK_CACHE_KEY);
-    if (cached && cached.value && typeof cached.value === 'object'
-      && typeof cached.at === 'number' && Date.now() - cached.at < CHECK_TTL_MS) {
-      // 缓存里的值一定来自一次成功的 fetch（失败不写缓存）→ cached:true 仍如实表示「命中缓存」
-      return { value: cached.value, cached: true };
-    }
-  }
-
-  // ★ 已有一次检查在跑 → 直接复用它，不再发起第二条 fetch（避免抢 .git 锁）。
+  // ★ ① 已有一次检查在跑 → 直接复用它，不再发起第二条 fetch（避免抢 .git 锁）。
   //   force:true 也复用：那次 fetch 正在/即将拿到最新远端数据，对调用方就是「新鲜」的。
   if (checkInflight) return checkInflight;
 
+  // ★ ② 防抖（force 时跳过）：最近 30s 内已经查过（不管成功还是失败）就直接复用上次结果。
+  //   成功过的结果同时落盘（进程重启后仍可复用），失败只在进程内记着 —— 这样离线时
+  //   不会每次切回总览都干等一次 fetch 超时。
+  if (opts.force !== true) {
+    const cached = store.getCached(CHECK_CACHE_KEY);
+    const cachedAt = (cached && cached.value && typeof cached.at === 'number') ? cached.at : 0;
+    if (Date.now() - Math.max(cachedAt, lastAttemptAt) < CHECK_MIN_INTERVAL_MS) {
+      const value = lastResult || (cached && cached.value) || null;
+      if (value) return { value, cached: true };
+    }
+  }
+
+  // ★ ③ 真查：记下本次尝试（失败也算，供上面的防抖使用）
+  lastAttemptAt = Date.now();
   checkInflight = computeRemote().finally(() => { checkInflight = null; });
   return checkInflight;
 }
@@ -176,6 +192,7 @@ async function computeRemote() {
   }
 
   const value = { upstream, behind, ahead, latest, fetchOk, fetchError, checkedAt: Date.now() };
+  lastResult = value; // 供 30s 防抖复用（成功与失败都记）
   // ★ 2026-09-21 修复：fetch 失败时**不写缓存**（仍照常返回 value）。
   //   原实现无条件 setCached，导致瞬时网络故障被缓存 10 分钟：用户网络恢复后
   //   UI 仍一直显示「无法检查更新」，直到 TTL 过期。成功才缓存，同一成功结果依旧 10 分钟内复用。
