@@ -641,7 +641,8 @@ async function shutdown() {
     if (!ok) return;
   }
   try { await api('POST', '/api/shutdown'); } catch { /* 服务可能已退出 */ }
-  showVeil('服务已关闭', 'MacKit 后台服务已停止，可以关闭此标签页。需要时再次双击 MacKit.command 即可重新打开。');
+  // 只留一行：遮罩正文由这里全权负责（index.html 里不再另有一句静态文案，避免重复显示）
+  showVeil('服务已关闭', 'MacKit 后台服务已停止，可以关闭此标签页。');
 }
 
 /**
