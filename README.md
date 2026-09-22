@@ -12,7 +12,6 @@ macOS 日常维护工具箱 —— 把零碎的维护操作收拢到一个本地
 | --- | --- |
 | **总览** | 一键体检：Homebrew / Git / Rime / 代理等环境状态一览；旁边还有 **MacKit 自身更新** 按钮（有新版本时高亮） |
 | **Homebrew 管家** | 列出可升级的软件包并逐项选择「代理 / 直连」升级；搜索并安装 Formula（命令行工具 / 库）与 Cask 应用；卸载 formula / cask / tap；本机没装 Homebrew 时可一键安装 |
-| **DeepSeek Harness** | 一键安装 / 更新 `@deepseek-ai/dsh`；**插件市场 dshmarket 是独立的一个按钮**（需要 pnpm，会自动装；装过即锁定不重复安装） |
 | **音乐下载** | 输入关键词跨 57 个音源搜索、勾选后批量下载到本地，也可粘贴歌单 / 专辑链接批量解析。Python 依赖**按需**装到 `~/.mackit/py`，不用时一键卸载（见下文「音乐下载」） |
 | **系统初始化** | 把代理别名写进 shell 配置、设置 Git 全局项、把 GitHub Token 存进 macOS 钥匙串、配置代理端口 |
 | **Rime 输入法** | 安装 / 更新 rime-ice 词库，切换皮肤与布局，启用万象语法模型，写入配置 |
@@ -126,37 +125,13 @@ git pull --ff-only                      # 只做快进合并
 | `runtime.json` | 当前服务的端口与进程号 |
 | `logs/` | 各次任务的执行日志（保留最近 50 个任务 / 30 天；权限 600，与配置同口径） |
 | `history/` | 任务历史（保留最近 10 次） |
-| `cache/` | Homebrew 环境快照（30 秒）、Formula / Cask 搜索索引（24 小时）、DSH 最新版本与 MacKit 自更新检查（12 小时 / 10 分钟）、音乐搜索快照 |
+| `cache/` | Homebrew 环境快照（30 秒）、Formula / Cask 搜索索引（24 小时）、MacKit 自更新检查（10 分钟）、音乐搜索快照 |
 | `py/` | **可选**：音乐模块的隔离 Python 环境（`venv/`）与 pip 缓存（`cache/`）。没用过音乐模块时不存在；随「卸载音频环境」整体删除 |
 | `server.out` | 服务启动日志 |
 | `app-launch.log` | 从启动台 / Dock 每次启动的记录（退出码 + 输出），启动出问题时看它 |
 | `webdav.json` | WebDAV 备份凭据（明文，权限 600） |
 
 **安装时写进去的东西只有两处**：`/Applications/MacKit.app`（启动用的外壳）与 `~/.mackit/`（运行数据）。
-
-## DeepSeek Harness（dsh）
-
-侧边栏的 **DeepSeek Harness** 模块把官方安装流程收成了两个按钮（全局安装走代理优先、失败自动降级；需要本机已装 Node 20+）：
-
-| 步骤 | 命令 | 是否必装 |
-| --- | --- | --- |
-| 宿主 | `npm install -g @deepseek-ai/dsh` | 必装；**按钮跟着版本走**（见下） |
-| 前置 | `npm install -g pnpm` | 只有装插件市场时才需要 |
-| 插件市场 | `dsh plugin --profile web add dshmarket` | **可选**，与宿主分开的独立按钮；装过即锁定 |
-
-- 宿主与插件市场是界面上的**两个独立按钮**，互不牵连：
-  - **宿主按钮按「本地版本 vs registry 最新版」三态变化**：
-    | 情况 | 按钮 |
-    | --- | --- |
-    | 未安装 | **`安装`**，可点 |
-    | 已安装且已是最新 | **`已是最新`**，置灰禁用 |
-    | registry 上有新版 | **`更新到 x.y.z`**，可点 |
-    | 查不到（离线 / 被墙） | **`重新安装 / 更新`**，可点（不敢谎报「已是最新」） |
-  - 版本判断查的是 npm registry 的 `latest`（结果缓存 **12 小时**，所以不会每次体检都联网）。因为「已是最新」时按钮是禁用的，万一本地安装损坏需要强制重装，可以在终端执行 `npm install -g @deepseek-ai/dsh`。
-  - **`安装`**（插件市场）只在「已装宿主 + 未装插件」时可点；装好之后按钮变成 **`已安装` 并置灰**，**不提供再次安装 / 更新**。确实需要更新插件市场时，自己到终端执行 `dsh plugin --profile web add dshmarket`。
-- 插件装在 `~/.dsh/profiles/web`（dsh 自己的 profile 目录，与 `~/.mackit/` 互不相干）；装好后在 dsh web 的 **Settings → Plugin Market** 里管理插件。
-- `dsh web` 是长驻服务，MacKit **不代跑、也不提供启动入口**：装完后自己在终端执行 `dsh web`，再用浏览器打开它打印的地址。
-- npm 全局目录不可写时（例如官网 pkg 装的 Node），界面会提前拦下并给出替代方案（改用 Homebrew 的 Node，或 `npm config set prefix ~/.npm-global`），**不会偷偷提权用 sudo**。
 
 ## 音乐下载（可选模块）
 

@@ -2,7 +2,7 @@
  * MacKit · 执行层（唯一子进程出口）
  *
  *   - 一律 spawn(bin, argsArray, { shell:false })：绝不启用 shell 选项、绝不拼接命令行字符串
- *   - 命令白名单：brew / git / xattr / security / osascript / curl / node / npm / pnpm / dsh
+ *   - 命令白名单：brew / git / xattr / security / osascript / curl / node / npm / pnpm
  *     （+ 绝对路径的 Squirrel）
  *   - 环境变量注入：代理（channel）与 Homebrew 镜像源；PATH 完全固定（不继承宿主）
  *   - 流式 stdout/stderr 逐行回调、超时、AbortSignal 取消（SIGTERM→3s→SIGKILL）
@@ -93,7 +93,7 @@ const MAX_CAPTURE = 4_000_000;
 /**
  * 命令白名单：逻辑名 → 固定路径。
  * ★ 白名单即本表的键集（不另设平行数组，避免两处手工同步漏改）。
- *   node / npm / pnpm / dsh 供 DeepSeek Harness 模块安装与自检使用。
+ *   node / npm / pnpm 供脚本与自检使用。
  */
 const BIN_MAP = Object.freeze({
   brew: paths.BREW_BIN,
@@ -107,7 +107,6 @@ const BIN_MAP = Object.freeze({
   node: paths.NODE_BIN,
   npm: paths.NPM_BIN,
   pnpm: paths.PNPM_BIN,
-  dsh: paths.DSH_BIN,
 });
 
 /**
@@ -442,7 +441,7 @@ function buildEnv(opts) {
     // 每个非交互 bash 的 PATH 最顶），劫持 plum 配方管道里的 sed，导致 patch_files
     // 类配方（切换方案/语法模型补丁）把 YAML 正文当 bash 命令执行而全部失败。
     // MacKit 子进程只需要 PATH_PREFIX 内的工具（brew/git/curl/sed 等），全部显式固定。
-    // paths.EXEC_PATH = PATH_PREFIX + 各工具（node/npm/pnpm/dsh…）实际所在目录，
+    // paths.EXEC_PATH = PATH_PREFIX + 各工具（node/npm/pnpm…）实际所在目录，
     // 这样 nvm / 自定义前缀装的 Node 也能被 `#!/usr/bin/env node` 这类 shebang 找到。
     env.PATH = paths.EXEC_PATH.join(':');
     // 剥离会向子 shell 注入行为的变量：BASH_ENV 会被每个非交互 bash source；

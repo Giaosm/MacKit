@@ -66,49 +66,6 @@ export default {
       return rows;
     }
 
-    // DeepSeek Harness 卡片：数据源是独立的 /api/dsh/status（env 快照里已不再包含 dsh），
-    // 与体检渲染解耦 —— 用持久容器 dshHost，体检重渲染时只把它挂回网格。
-    const dshHost = el('div');
-    let dshState = { loading: true, data: null, error: null };
-
-    function renderDsh() {
-      dshHost.innerHTML = '';
-      const { loading, data: dh, error } = dshState;
-      if (loading) {
-        dshHost.append(ui.card('🐋 DeepSeek Harness', el('div', { class: 'view-loading', text: '正在读取 DSH 状态…' })));
-        return;
-      }
-      if (error || !dh) {
-        // 读取失败不抛错：给出明确文案并保留「前往安装」入口
-        dshHost.append(ui.card('🐋 DeepSeek Harness', el('div', { class: 'card__rows' }, [
-          el('div', { class: 'warn-box', text: '未能读取 DSH 状态' }),
-          el('button', { class: 'btn btn--sm', type: 'button', text: '前往安装 →', on: { click: () => ctx.navigate('#/dsh') } }),
-        ]), { light: 'warn' }));
-        return;
-      }
-      const dhDsh = dh.dsh || {};
-      const dhNode = dh.node || {};
-      const dhMarket = dh.market || {};
-      const dshRows = el('div', { class: 'card__rows' }, [
-        ui.kv('dsh', dhDsh.installed ? `${dhDsh.version || '已安装'}` : '未安装'),
-        ui.kv('Node.js / npm', `${dhNode.installed ? (dhNode.version || '✓') : '未检测到'} · ${(dh.npm && dh.npm.installed) ? 'npm ✓' : 'npm ✗'}`),
-        ui.kv('插件市场', dhMarket.installed ? `已安装${dhMarket.version ? ' v' + dhMarket.version : ''}` : '未安装（可选）'),
-      ]);
-      if (!dhDsh.installed) {
-        dshRows.append(el('div', { class: 'warn-box', text: '未检测到 DeepSeek Harness（dsh）。可在该模块里一键安装，并自行决定是否同时装插件市场。' }));
-        dshRows.append(el('button', { class: 'btn btn--sm', type: 'button', text: '前往安装 →', on: { click: () => ctx.navigate('#/dsh') } }));
-      }
-      dshHost.append(ui.card('🐋 DeepSeek Harness', dshRows, { light: dhDsh.installed ? 'ok' : 'warn' }));
-    }
-
-    async function loadDsh() {
-      dshState = { loading: true, data: null, error: null };
-      renderDsh();
-      try { dshState = { loading: false, data: await ctx.api('GET', '/api/dsh/status'), error: null }; }
-      catch (err) { dshState = { loading: false, data: null, error: err }; }
-      renderDsh();
-    }
-
     function render(e) {
       e = e || {};   // API 返回 undefined 时不能整卡抛错（会被 emit 的 try/catch 吞掉，页面永久停在「正在体检…」）
       grid.innerHTML = '';
@@ -172,9 +129,6 @@ export default {
         ui.kv('配置文件', el('span', { class: 'mono', text: pp.configPath || '—' })),
       ]), { light: lightOf(m.status) }));
 
-      // DeepSeek Harness（独立数据源 /api/dsh/status；env 快照已无 dsh）
-      grid.append(dshHost);
-      renderDsh();
     }
 
     let envBusy = false;
@@ -272,7 +226,6 @@ export default {
     ctx.on('env', (e) => { lastEnv = e; render(e); });          // 订阅由 app.js 在视图卸载时统一回收
     ctx.on('brewmeta', () => render(lastEnv));                    // 元数据同步状态变化 → 重渲染那一行
     load(false);
-    loadDsh();
     loadUpdate(false);
   },
 

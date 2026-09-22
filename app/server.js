@@ -47,7 +47,7 @@ const VERSION = readVersion();
 function log(...args) { console.log('[MacKit]', ...args); } // 被启动器重定向到 ~/.mackit/server.out
 
 // ------------------------------ 功能模块注册表（动态接入） ------------------------------
-const MODULE_FILES = Object.freeze({ brew: 'brew.js', sysinit: 'sysinit.js', rime: 'rime.js', unseal: 'unseal.js', backup: 'backup.js', dsh: 'dsh.js', selfupdate: 'selfupdate.js', music: 'music.js' });
+const MODULE_FILES = Object.freeze({ brew: 'brew.js', sysinit: 'sysinit.js', rime: 'rime.js', unseal: 'unseal.js', backup: 'backup.js', selfupdate: 'selfupdate.js', music: 'music.js' });
 const registry = new Map();
 
 async function loadModules() {
@@ -564,12 +564,10 @@ async function handleApi(req, res, url) {
       });
     }
     if (body.defaultChannel !== undefined || body.autoFallback !== undefined || body.autoCleanup !== undefined
-      || body.lastCheckedAt !== undefined || body.brewAutoRefreshMeta !== undefined
-      || body.dshChannel !== undefined) {
+      || body.lastCheckedAt !== undefined || body.brewAutoRefreshMeta !== undefined) {
       store.writeMackit({
         defaultChannel: body.defaultChannel, autoFallback: body.autoFallback, autoCleanup: body.autoCleanup,
         lastCheckedAt: body.lastCheckedAt, brewAutoRefreshMeta: body.brewAutoRefreshMeta,
-        dshChannel: body.dshChannel,
       });
     }
     env.invalidate();
@@ -631,13 +629,6 @@ async function handleApi(req, res, url) {
   if (method === 'POST' && pathname === '/api/sysinit/alias/preview') {
     const body = await readBody(req);
     ok(res, await queryModule('sysinit', 'aliasPreview', { mode: body.mode || 'keep' }));
-    return;
-  }
-
-  // DeepSeek Harness（安装状态 / 版本探测；安装本身走任务流 POST /api/tasks）
-  // force=1 绕过最新版本的 1 小时缓存（模块页「⟳ 重新检测」用）
-  if (method === 'GET' && pathname === '/api/dsh/status') {
-    ok(res, await queryModule('dsh', 'status', { force: url.searchParams.get('force') === '1' }));
     return;
   }
 

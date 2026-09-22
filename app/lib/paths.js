@@ -121,27 +121,6 @@ export const PLUM_DIR = path.join(HOME, 'plum');
 export const SQUIRREL_BIN = '/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel';
 
 // ---------------------------------------------------------------------------
-// DeepSeek Harness（dsh）
-// ---------------------------------------------------------------------------
-/** DSH 宿主包名（npm install -g @deepseek-ai/dsh） */
-export const DSH_PACKAGE = '@deepseek-ai/dsh';
-/** 插件市场包名（dsh plugin --profile web add dshmarket） */
-export const DSH_MARKET_PACKAGE = 'dshmarket';
-/** DSH 主 profile 名（dsh web 用的就是它） */
-export const DSH_WEB_PROFILE = 'web';
-/** DSH_HOME：环境变量可覆盖，默认 ~/.dsh（dsh 自身就是这么定的） */
-export const DSH_HOME = (() => {
-  const fromEnv = String(process.env.DSH_HOME || '').trim();
-  return fromEnv !== '' ? fromEnv : path.join(HOME, '.dsh');
-})();
-/** <DSH_HOME>/profiles */
-export const DSH_PROFILES_DIR = path.join(DSH_HOME, 'profiles');
-/** <DSH_HOME>/profiles/web —— web profile 目录 */
-export const DSH_WEB_PROFILE_DIR = path.join(DSH_PROFILES_DIR, DSH_WEB_PROFILE);
-/** web profile 的 package.json（插件依赖 / bundles 的事实源） */
-export const DSH_WEB_MANIFEST = path.join(DSH_WEB_PROFILE_DIR, 'package.json');
-
-// ---------------------------------------------------------------------------
 // MacKit 自身（自更新用）
 // ---------------------------------------------------------------------------
 /** 仓库根目录 = app/ 的上一级；README 推荐的就是 git clone，所以 .git 通常在这里 */
@@ -244,7 +223,7 @@ function pathDirs() {
 }
 
 /**
- * 在宿主 PATH 里找到第一个存在的可执行文件（npm / pnpm / dsh 的兜底探测）。
+ * 在宿主 PATH 里找到第一个存在的可执行文件（npm / pnpm 的兜底探测）。
  * @param {string} name 裸命令名
  * @returns {string|null}
  */
@@ -296,7 +275,7 @@ export const NODE_BIN = firstExisting(
 );
 
 /**
- * npm / pnpm / dsh 可执行文件（DeepSeek Harness 模块用）。
+ * npm / pnpm 可执行文件。
  * 探测顺序：Homebrew 两代前缀 → 官网 pkg 的 /usr/local → pnpm 独立安装目录 →
  * 宿主 PATH 里实际能找到的那一个（覆盖 nvm / fnm / volta 等）。
  * 都找不到时回落到确定路径，交给调用方按「不存在」处理（exec 层会把 spawn 失败报出来）。
@@ -305,17 +284,11 @@ export const NPM_BIN = firstExisting(
   [`${BREW_PREFIX}/bin/npm`, '/opt/homebrew/bin/npm', '/usr/local/bin/npm'],
   firstOnPath('npm') || `${BREW_PREFIX}/bin/npm`
 );
-/** pnpm（插件市场的前置；也可能来自 brew install pnpm 或独立安装脚本） */
+/** pnpm（可能来自 brew install pnpm 或独立安装脚本） */
 export const PNPM_BIN = firstExisting(
   [`${BREW_PREFIX}/bin/pnpm`, '/opt/homebrew/bin/pnpm', '/usr/local/bin/pnpm',
     path.join(HOME, 'Library', 'pnpm', 'pnpm'), path.join(HOME, '.local', 'share', 'pnpm', 'pnpm')],
   firstOnPath('pnpm') || `${BREW_PREFIX}/bin/pnpm`
-);
-/** dsh（DeepSeek Harness 宿主；npm install -g 后落在全局前缀的 bin 下） */
-export const DSH_BIN = firstExisting(
-  [`${BREW_PREFIX}/bin/dsh`, '/opt/homebrew/bin/dsh', '/usr/local/bin/dsh',
-    path.join(HOME, '.local', 'bin', 'dsh'), path.join(HOME, 'Library', 'pnpm', 'dsh')],
-  firstOnPath('dsh') || `${BREW_PREFIX}/bin/dsh`
 );
 
 /**
@@ -330,12 +303,12 @@ export const PATH_PREFIX = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '
  *
  * 在固定的 PATH_PREFIX 之后追加「上面探测到的各工具自己所在目录」：宿主 PATH 仍然
  * 完全不被继承（这是 2026-09-16 的教训，见 exec.buildEnv），但 nvm / fnm / 自定义
- * 前缀装的 node / npm / pnpm / dsh 也能被子进程找到 —— 否则 `#!/usr/bin/env node`
+ * 前缀装的 node / npm / pnpm 也能被子进程找到 —— 否则 `#!/usr/bin/env node`
  * 这类 shebang 会因为 PATH 里没有 node 而失败。
  * 去重且保持顺序：PATH_PREFIX 里已有的目录不会被重复追加。
  */
 export const EXEC_PATH = (() => {
-  const dirs = [NODE_BIN, NPM_BIN, PNPM_BIN, DSH_BIN, BREW_BIN, GIT_BIN]
+  const dirs = [NODE_BIN, NPM_BIN, PNPM_BIN, BREW_BIN, GIT_BIN]
     .map((bin) => path.dirname(bin));
   const seen = new Set();
   const out = [];
@@ -444,92 +417,3 @@ export const LOOPBACK = '127.0.0.1';
 
 /** 代理主机 */
 export const PROXY_HOST = '127.0.0.1';
-
-// ---------------------------------------------------------------------------
-// DeepSeek Harness · profile 清单读取（纯 fs，无子进程，供 dsh 模块与 env 体检共用）
-// ---------------------------------------------------------------------------
-
-/**
- * 读取 web profile 的 package.json。
- * @returns {any|null} 解析失败 / 文件不存在一律 null
- */
-export function readDshWebManifest() {
-  const text = readTextSafe(DSH_WEB_MANIFEST);
-  if (text === null) return null;
-  try {
-    const obj = JSON.parse(text);
-    return obj && typeof obj === 'object' ? obj : null;
-  } catch { return null; }
-}
-
-/**
- * 插件市场（dshmarket）在 web profile 里的安装状态。
- *
- * 「已装」以 node_modules/<包名>/package.json 的 version 为准（pnpm 装完即存在）；
- * 「已登记」看 profile 清单的 dsh.profile.bundles —— dsh 的 plugin 命令会在 pnpm
- * 成功后把声明了 dsh.bundle 的依赖补进 bundles，两者都齐才真正作为一层生效。
- *
- * @returns {{installed:boolean, declared:boolean, version:string|null, bundles:string[],
- *            profileDir:string, manifest:string}}
- */
-export function readDshMarketState() {
-  const manifest = readDshWebManifest();
-  const declared = !!(manifest && manifest.dependencies
-    && Object.prototype.hasOwnProperty.call(manifest.dependencies, DSH_MARKET_PACKAGE));
-  const bundleList = manifest && manifest.dsh && manifest.dsh.profile
-    && Array.isArray(manifest.dsh.profile.bundles) ? manifest.dsh.profile.bundles : [];
-  const bundles = bundleList.filter((b) => typeof b === 'string');
-
-  const pkgDir = path.join(DSH_WEB_PROFILE_DIR, 'node_modules', ...DSH_MARKET_PACKAGE.split('/'));
-  let version = null;
-  const pkgText = readTextSafe(path.join(pkgDir, 'package.json'));
-  if (pkgText !== null) {
-    try {
-      const pkg = JSON.parse(pkgText);
-      if (pkg && typeof pkg.version === 'string') version = pkg.version;
-    } catch { /* 版本读不到不影响「已安装」判定 */ }
-  }
-
-  return {
-    installed: version !== null || exists(pkgDir),
-    declared,
-    version,
-    bundles,
-    profileDir: DSH_WEB_PROFILE_DIR,
-    manifest: DSH_WEB_MANIFEST,
-  };
-}
-
-/**
- * DSH web profile 的插件解析状态（2026-09-22 新增）。
- *
- * 为什么需要它：`dsh` 升级（尤其升到 next/alpha 预览版）后，profile 里声明的第三方插件可能
- * 解析不到或无法激活 —— 表现就是 `dsh web` 直接起不来（"Failed to load plugins / N entry did
- * not activate"），用户被挡在自己的主界面之外。这里做**零副作用**的存在性检查：只读 profile 的
- * package.json 与 node_modules，不跑子进程、不写文件（`dsh --dump-config` 更权威，但它会重写
- * cordis.yml，所以只当安装任务里的校验步骤，不进状态查询）。
- *
- * 判定口径：`dsh.profile.bundles` 里除 `@deepseek-ai/dsh-*`（随 dsh 一起发布、必然存在）之外的
- * 名字，都应该能在 profile 的 node_modules 下解析到；缺任何一个就视为需要修复。
- *
- * @returns {{hasProfile:boolean, manifest:string, profileDir:string, bundles:string[],
- *            missing:string[], ok:boolean}}
- */
-export function readDshProfileState() {
-  const manifest = readDshWebManifest();
-  const bundleList = manifest && manifest.dsh && manifest.dsh.profile
-    && Array.isArray(manifest.dsh.profile.bundles) ? manifest.dsh.profile.bundles : [];
-  const bundles = bundleList.filter((b) => typeof b === 'string');
-  const missing = bundles.filter((name) => {
-    if (name.startsWith('@deepseek-ai/dsh-')) return false; // dsh 自带，随 dsh 升版
-    return !exists(path.join(DSH_WEB_PROFILE_DIR, 'node_modules', ...name.split('/')));
-  });
-  return {
-    hasProfile: manifest !== null,
-    manifest: DSH_WEB_MANIFEST,
-    profileDir: DSH_WEB_PROFILE_DIR,
-    bundles,
-    missing,
-    ok: missing.length === 0,
-  };
-}
