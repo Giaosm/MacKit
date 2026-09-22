@@ -29,7 +29,7 @@ import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
 import * as env from './env.js';
-import { policyForHost, policyForUrl, resolvePolicy } from './netpolicy.js';
+import { bareChannel, policyForHost, policyForUrl, resolvePolicy } from './netpolicy.js';
 import { countSteps, isBusy as runnerIsBusy } from './runner.js';
 
 const { ERR, AppError } = exec;
@@ -377,39 +377,195 @@ function parseOutdatedJson(text, key) {
 
 async function queryOutdated() {
   const formulae = await rawOutdated('formulae', ['outdated', '--json=v2', '--formula']);
-  const { items: casks, autoUpdates: autoCasks } = await queryCaskOutdated();
+  const { items: casks, upstream } = await queryCaskOutdated();
   const checkedAt = Date.now();
   try { store.writeMackit({ lastCheckedAt: checkedAt }); } catch { /* ignore */ }
   return {
     formulae,
     casks,
-    autoCasks,
-    counts: { formula: formulae.length, cask: casks.length, autoCask: autoCasks.length },
+    upstreamCasks: upstream,
+    counts: { formula: formulae.length, cask: casks.length, upstream: upstream.length },
     checkedAt,
   };
 }
 
+// ------------------------------ cask：应用真实版本 + 上游版本（纠 brew 的两类错判） ------------------------------
 /**
- * cask 的「可更新」查询：先按 `--greedy` 拿全（含 auto_updates），再用 `brew info` 标注
- * `auto_updates`，拆成两组返回。
+ * brew 对 cask 的 outdated 判定是「已装版本字符串 ≠ cask 版本」——**不比大小**，而且它记的是
+ * **Caskroom 里的记账版本**、不是应用真实版本。于是 auto_updates（自带更新）的应用会出现两类错判：
  *
- * 为什么 auto_updates（自带更新）的应用不能交给 brew 升级（2026-09-22 实测）：
- *   brew 对 cask 的 outdated 判定是「已装版本字符串 ≠ cask 版本」，**不比大小**；而 brew 默认
- *   会跳过 auto_updates 的 cask（须 `--greedy` 才纳入，见 `brew outdated --help`）。这类应用
- *   自己会更新，一旦应用内版本领先于 cask 里的记录，`brew upgrade` 就会把它「升」回旧版本
- *   = 版本回退。故只有 `items` 交给 brew 升级；`autoUpdates` 仅返回给界面说明原因，不参与升级。
+ *   · 假阳性（用户 2026-09-22 反馈 #2）：codebuddy-cn 应用已自更新到 4.12.1（= cask 版本），
+ *     而 brew 记账停在 4.12.0 → 天天报「可更新」，真装一次也只是把记账数字刷一致。
+ *   · 假阴性（用户 2026-09-22 反馈 #3）：clash-verge-rev 本机 2.5.2、上游已 v2.5.5，
+ *     但 homebrew-cask 自己也没跟上（仍停在 2.5.2）→ brew 完全不报，界面上什么都看不到。
  *
- * 为什么不直接用 `--greedy-latest` 把 auto_updates 滤掉：列表会凭空变空，用户只看到
- * 「无需更新」却不知道那些应用为什么消失（2026-09-22 用户反馈「没检测到啊」）。
+ * 修法：auto_updates 的 cask 一律以**应用 bundle 的真实版本**为准，并额外探一次**上游 release**：
+ *   · 应用版本「就是」cask 版本（cask 常在其后追加 build / commit）→ 无更新，不列出；
+ *   · 应用版本 < cask 版本 → 真落后 → **参与 brew 升级**（用户要求：自带更新的也要能升级）；
+ *   · 应用版本 > cask 版本 → brew 升级只会**降级**，不列出；
+ *   · 上游版本 > 本机版本且 cask 没跟上 → 单列「上游已有新版本」，提示用应用内更新。
+ * 非 auto_updates 的 cask 不自己更新，brew 记账即真值 → 口径原样。
+ */
+const UPSTREAM_TTL_MS = 6 * 60 * 60 * 1000;
+/** 上游版本缓存：repo(小写) → { at, tag }。6h 内不重复联网（本机 17 个 auto_updates 应用里 6 个走 GitHub）。 */
+const upstreamCache = new Map();
+
+/**
+ * 从 cask 的 url 认出 GitHub 仓库（`https://github.com/<owner>/<repo>/releases/...`）。
+ * @param {string} url
+ * @returns {string|null} 'owner/repo'
+ */
+function githubRepoFromCaskUrl(url) {
+  const m = /^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/releases\//i.exec(String(url || ''));
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
+/** 版本串 → 逐段数组（去前导 v；`,` `-` `_` `+` 都当分隔符）。 */
+function verSegments(v) {
+  return String(v == null ? '' : v).replace(/^v/i, '').split(/[.,\-_+]/).filter((s) => s !== '');
+}
+
+/**
+ * 版本比较（逐段：数字段按数值、其余按字典序；缺段视为更小）。
+ * @returns {number} a>b → 1；a<b → -1；相等 → 0
+ */
+function compareVer(a, b) {
+  const A = verSegments(a);
+  const B = verSegments(b);
+  for (let i = 0; i < Math.max(A.length, B.length); i += 1) {
+    const x = A[i];
+    const y = B[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (/^\d+$/.test(x) && /^\d+$/.test(y)) {
+      const d = Number(x) - Number(y);
+      if (d !== 0) return d > 0 ? 1 : -1;
+    } else if (x !== y) return x > y ? 1 : -1;
+  }
+  return 0;
+}
+
+/**
+ * 应用版本是否「就是」cask 版本 —— cask 版本常在后面追加 build / commit
+ * （如应用 `4.12.1` vs cask `4.12.1.39217423,757a5b2f`），所以按**前缀**判定，不能用大小比较。
+ * @param {string} appVer
+ * @param {string} caskVer
+ */
+function sameVersion(appVer, caskVer) {
+  const a = verSegments(appVer);
+  const c = verSegments(caskVer);
+  if (a.length === 0 || c.length === 0 || a.length > c.length) return false;
+  return a.every((seg, i) => seg === c[i]);
+}
+
+/**
+ * 读 .app 的真实已装版本（CFBundleShortVersionString）。读不到 → null（调用方回退 brew 口径）。
+ * @param {string|null} appTarget 形如 /Applications/Clash Verge.app
+ */
+async function readAppVersion(appTarget) {
+  if (!appTarget) return null;
+  try {
+    const plist = path.join(appTarget, 'Contents', 'Info.plist');
+    const r = await exec.run('plutil', ['-extract', 'CFBundleShortVersionString', 'raw', '-o', '-', plist],
+      { noMirror: true, timeoutMs: 10_000 });
+    const v = String(r.stdout || '').trim();
+    return r.code === 0 && v ? v : null;
+  } catch { return null; }
+}
+
+/**
+ * 一次 `brew info --json=v2 --cask <names...>` → token → 判定所需字段。
+ * 实测 22 个 cask 约 0.7s（本地 API 元数据，不联网）。
+ * @param {string[]} names
+ * @returns {Promise<Map<string,{token:string,version:string,installed:string,autoUpdates:boolean,appTarget:string|null,repo:string|null}>>}
+ */
+async function caskMetaMap(names) {
+  const out = new Map();
+  if (!Array.isArray(names) || names.length === 0) return out;
+  const res = await safeRun('brew', ['info', '--json=v2', '--cask', ...names]);
+  try {
+    const arr = JSON.parse(res.stdout || '{}').casks || [];
+    for (const c of arr) {
+      if (!c || !c.token) continue;
+      const app = (c.artifacts || []).find((a) => a && a.app && a.target);
+      out.set(String(c.token), {
+        token: String(c.token),
+        version: String(c.version || ''),
+        installed: Array.isArray(c.installed) ? String(c.installed[c.installed.length - 1] || '') : String(c.installed || ''),
+        autoUpdates: c.auto_updates === true,
+        appTarget: app ? String(app.target) : null,
+        repo: githubRepoFromCaskUrl(c.url),
+      });
+    }
+  } catch { /* 解析失败 → 空表（调用方回退 brew 口径） */ }
+  return out;
+}
+
+/**
+ * 探上游最新 release tag。
+ * ★ 用 GitHub 的 `releases/latest` **302 重定向**取 tag，不走 API —— 不需要 token、没有 60次/小时
+ *   的速率限制（本项目此前正是被 API 限流挡住过），且一次往返就够（不 -L 跟随，只读 location）。
+ * 走的是**模块通道**（GitHub → 自动档即代理优先），与其它联网行为一致。
+ * @param {string} repo 'owner/repo'
+ * @returns {Promise<string|null>} 形如 'v2.5.5'
+ */
+async function probeUpstreamTag(repo) {
+  if (!repo) return null;
+  const key = repo.toLowerCase();
+  const hit = upstreamCache.get(key);
+  if (hit && Date.now() - hit.at < UPSTREAM_TTL_MS) return hit.tag;
+  let tag = null;
+  try {
+    const res = await exec.run('curl',
+      ['-s', '-I', '--max-time', '15', `https://github.com/${repo}/releases/latest`],
+      { channel: bareChannel(brewPolicy('github.com')), noMirror: true, timeoutMs: 20_000 });
+    const m = /^location:\s*\S*\/releases\/tag\/([^\s]+)/im.exec(res.stdout || '');
+    if (m) tag = decodeURIComponent(m[1].trim());
+  } catch { /* 探测失败不影响主列表 */ }
+  // 失败也写缓存（tag=null，短 TTL 由下次 6h 后再试），避免每次刷新都打一遍
+  upstreamCache.set(key, { at: Date.now(), tag });
+  return tag;
+}
+
+/**
+ * cask 的「可更新」判定（返回可交给 brew 升级的项 + 上游已有新版本的提示项）。
+ * @returns {Promise<{items:object[], upstream:object[]}>}
  */
 async function queryCaskOutdated() {
-  const all = await rawOutdated('casks', ['outdated', '--json=v2', '--cask', '--greedy']);
-  if (all.length === 0) return { items: [], autoUpdates: [] };
-  const auto = await caskAutoUpdatesSet(all.map((it) => it.name));
-  return {
-    items: all.filter((it) => !auto.has(it.name)),
-    autoUpdates: all.filter((it) => auto.has(it.name)),
-  };
+  const flagged = await rawOutdated('casks', ['outdated', '--json=v2', '--cask', '--greedy']);
+  const installed = lineList((await safeRun('brew', ['list', '--cask'])).stdout);
+  const meta = await caskMetaMap(installed);
+
+  // ① brew 报「可更新」的：auto_updates 用应用真实版本纠偏
+  const items = [];
+  for (const it of flagged) {
+    const m = meta.get(it.name);
+    if (!m || !m.autoUpdates) { items.push({ ...it }); continue; }   // 非自带更新：brew 口径即真值
+    const appVer = await readAppVersion(m.appTarget);
+    if (!appVer) { items.push({ ...it, autoUpdates: true }); continue; }  // 读不到版本 → 保守按 brew 口径列出
+    if (sameVersion(appVer, m.version)) continue;        // 假阳性：应用已是 cask 版本（记账滞后）
+    if (compareVer(appVer, m.version) > 0) continue;      // 应用反而更新 → brew 装下去是降级，不列
+    items.push({ ...it, autoUpdates: true });             // 真落后 → 参与 brew 升级
+  }
+
+  // ② 上游探测：抓「cask 自己没跟上」的假阴性（brew 完全不报的那种）
+  const cands = [...meta.values()].filter((m) => m.autoUpdates && m.repo);
+  const upstream = [];
+  await Promise.all(cands.map(async (m) => {
+    const tag = await probeUpstreamTag(m.repo);
+    if (!tag || compareVer(tag, m.version) <= 0) return;   // 上游没超过 cask → 无话可说
+    const appVer = await readAppVersion(m.appTarget);
+    if (appVer && compareVer(tag, appVer) <= 0) return;    // 本机已经不比上游旧 → 不提示
+    upstream.push({
+      name: m.token,
+      current: appVer || m.installed || null,
+      cask: m.version || null,
+      latest: tag,
+    });
+  }));
+  upstream.sort((a, b) => a.name.localeCompare(b.name));
+  items.sort((a, b) => a.name.localeCompare(b.name));
+  return { items, upstream };
 }
 
 /**
@@ -425,41 +581,6 @@ async function rawOutdated(key, args) {
   const quietArgs = [...args.filter((a) => a !== '--json=v2'), '--quiet'];
   const q = await safeRun('brew', quietArgs);
   return lineList(q.stdout).map((n) => ({ name: n, current: null, latest: null }));
-}
-
-/**
- * 批量取 cask 的 `auto_updates` 标记（一次 `brew info --json=v2 --cask a b c` 拿回）。
- * 取不到时返回空集合 —— 宁可多列（走 brew 升级），也不静默把更新藏掉。
- * @param {string[]} names
- * @returns {Promise<Set<string>>}
- */
-async function caskAutoUpdatesSet(names) {
-  const out = new Set();
-  if (!Array.isArray(names) || names.length === 0) return out;
-  try {
-    const res = await safeRun('brew', ['info', '--json=v2', '--cask', ...names]);
-    const obj = JSON.parse(res.stdout || '{}');
-    const arr = Array.isArray(obj.casks) ? obj.casks : [];
-    for (const c of arr) if (c && c.auto_updates === true) out.add(String(c.token));
-  } catch { /* ignore */ }
-  return out;
-}
-
-/**
- * 单个 cask 是否声明 `auto_updates`（自带更新）—— 升级动作的逐项兜底。
- * 列表已按 auto_updates 分组，这里再查一次是防「旧缓存 / 手工参数」绕过列表直接升级：
- * brew 只比版本字符串是否相等，会把更高的已装版本「升」回 cask 里的旧版本（版本回退）。
- * @param {(bin:string,args:string[],opts?:object)=>Promise<{code:number,stdout:string}>} run
- * @param {string} name cask token
- * @returns {Promise<boolean>}
- */
-async function caskAutoUpdates(run, name) {
-  try {
-    const res = await run('brew', ['info', '--json=v2', '--cask', name], { env: BREW_ENV, timeoutMs: 120_000 });
-    const obj = JSON.parse(res.stdout || '{}');
-    const arr = Array.isArray(obj.casks) ? obj.casks : [];
-    return arr.some((c) => c && c.token === name && c.auto_updates === true);
-  } catch { return false; }
 }
 
 async function queryInstalled() {
@@ -1398,12 +1519,9 @@ const actions = {
               ctx.log('error', `名称不合法（含 brew 选项或非法字符），已跳过：${it.name}`);
               throw Object.assign(new AppError('SKIP', `名称不合法：${it.name}`), { code: 'SKIP' });
             }
-            // 兜底：自带更新（auto_updates）的 cask 不交给 brew 升级 —— brew 只比版本字符串是否相等，
-            // 会把更高的已装版本「升」回 cask 里的旧版本（2026-09-22 反向更新事故），故直接跳过。
-            if (kind === 'cask' && await caskAutoUpdates(ctx.exec.run, it.name)) {
-              ctx.log('warn', `${it.name} 自带更新（auto_updates），已跳过以免版本回退 —— 请在应用内更新`);
-              throw Object.assign(new AppError('SKIP', `${it.name} 自带更新，已跳过`), { code: 'SKIP' });
-            }
+            // ★ 自带更新（auto_updates）的 cask **照常交给 brew 升级**（2026-09-22 用户要求）：
+            //   列表侧已用「应用真实版本」纠过偏，只会列出真正落后的项（应用版本 > cask 的会被挡在
+            //   列表外，避免 brew 把它降级），所以这里不再做额外拦截。
             const args = ['upgrade'];
             if (kind === 'cask') args.push('--cask');
             args.push(it.name);

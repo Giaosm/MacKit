@@ -342,8 +342,10 @@ async function brewSnapshot() {
   const oF = await runQuiet('brew', ['outdated', '--formula', '--quiet'], { timeoutMs: 60_000 });
   snap.outdatedFormula = nonEmptyLines(oF.stdout).length;
 
-  // 口径与 brew 管家的「可更新」列表保持一致：用 --greedy-latest（不用 --greedy），
-  // 排除 auto_updates 的自带更新应用 —— 否则这里的「可更新 N 项」会比列表数字大。
+  // 口径：用 --greedy-latest（排除 auto_updates 的自带更新应用）。
+  // 为什么不跟 brew 管家页完全一致：那边要逐个读 .app 真实版本才能纠偏（含上游探测），
+  // 这里只是总览的轻量计数。取舍 —— auto_updates 里「应用已自更新、只有 brew 记账滞后」的
+  // 假阳性（如 codebuddy-cn）会常年虚报 1 项，比「偶尔漏计一个真落后的自带更新应用」更烦人。
   const oC = await runQuiet('brew', ['outdated', '--cask', '--greedy-latest', '--quiet'], { timeoutMs: 60_000 });
   snap.outdatedCask = nonEmptyLines(oC.stdout).length;
 

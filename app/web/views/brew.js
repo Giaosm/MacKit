@@ -284,6 +284,9 @@ export default {
         return el('div', { class: 'row row--between', style: 'padding:6px 0; border-bottom:1px solid var(--border,#2a2a2a)' }, [
           el('span', {}, [
             el('span', { class: 'mono', text: it.name }), ' ', ui.badge(it.kind, 'muted'), ' ',
+            // 自带更新（auto_updates）的应用照常参与 brew 升级（2026-09-22 用户要求），
+            // 只是打个标让用户知道它平时是自己升级的。
+            it.autoUpdates ? ui.badge('自带更新', 'muted') : null, it.autoUpdates ? ' ' : null,
             el('span', { class: 'muted', text: `当前 ${it.current || '—'} → 可用 ${it.latest || '—'}` }),
           ]),
           el('span', {}, [mutualBtn(key, cur, 'proxy', '代理'), ' ', mutualBtn(key, cur, 'direct', '直连')]),
@@ -296,21 +299,19 @@ export default {
           : [el('div', { class: 'muted', text: filter ? '（无匹配项）' : '（无）' })];
         return ui.card(title, el('div', {}, rows));
       }
-      // 自带更新（auto_updates）的 cask：brew 默认不管，MacKit 也不交给 brew 升级
-      // —— brew 只比版本字符串是否相等，会把应用自更新到的更高版本「升」回旧版（版本回退）。
-      // 但仍然列出来：否则列表为空时用户只看到「无需更新」，不知道这些应用为什么不见了
-      // （2026-09-22 用户反馈「没检测到啊」）。
-      function autoCaskCard() {
-        const items = Array.isArray(data.autoCasks) ? data.autoCasks : [];
+      // 「上游已有新版本」卡：brew 完全不报的那种情况 —— cask 自己没跟上上游（如 clash-verge-rev：
+      // 本机/ cask 都是 2.5.2，上游已 v2.5.5）。这种只能靠应用内更新，列出来让用户知道该去哪升。
+      function upstreamCard() {
+        const items = Array.isArray(data.upstreamCasks) ? data.upstreamCasks : [];
         if (items.length === 0) return null;
         const rows = items.map((it) => el('div', { class: 'row row--between', style: 'padding:6px 0' }, [
           el('span', {}, [
-            el('span', { class: 'mono', text: it.name }), ' ', ui.badge('自带更新', 'muted'), ' ',
-            el('span', { class: 'muted', text: `brew 记账 ${it.current || '—'} → cask ${it.latest || '—'}` }),
+            el('span', { class: 'mono', text: it.name }), ' ', ui.badge('上游有新版本', 'muted'), ' ',
+            el('span', { class: 'muted', text: `本机 ${it.current || '—'} → 上游 ${it.latest || '—'}（homebrew-cask 仍是 ${it.cask || '—'}）` }),
           ]),
-          el('span', { class: 'muted', text: '由应用自身升级' }),
+          el('span', { class: 'muted', text: '请在应用内更新' }),
         ]));
-        return ui.card(`自带更新的应用（${items.length}，不参与 brew 升级）`, el('div', {}, rows));
+        return ui.card(`上游已有新版本（${items.length}，brew 尚未跟进）`, el('div', {}, rows));
       }
       function drawList() {
         listHost.innerHTML = '';
@@ -322,7 +323,7 @@ export default {
             // 这里原先还有一个「重新检查」按钮：与正上方工具条的按钮同名同功能，
             // 两处并存只会让用户分不清各自做什么（2026-09-21 去掉重复入口，说明文字里已给出时间）。
           })));
-          const emptyAc = autoCaskCard();
+          const emptyAc = upstreamCard();
           if (emptyAc) listHost.append(emptyAc);
           renderSummary();
           return;
@@ -340,8 +341,8 @@ export default {
           groupCard(`Formula（${data.formulae.length}）`, data.formulae, 'formula'),
           groupCard(`Cask（${data.casks.length}）`, data.casks, 'cask'),
         ]));
-        // 说清为什么某些应用不在升级列表里（auto_updates 由应用自身升级，交给 brew 只会版本回退）
-        const ac = autoCaskCard();
+        // brew 没报、但上游已发新版（cask 没跟上）的应用，单列提示
+        const ac = upstreamCard();
         if (ac) listHost.append(ac);
         renderSummary();
       }

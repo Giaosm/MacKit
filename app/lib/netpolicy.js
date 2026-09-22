@@ -116,7 +116,16 @@ export function resolvePolicy(moduleId, autoPolicy) {
   return resolvePolicyFrom(cfg, moduleId, autoPolicy);
 }
 
+/**
+ * 策略 → 具体通道（子进程要的是 'proxy' / 'direct'，不是「优先」语义）。
+ * @param {'proxy_first'|'direct_first'} policy
+ * @returns {'proxy'|'direct'}
+ */
+export function bareChannel(policy) {
+  return policy === 'proxy_first' ? 'proxy' : 'direct';
+}
+
 export default {
   CHANNEL_VALUES, CHANNEL_MODULES, CHANNEL_LABELS,
-  policyForHost, policyForUrl, channelFromConfig, readModuleChannel, resolvePolicyFrom, resolvePolicy,
+  policyForHost, policyForUrl, channelFromConfig, readModuleChannel, resolvePolicyFrom, resolvePolicy, bareChannel,
 };

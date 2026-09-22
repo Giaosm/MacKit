@@ -104,6 +104,7 @@ const BIN_MAP = Object.freeze({
   curl: paths.CURL_BIN,
   spctl: paths.SPCTL_BIN,
   sips: paths.SIPS_BIN,
+  plutil: paths.PLUTIL_BIN,
   node: paths.NODE_BIN,
   npm: paths.NPM_BIN,
   pnpm: paths.PNPM_BIN,
