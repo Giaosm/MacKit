@@ -131,6 +131,21 @@ function pnpmInvocation(prefix) {
  * 用 curl 而不是 `npm view`：后者要起一个 node 进程 + 读 npm 配置，慢一个数量级。
  */
 const REGISTRY_DIST_TAGS_URL = `https://registry.npmjs.org/-/package/${paths.DSH_PACKAGE}/dist-tags`;
+/**
+ * 可选的更新频道（顺序 = 界面下拉的顺序）。
+ *
+ * ★ 2026-09-22 事故后的策略修正：默认**只跟 latest**。
+ *   上一版把「所有频道里 semver 最高」当作默认更新目标，于是本地 0.1.5-rc.2 的用户被一键推到
+ *   `alpha` 的 0.1.7-alpha.1 —— 而该 alpha 让 profile 插件 dsh-univer-office 无法激活，
+ *   `dsh web` 起不来、用户被挡在主界面外（实测日志 t_1790079434976_e9216c.log）。
+ *   现在：默认目标取选定频道的版本；**其它频道有更新的版本只做提示**，要装必须显式选频道。
+ */
+export const DSH_CHANNELS = ['latest', 'next', 'alpha'];
+/** 默认频道（= npm install -g <pkg> 的默认行为） */
+export const DSH_DEFAULT_CHANNEL = 'latest';
+/** 预览频道集合：选中它们时界面要给出明确警告（可能与已装插件不兼容） */
+export const DSH_PRERELEASE_CHANNELS = ['next', 'alpha'];
+
 /** 成功结果的缓存时长（1 小时）。原为 12h —— 该项目隔几天就发新版，12h 太钝。 */
 const LATEST_TTL_MS = 60 * 60 * 1000;
 /** 失败结果的缓存时长（15 分钟）——失败也缓存，免得每次开页面都去撞一次网络 */
@@ -217,6 +232,47 @@ export function pickNewestDistTag(tags) {
 }
 
 /**
+ * 解析「该装哪个版本」（纯函数，便于单测）。
+ *
+ * @param {Record<string,string>} tags npm dist-tags（如 {latest,next,alpha}）
+ * @param {string} channel 选定频道（不在白名单内则回落 latest）
+ * @param {string|null} installed 本地已装版本
+ * @returns {{channel:string, target:string|null, targetTag:string|null,
+ *            updateAvailable:boolean, newerChannels:{tag:string,version:string}[]}}
+ *   target：选定频道的最新版（该频道缺失时回落 latest）；updateAvailable：target 严格大于本地；
+ *   newerChannels：**其它**频道里比本地更高的版本，仅用于提示（绝不作为默认目标）。
+ */
+export function resolveDshTarget(tags, channel, installed) {
+  const map = (tags && typeof tags === 'object' && !Array.isArray(tags)) ? tags : {};
+  const ch = DSH_CHANNELS.includes(channel) ? channel : DSH_DEFAULT_CHANNEL;
+  const pick = (tag) => {
+    const v = map[tag];
+    return typeof v === 'string' && parseVersion(v) !== null ? v : null;
+  };
+  let targetTag = ch;
+  let target = pick(ch);
+  if (!target && ch !== DSH_DEFAULT_CHANNEL) { // 选定频道还没有发布 → 回落 latest，而不是硬报「无法检查」
+    const fallback = pick(DSH_DEFAULT_CHANNEL);
+    if (fallback) { target = fallback; targetTag = DSH_DEFAULT_CHANNEL; }
+  }
+  const updateAvailable = !!(target && installed && compareVersions(target, installed) === 1);
+  const newerChannels = Object.entries(map)
+    .filter(([tag, v]) => tag !== targetTag && typeof v === 'string' && parseVersion(v) !== null
+      && installed && compareVersions(v, installed) === 1)
+    .map(([tag, version]) => ({ tag, version }))
+    .sort((a, b) => (compareVersions(b.version, a.version) || 0));
+  // 兜底退路：本地版本比 latest 更高（例如手动/上一版 MacKit 装上了预览版）时，
+  // 「回到 latest」是唯一能一键脱身的动作 —— 事故现场往往没有 previousVersion 记录。
+  const latestTagVersion = pick(DSH_DEFAULT_CHANNEL);
+  const canDowngradeToLatest = !!(latestTagVersion && installed
+    && compareVersions(latestTagVersion, installed) === -1);
+  return {
+    channel: ch, target, targetTag, updateAvailable, newerChannels,
+    latestTagVersion, canDowngradeToLatest,
+  };
+}
+
+/**
  * 查宿主包在 npm registry 上的最新版本。
  *
  * 磁盘缓存 + 失败也缓存：调用方是 30s 一次的环境体检链路，没有缓存会把 registry
@@ -283,10 +339,17 @@ export async function queryStatus(opts = {}) {
   const nodeMajor = Number.isFinite(major) ? major : null;
 
   const dshVersion = firstLine(dshRes);
-  const latestVersion = latest ? latest.version : null;
-  // 「有更新」= 查到了最新版 && 本地已装 && 最新版严格大于本地版
-  const updateAvailable = !!(latestVersion && dshVersion
-    && compareVersions(latestVersion, dshVersion) === 1);
+  const cfg = store.readMackit();
+  // 频道策略：默认只跟 latest；next/alpha 必须用户显式选（见 DSH_CHANNELS 注释里的事故说明）
+  const picked = resolveDshTarget(latest ? latest.tags : null, cfg.dshChannel, dshVersion);
+  const latestVersion = picked.target;      // ✅ 按钮将要安装的版本（选定频道）
+  const updateAvailable = picked.updateAvailable;
+  const profile = paths.readDshProfileState();
+  // 回滚目标：优先用「更新前记录的版本」；没有记录但本地高于 latest 时，允许回到 latest（见纯函数）
+  const previousVersion = cfg.dshPreviousVersion || null;
+  const rollbackTarget = (previousVersion && previousVersion !== dshVersion)
+    ? previousVersion
+    : (picked.canDowngradeToLatest ? picked.latestTagVersion : null);
 
   return {
     node: {
@@ -319,11 +382,22 @@ export async function queryStatus(opts = {}) {
       profileExists: paths.exists(paths.DSH_WEB_PROFILE_DIR),
       // 更新检查：latestVersion 为 null 表示「这次没查到」（离线等），而非「没有新版」
       latestVersion,
-      // 它来自哪个 npm 频道（latest / next / alpha …）：界面上要写出来，用户才知道自己装的是不是预发布
-      latestTag: latest ? (latest.tag || null) : null,
+      // 目标版本来自哪个频道 + 各频道当前版本：界面要写清楚，用户才知道自己装的是不是预发布
+      latestTag: picked.targetTag,
       latestTags: latest ? (latest.tags || null) : null,
+      channel: picked.channel,
+      channels: DSH_CHANNELS,
+      prereleaseChannels: DSH_PRERELEASE_CHANNELS,
+      // 其它频道里比本地更高的版本：**只做提示**（想装必须显式切频道）
+      newerChannels: picked.newerChannels,
       updateAvailable,
       updateCheckedAt: latest ? latest.checkedAt : null,
+      // 回滚目标：更新前记录过的版本，或（没记录时）回到 latest —— 界面据此给「回滚 / 回到 latest」按钮
+      previousVersion,
+      rollbackTarget,
+      rollbackIsLatest: !previousVersion && !!picked.canDowngradeToLatest,
+      // profile 插件解析状态：缺插件 = `dsh web` 起不来的典型原因，界面上要能直接看到 + 一键修复
+      profile,
     },
     market: {
       packageName: paths.DSH_MARKET_PACKAGE,
@@ -476,6 +550,30 @@ function pnpmStep() {
   };
 }
 
+/**
+ * 更新前的第一步：把**当前**版本记进配置，供「回滚到 X」使用。
+ *
+ * 为什么必须有：`npm install -g` 换掉的是全局树（实测 "removed 88 packages, changed 432 packages"），
+ * 一旦新版与 profile 插件不兼容（0.1.7-alpha.1 就是如此），用户唯一的出路就是装回旧版 ——
+ * 而旧版号只有更新前记得住。（步骤失败不抛异常：记不住版本不该挡住安装。）
+ */
+function rememberDshStep() {
+  return {
+    id: 'remember_dsh', title: '记录当前版本（便于回滚）',
+    run: async (ctx) => {
+      const inv = dshInvocation(await npmPrefix());
+      if (!inv) return;
+      const res = await probe(inv.bin, [...inv.argv, '--version']);
+      const cur = firstLine(res);
+      if (!cur) return;
+      try {
+        store.writeMackit({ dshPreviousVersion: cur });
+        ctx.log('info', `当前版本 ${cur}（已记录；新版若与插件不兼容，可一键回滚）`);
+      } catch { /* 写配置失败不影响安装 */ }
+    },
+  };
+}
+
 /** 验证 dsh 可用（安装后自检）。 */
 function verifyDshStep() {
   return {
@@ -494,6 +592,49 @@ function verifyDshStep() {
         ctx.log('info', `提示：插件市场（${paths.DSH_MARKET_PACKAGE}）尚未安装，可在本页单独安装`);
       }
       ctx.log('info', '下一步：点「在终端启动 dsh web」，再在浏览器打开它提示的地址');
+    },
+  };
+}
+
+/**
+ * 安装后自检：profile 还能不能被 dsh 组装起来。
+ *
+ * 为什么加它：2026-09-22 的实测事故 —— dsh 升到 alpha 后 `dsh web` 直接起不来
+ * （"Failed to load plugins / 1 entry did not activate"），用户在任务日志里只看到「已就绪、
+ * 下一步启动 dsh web」，完全不知道自己的主界面已经进不去了。所以装完必须再问一次 profile。
+ *
+ * 判据：`dsh --profile web --dump-config` 的输出（它会把无法解析的 bundle 明确写出来，
+ * 例如 `dsh: skipping profile bundle "dsh-univer-office": cannot resolve …`）+ 退出码。
+ * **只告警、不把任务判失败**：dsh 本身装好了，坏的是 profile；同时给出官方修复命令与回滚指引，
+ * 并把结论写进 dsh.profile（模块页会显示成警告框）。
+ */
+function verifyProfileStep() {
+  return {
+    id: 'verify_profile', title: '校验 web profile 能否加载',
+    run: async (ctx) => {
+      const inv = dshInvocation(await npmPrefix());
+      if (!inv) return;
+      let out = '';
+      let code = null;
+      try {
+        const res = await ctx.exec.run(inv.bin,
+          [...inv.argv, '--profile', paths.DSH_WEB_PROFILE, '--dump-config'],
+          { timeoutMs: 60_000, channel: 'proxy' });
+        out = `${res.stdout || ''}\n${res.stderr || ''}`;
+        code = res.code;
+      } catch (err) {
+        out = String((err && (err.detail || err.message)) || err);
+      }
+      const bad = paths.lines(out).filter((l) => /cannot resolve profile bundle|skipping profile bundle|did not activate|Failed to load plugins/i.test(l));
+      const missing = paths.readDshProfileState().missing;
+      if (code === 0 && bad.length === 0 && missing.length === 0) {
+        ctx.log('ok', 'profile 校验通过：所有插件都能被解析');
+        return;
+      }
+      ctx.log('warn', `⚠ profile 校验未通过（dsh web 可能起不来）：${(bad[0] || `退出码 ${code}`).trim().slice(0, 180)}`);
+      if (missing.length) ctx.log('warn', `  声明了但解析不到的插件：${missing.join('、')}`);
+      ctx.log('warn', `  修复：dsh plugin --profile ${paths.DSH_WEB_PROFILE} install（本页也有「校验并修复 profile」按钮）`);
+      ctx.log('warn', '  仍不行就用本页的「回滚到 <上一版本>」：预览版（next/alpha）常与已装插件不兼容');
     },
   };
 }
@@ -580,11 +721,56 @@ const actions = {
   install_dsh: {
     title: '安装 / 更新 DeepSeek Harness',
     destructive: true,
-    // params.version：界面点「更新到 x.y.z」时带上具体版本（只在 VERSION_SPEC_RE 允许时生效）
+    // params.version：界面点「更新到 x.y.z」/「回滚到 x.y.z」时带上具体版本（只在 VERSION_SPEC_RE 允许时生效）
     steps: (params) => [
+      rememberDshStep(),
       toolchainStep(),
       npmInstallStep(paths.DSH_PACKAGE, 'DeepSeek Harness', { version: params && params.version }),
       verifyDshStep(),
+      verifyProfileStep(),
+    ],
+  },
+  /**
+   * 修复 web profile：跑官方命令 `dsh plugin --profile web install`（按 package.json 把插件装回来），
+   * 然后再校验一次。用于「升级 dsh 后插件解析不到 / 被手动删掉」的恢复。
+   */
+  repair_web_profile: {
+    title: '校验并修复 web profile 插件',
+    destructive: true,
+    steps: () => [
+      {
+        id: 'repair_profile', title: `重装 web profile 插件（dsh plugin --profile ${paths.DSH_WEB_PROFILE} install）`,
+        run: async (ctx) => {
+          const prefix = await npmPrefix();
+          const inv = dshInvocation(prefix);
+          if (!inv) throw new AppError(ERR.NOT_FOUND, '未找到 dsh 可执行文件', '请先在本页安装 DeepSeek Harness');
+          const before = paths.readDshProfileState().missing;
+          if (before.length === 0) { ctx.log('ok', 'profile 插件齐全，无需修复'); return; }
+          ctx.log('info', `待恢复：${before.join('、')}`);
+          // 与「安装插件市场」同款环境处理：PATH 里补上 npm 全局 bin（dsh plugin 要调 pnpm），
+          // 并 noMirror（这条链路不走 brewgo 镜像重写）。
+          const envPath = prefix
+            ? [path.join(prefix, 'bin'), ...paths.EXEC_PATH].join(':')
+            : paths.EXEC_PATH.join(':');
+          ctx.log('info', `执行：dsh plugin --profile ${paths.DSH_WEB_PROFILE} install`);
+          await ctx.exec.runWithChannel('proxy_first', `重装 ${paths.DSH_WEB_PROFILE} profile 插件`, inv.bin,
+            [...inv.argv, 'plugin', '--profile', paths.DSH_WEB_PROFILE, 'install'],
+            {
+              env: { ...NPM_ENV, PATH: envPath },
+              noMirror: true,
+              timeoutMs: 15 * 60 * 1000,
+              channel: 'proxy',
+              onLine: (line, stream) => {
+                const t = String(line || '').trim();
+                if (t) ctx.log(stream === 'stderr' ? 'warn' : 'info', t);
+              },
+            });
+          const after = paths.readDshProfileState().missing;
+          if (after.length) ctx.log('warn', `仍有插件解析不到：${after.join('、')}（可能需要回滚 dsh 版本）`);
+          else ctx.log('ok', 'profile 插件已全部就位');
+        },
+      },
+      verifyProfileStep(),
     ],
   },
 

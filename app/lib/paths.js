@@ -499,3 +499,37 @@ export function readDshMarketState() {
     manifest: DSH_WEB_MANIFEST,
   };
 }
+
+/**
+ * DSH web profile 的插件解析状态（2026-09-22 新增）。
+ *
+ * 为什么需要它：`dsh` 升级（尤其升到 next/alpha 预览版）后，profile 里声明的第三方插件可能
+ * 解析不到或无法激活 —— 表现就是 `dsh web` 直接起不来（"Failed to load plugins / N entry did
+ * not activate"），用户被挡在自己的主界面之外。这里做**零副作用**的存在性检查：只读 profile 的
+ * package.json 与 node_modules，不跑子进程、不写文件（`dsh --dump-config` 更权威，但它会重写
+ * cordis.yml，所以只当安装任务里的校验步骤，不进状态查询）。
+ *
+ * 判定口径：`dsh.profile.bundles` 里除 `@deepseek-ai/dsh-*`（随 dsh 一起发布、必然存在）之外的
+ * 名字，都应该能在 profile 的 node_modules 下解析到；缺任何一个就视为需要修复。
+ *
+ * @returns {{hasProfile:boolean, manifest:string, profileDir:string, bundles:string[],
+ *            missing:string[], ok:boolean}}
+ */
+export function readDshProfileState() {
+  const manifest = readDshWebManifest();
+  const bundleList = manifest && manifest.dsh && manifest.dsh.profile
+    && Array.isArray(manifest.dsh.profile.bundles) ? manifest.dsh.profile.bundles : [];
+  const bundles = bundleList.filter((b) => typeof b === 'string');
+  const missing = bundles.filter((name) => {
+    if (name.startsWith('@deepseek-ai/dsh-')) return false; // dsh 自带，随 dsh 升版
+    return !exists(path.join(DSH_WEB_PROFILE_DIR, 'node_modules', ...name.split('/')));
+  });
+  return {
+    hasProfile: manifest !== null,
+    manifest: DSH_WEB_MANIFEST,
+    profileDir: DSH_WEB_PROFILE_DIR,
+    bundles,
+    missing,
+    ok: missing.length === 0,
+  };
+}

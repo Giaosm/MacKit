@@ -564,10 +564,12 @@ async function handleApi(req, res, url) {
       });
     }
     if (body.defaultChannel !== undefined || body.autoFallback !== undefined || body.autoCleanup !== undefined
-      || body.lastCheckedAt !== undefined || body.brewAutoRefreshMeta !== undefined) {
+      || body.lastCheckedAt !== undefined || body.brewAutoRefreshMeta !== undefined
+      || body.dshChannel !== undefined) {
       store.writeMackit({
         defaultChannel: body.defaultChannel, autoFallback: body.autoFallback, autoCleanup: body.autoCleanup,
         lastCheckedAt: body.lastCheckedAt, brewAutoRefreshMeta: body.brewAutoRefreshMeta,
+        dshChannel: body.dshChannel,
       });
     }
     env.invalidate();

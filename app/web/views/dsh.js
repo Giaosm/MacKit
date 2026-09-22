@@ -127,11 +127,34 @@ export default {
       });
       marketBtn.disabled = marketInstalled || !dshInstalled || !ready;
 
+      // 更新频道：默认 latest（与 npm install -g 的默认行为一致）；next/alpha 是预览频道，需显式选择
+      const chSel = el('select', {
+        style: 'max-width:200px',
+        title: '选择更新频道：默认只跟 npm 的 latest；预览频道（next/alpha）可能与已装插件不兼容',
+        on: { change: (e) => saveChannel(e.target.value) },
+      }, (Array.isArray(dsh.channels) && dsh.channels.length ? dsh.channels : ['latest', 'next', 'alpha'])
+        .map((c) => el('option', { value: c, text: CHANNEL_LABEL[c] || c, selected: (dsh.channel || 'latest') === c })));
+
+      // 回滚按钮：优先装回「更新前记录的版本」；没有记录（例如装预览版是旧版 MacKit 干的）但本地
+      // 高于 latest 时，则给「回到 latest」—— 这正是 2026-09-22 那次事故里用户唯一能一键脱身的动作。
+      const rollbackTo = dsh.rollbackTarget || null;
+      const rollbackBtn = rollbackTo ? el('button', {
+        class: 'btn', type: 'button',
+        text: dsh.rollbackIsLatest ? `↩ 回到 latest（${rollbackTo}）` : `↩ 回滚到 ${rollbackTo}`,
+        title: dsh.rollbackIsLatest
+          ? `本地 ${dsh.version || ''} 高于 npm latest（${rollbackTo}）：装回它可恢复与已装插件的兼容性`
+          : `把 dsh 装回更新前的 ${rollbackTo}（预览版不兼容插件时用）`,
+        on: { click: () => installDsh(cmds, dshInstalled, { ...dsh, rollbackTo }) },
+      }) : null;
+
       return ui.card('② 安装 / 更新', el('div', { class: 'card__rows' }, [
         actionRow('@deepseek-ai/dsh', hostStatus(dsh), dshBtn),
+        actionRow('更新频道', '', el('div', { class: 'row' }, [chSel, rollbackBtn])),
         actionRow(marketName(d), marketInstalled
           ? `已安装${market.version ? ' v' + market.version : ''}（不再重复安装）`
           : (dshInstalled ? '未安装（可选）' : '需先安装 dsh 宿主'), marketBtn),
+        profileWarningNode(dsh),
+        otherChannelsNode(dsh),
         !ready ? el('div', { class: 'warn-box', text: '⚠ 环境未就绪（缺少 Node / npm，或 npm 全局目录不可写），请先按「环境状态」里的提示处理。' }) : null,
       ]), { light: dshInstalled ? 'ok' : 'warn' });
     }
@@ -164,12 +187,57 @@ export default {
       if (!dsh.installed) return '未安装';
       const ver = `已安装 ${dsh.version || ''}`.trim();
       if (dsh.updateAvailable) {
-        // 频道名要写出来：新版本常常只在 next / alpha 上（实测 latest 停在 rc.2，而 next/alpha 已有新版）
+        // 频道名要写出来：默认只跟 latest，用户切了预览频道（next/alpha）必须知道自己在装预发布
         const ch = dsh.latestTag && dsh.latestTag !== 'latest' ? `（${dsh.latestTag} 频道）` : '';
         return `${ver} · 有新版本 ${dsh.latestVersion}${ch}`;
       }
       if (!dsh.latestVersion) return `${ver} · 未能检查更新`;
       return ver;
+    }
+
+    /** 频道名 → 界面标签。 */
+    const CHANNEL_LABEL = { latest: '稳定 latest', next: '预览 next', alpha: '预览 alpha' };
+
+    /**
+     * 「其它频道有更新」提示行：2026-09-22 事故后的折中 ——
+     * 用户要求「能看到有没有新版」（GitHub 上有、模块却说已是最新），但默认一键装 alpha 又把
+     * profile 插件搞坏、`dsh web` 起不来。所以：默认频道只跟 latest，**其它频道的更新只做提示**，
+     * 想装必须自己去上面的下拉显式选频道。
+     */
+    function otherChannelsNode(dsh) {
+      const list = Array.isArray(dsh.newerChannels) ? dsh.newerChannels : [];
+      if (!list.length) return null;
+      const body = list.map((x) => `${x.tag} ${x.version}`).join('、');
+      return el('div', { class: 'muted' }, [
+        el('span', { text: `当前频道（${CHANNEL_LABEL[dsh.channel] || dsh.channel}）没有更新；其它频道有：${body}` }),
+        el('span', { text: ' —— 预览频道常与已装插件不兼容，切换前请确认插件已支持（本项目实测 0.1.7-alpha.1 会让 dsh web 起不来）。' }),
+      ]);
+    }
+
+    /** profile 插件解析状态：缺插件 = `dsh web` 起不来的典型原因，直接摊开 + 给修复按钮。 */
+    function profileWarningNode(dsh) {
+      const pf = dsh.profile || {};
+      if (pf.hasProfile === false || pf.ok !== false) return null;
+      const missing = Array.isArray(pf.missing) ? pf.missing : [];
+      return el('div', { class: 'warn-box' }, [
+        el('div', { text: `⚠ web profile 有 ${missing.length} 个插件解析不到：${missing.join('、')}` }),
+        el('div', { class: 'muted', text: '这正是 `dsh web` 报「Failed to load plugins / N entry did not activate」而进不去主界面的典型原因。' }),
+        el('div', { class: 'row section' }, [
+          el('button', {
+            class: 'btn', type: 'button', text: '🔧 校验并修复 profile',
+            title: `执行 dsh plugin --profile web install，按 profile 的 package.json 把插件装回来`,
+            on: { click: () => repairProfile() },
+          }),
+          dsh.rollbackTarget
+            ? el('button', {
+              class: 'btn', type: 'button',
+              text: dsh.rollbackIsLatest ? `↩ 回到 latest（${dsh.rollbackTarget}）` : `↩ 回滚到 ${dsh.rollbackTarget}`,
+              title: '预览版常与已装插件不兼容；装回旧版可恢复',
+              on: { click: () => installDsh(cmds, dshInstalled, { ...dsh, rollbackTo: dsh.rollbackTarget }) },
+            })
+            : null,
+        ]),
+      ]);
     }
 
     /** 一行「名称 + 状态 + 操作按钮」。 */
@@ -189,21 +257,53 @@ export default {
     }
 
     /** 安装 / 更新宿主（与插件市场完全独立）。 */
-    async function installDsh(cmds, dshInstalled, dsh = {}) {
-      // 「更新到 x.y.z」必须真的装那个版本：新版本常常只在 next / alpha 频道（装 latest 等于没装，
-      // 甚至把本地从预发布降级回去）。所以这里把版本显式带进任务参数。
-      const pkg = dsh.packageName || '@deepseek-ai/dsh';
-      const ver = dsh.updateAvailable && dsh.latestVersion ? dsh.latestVersion : null;
-      const cmd = `npm install -g ${ver ? `${pkg}@${ver}` : pkg}`;
+    /** 切换更新频道（写配置 → 重新拉状态）。 */
+    async function saveChannel(ch) {
+      try {
+        await api('PUT', '/api/config', { dshChannel: ch });
+        ui.toast('ok', `更新频道已切为「${CHANNEL_LABEL[ch] || ch}」`);
+      } catch (err) { ui.toast('err', err.message || '频道保存失败'); }
+      load(true);
+    }
+
+    /** 一键修复 profile（官方命令 dsh plugin --profile web install）。 */
+    async function repairProfile() {
       const ok = await ui.confirmDialog({
-        title: ver ? `确认更新 DeepSeek Harness 到 ${ver}`
-          : (dshInstalled ? '确认重新安装 / 更新 DeepSeek Harness' : '确认安装 DeepSeek Harness'),
-        confirmLabel: ver ? `更新到 ${ver}` : (dshInstalled ? '重新安装 / 更新' : '开始安装'),
+        title: '确认校验并修复 web profile 插件',
+        confirmLabel: '开始修复',
+        body: el('div', {}, [
+          el('p', { text: '将执行（按 profile 的 package.json 把插件装回来）：' }),
+          el('ol', { class: 'card__rows mono' }, [el('li', { text: `dsh plugin --profile ${'web'} install` })]),
+          el('p', { class: 'muted', text: '若修完仍解析不到，通常是 dsh 预览版与插件不兼容 —— 用「回滚到 <上一版本>」。' }),
+        ]),
+      });
+      if (!ok) return;
+      try { await ctx.runTask('dsh', 'repair_web_profile', {}, { confirm: true }); }
+      catch { /* runTask 内部已提示 */ }
+    }
+
+    async function installDsh(cmds, dshInstalled, dsh = {}) {
+      // 「更新到 x.y.z」/「回滚到 x.y.z」必须真的装那个版本：新版本常常只在 next / alpha 频道
+      // （装 latest 等于没装，甚至把本地从预发布降级回去）。所以这里把版本显式带进任务参数。
+      const pkg = dsh.packageName || '@deepseek-ai/dsh';
+      const ver = dsh.rollbackTo ? dsh.rollbackTo : (dsh.updateAvailable && dsh.latestVersion ? dsh.latestVersion : null);
+      const isRollback = !!dsh.rollbackTo;
+      const cmd = `npm install -g ${ver ? `${pkg}@${ver}` : pkg}`;
+      const pre = Array.isArray(dsh.prereleaseChannels) ? dsh.prereleaseChannels : ['next', 'alpha'];
+      const isPre = !isRollback && !!(dsh.latestTag && pre.includes(dsh.latestTag));
+      const ok = await ui.confirmDialog({
+        title: isRollback ? `确认回滚 DeepSeek Harness 到 ${ver}`
+          : (ver ? `确认更新 DeepSeek Harness 到 ${ver}`
+            : (dshInstalled ? '确认重新安装 / 更新 DeepSeek Harness' : '确认安装 DeepSeek Harness')),
+        confirmLabel: isRollback ? `回滚到 ${ver}` : (ver ? `更新到 ${ver}` : (dshInstalled ? '重新安装 / 更新' : '开始安装')),
         body: el('div', {}, [
           el('p', { text: '将执行（全局安装；走代理优先、失败自动降级）：' }),
           el('ol', { class: 'card__rows mono' }, [el('li', { text: cmd })]),
-          ver && dsh.latestTag && dsh.latestTag !== 'latest'
-            ? el('p', { class: 'muted', text: `该版本来自 npm 的 ${dsh.latestTag} 频道（不是 latest 稳定频道）。` })
+          isPre
+            ? el('div', { class: 'warn-box', text: `⚠ ${ver} 来自 npm 的「${dsh.latestTag}」预览频道（不是 latest 稳定频道）。预览版可能无法加载你已装的插件（实测 0.1.7-alpha.1 会让 dsh web 直接起不来）—— 更新前请确认插件已支持；出问题可用「回滚到 ${dsh.version || '上一版本'}」恢复。` })
+            : null,
+          isRollback
+            ? el('p', { class: 'muted', text: `装回更新前的 ${ver}；若 profile 插件曾被删除，再用「校验并修复 profile」装回来。` })
             : null,
         ]),
       });

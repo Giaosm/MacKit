@@ -25,6 +25,12 @@ const MACKIT_DEFAULTS = Object.freeze({
   brewAutoRefreshMeta: true,
   // 上次**成功**同步 brew 元数据的时间戳（节流依据；null = 从未成功过）
   brewMetaRefreshedAt: null,
+  // DSH 更新频道（2026-09-22）：默认只跟 npm 的 latest；next/alpha 必须用户显式选择。
+  // 起因：把「所有频道里 semver 最高」当作默认目标，等于一键把用户推到 alpha 预览版 ——
+  // 实测 0.1.7-alpha.1 让 profile 插件 dsh-univer-office 无法激活，`dsh web` 直接起不来。
+  dshChannel: 'latest',
+  // 上次更新 dsh **之前**的版本（回滚用；null = 没有可回滚的记录）
+  dshPreviousVersion: null,
   // 音乐模块（第 8 模块）配置：默认下载目录 / 命名模板 / 网络通道 / 已选音源
   musicDownloadDir: paths.MUSIC_DEFAULT_DIR,
   musicNameTemplate: '{歌手} - {歌名}.{ext}',
@@ -316,6 +322,8 @@ export function readMackit() {
     lastCheckedAt: typeof raw.lastCheckedAt === 'number' ? raw.lastCheckedAt : MACKIT_DEFAULTS.lastCheckedAt,
     brewAutoRefreshMeta: typeof raw.brewAutoRefreshMeta === 'boolean' ? raw.brewAutoRefreshMeta : MACKIT_DEFAULTS.brewAutoRefreshMeta,
     brewMetaRefreshedAt: typeof raw.brewMetaRefreshedAt === 'number' ? raw.brewMetaRefreshedAt : MACKIT_DEFAULTS.brewMetaRefreshedAt,
+    dshChannel: typeof raw.dshChannel === 'string' && raw.dshChannel ? raw.dshChannel : MACKIT_DEFAULTS.dshChannel,
+    dshPreviousVersion: typeof raw.dshPreviousVersion === 'string' && raw.dshPreviousVersion ? raw.dshPreviousVersion : MACKIT_DEFAULTS.dshPreviousVersion,
     // 音乐模块。缺失/类型不符一律回落默认值（缺省下载目录、命名模板、通道、音源）。
     musicDownloadDir: typeof raw.musicDownloadDir === 'string' && raw.musicDownloadDir.trim()
       ? raw.musicDownloadDir : MACKIT_DEFAULTS.musicDownloadDir,
@@ -361,6 +369,8 @@ export function writeMackit(patch = {}) {
   if (patch.lastCheckedAt !== undefined) next.lastCheckedAt = typeof patch.lastCheckedAt === 'number' ? patch.lastCheckedAt : null;
   if (patch.brewAutoRefreshMeta !== undefined) next.brewAutoRefreshMeta = !!patch.brewAutoRefreshMeta;
   if (patch.brewMetaRefreshedAt !== undefined) next.brewMetaRefreshedAt = typeof patch.brewMetaRefreshedAt === 'number' ? patch.brewMetaRefreshedAt : null;
+  if (patch.dshChannel !== undefined) next.dshChannel = String(patch.dshChannel || '').trim() || MACKIT_DEFAULTS.dshChannel;
+  if (patch.dshPreviousVersion !== undefined) next.dshPreviousVersion = typeof patch.dshPreviousVersion === 'string' && patch.dshPreviousVersion ? patch.dshPreviousVersion : null;
   // 音乐模块配置（缺失字段 = 不改写；空串回落默认值）
   if (patch.musicDownloadDir !== undefined) {
     const v = String(patch.musicDownloadDir || '').trim();
