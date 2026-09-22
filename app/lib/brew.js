@@ -346,20 +346,47 @@ async function queryOutdated() {
   return { formulae, casks, counts: { formula: formulae.length, cask: casks.length }, checkedAt };
 }
 
+/**
+ * cask 的「可更新」口径必须是 `--greedy-latest`，**绝不能用 `--greedy`**（2026-09-22 反向更新事故）。
+ *
+ * brew 对 cask 的 outdated 判定是「已装版本字符串 ≠ cask 版本」——**不比大小**；而 `--greedy`
+ * 会把 `auto_updates true` 的 cask 一并纳入（brew 默认是跳过的，见 `brew outdated --help`）。
+ * 于是自带更新的应用被误列为可更新：实测 clash-verge-rev 由应用内更新到 2.5.4、cask 元数据仍是
+ * 2.5.2，用户点升级后 brew 输出 `2.5.4 -> 2.5.2` 并真的把它**降级**（任务日志实证）。
+ * 这类应用由自身负责更新，故用 `--greedy-latest` 只保留 `version :latest` 的 cask，
+ * 把 auto_updates 挡在「可更新列表」与升级链路之外。
+ */
 async function querySection(kind) {
   const isCask = kind === 'casks';
   const args = isCask
-    ? ['outdated', '--json=v2', '--cask', '--greedy']
+    ? ['outdated', '--json=v2', '--cask', '--greedy-latest']
     : ['outdated', '--json=v2', '--formula'];
   const res = await safeRun('brew', args);
   const parsed = res.code === 0 ? parseOutdatedJson(res.stdout, kind) : null;
   if (parsed) return parsed;
   // 降级：名字列表（brew 7 --quiet 输出）
   const quietArgs = isCask
-    ? ['outdated', '--cask', '--greedy', '--quiet']
+    ? ['outdated', '--cask', '--greedy-latest', '--quiet']
     : ['outdated', '--formula', '--quiet'];
   const q = await safeRun('brew', quietArgs);
   return lineList(q.stdout).map((n) => ({ name: n, current: null, latest: null }));
+}
+
+/**
+ * 单个 cask 是否声明 `auto_updates`（自带更新）。
+ * 升级动作的兜底：列表口径已排除这类应用，但参数若来自旧缓存 / 手工调用，也不能让 brew 去动它
+ * —— brew 只比版本字符串是否相等，会把更高的已装版本「升」回 cask 里的旧版本（版本回退）。
+ * @param {(bin:string,args:string[],opts?:object)=>Promise<{code:number,stdout:string}>} run
+ * @param {string} name cask token
+ * @returns {Promise<boolean>}
+ */
+async function caskAutoUpdates(run, name) {
+  try {
+    const res = await run('brew', ['info', '--json=v2', '--cask', name], { env: BREW_ENV, timeoutMs: 120_000 });
+    const obj = JSON.parse(res.stdout || '{}');
+    const arr = Array.isArray(obj.casks) ? obj.casks : [];
+    return arr.some((c) => c && c.token === name && c.auto_updates === true);
+  } catch { return false; }
 }
 
 async function queryInstalled() {
@@ -1256,6 +1283,12 @@ const actions = {
             if (!tokenRe(kind).test(it.name)) {
               ctx.log('error', `名称不合法（含 brew 选项或非法字符），已跳过：${it.name}`);
               throw Object.assign(new AppError('SKIP', `名称不合法：${it.name}`), { code: 'SKIP' });
+            }
+            // 兜底：自带更新（auto_updates）的 cask 不交给 brew 升级 —— brew 只比版本字符串是否相等，
+            // 会把更高的已装版本「升」回 cask 里的旧版本（2026-09-22 反向更新事故），故直接跳过。
+            if (kind === 'cask' && await caskAutoUpdates(ctx.exec.run, it.name)) {
+              ctx.log('warn', `${it.name} 自带更新（auto_updates），已跳过以免版本回退 —— 请在应用内更新`);
+              throw Object.assign(new AppError('SKIP', `${it.name} 自带更新，已跳过`), { code: 'SKIP' });
             }
             const args = ['upgrade'];
             if (kind === 'cask') args.push('--cask');

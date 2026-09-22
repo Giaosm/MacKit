@@ -314,8 +314,15 @@ export default {
         ]));
         listHost.append(el('div', { class: 'grid grid--2' }, [
           groupCard(`Formula（${data.formulae.length}）`, data.formulae, 'formula'),
-          groupCard(`Cask（--greedy，${data.casks.length}）`, data.casks, 'cask'),
+          groupCard(`Cask（${data.casks.length}）`, data.casks, 'cask'),
         ]));
+        // 说清为什么某些应用不在列表里：brew 对 cask 只比「版本字符串是否相等」，把 auto_updates
+        // （自带更新）的应用交给 brew 升级会把它回退到 cask 里的旧版本 —— 2026-09-22 反向更新事故。
+        listHost.append(el('div', {
+          class: 'muted',
+          style: 'margin-top:8px; font-size:12px',
+          text: '说明：自带更新（auto_updates）的应用由应用自身升级，不在本列表中，以免 brew 升级造成版本回退；Cask 仅列 brew 能正常升级的项（含 version :latest）。',
+        }));
         renderSummary();
       }
       function draw() {

@@ -342,7 +342,9 @@ async function brewSnapshot() {
   const oF = await runQuiet('brew', ['outdated', '--formula', '--quiet'], { timeoutMs: 60_000 });
   snap.outdatedFormula = nonEmptyLines(oF.stdout).length;
 
-  const oC = await runQuiet('brew', ['outdated', '--cask', '--greedy', '--quiet'], { timeoutMs: 60_000 });
+  // 口径与 brew 管家的「可更新」列表保持一致：用 --greedy-latest（不用 --greedy），
+  // 排除 auto_updates 的自带更新应用 —— 否则这里的「可更新 N 项」会比列表数字大。
+  const oC = await runQuiet('brew', ['outdated', '--cask', '--greedy-latest', '--quiet'], { timeoutMs: 60_000 });
   snap.outdatedCask = nonEmptyLines(oC.stdout).length;
 
   const taps = await runQuiet('brew', ['tap'], { timeoutMs: 15_000 });
