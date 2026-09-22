@@ -35,6 +35,8 @@ export default {
     const head = el('div', { class: 'view-head' }, [
       el('div', {}, [el('h1', { text: '总览' }), el('div', { class: 'muted', text: '环境体检' })]),
       el('div', { class: 'row' }, [
+        // 本页只有「MacKit 自更新」是联网动作；环境体检本身要同时探测直连与代理，故不加通道开关。
+        ui.netChannel('selfupdate', '自更新通道', '仅影响 MacKit 自身更新（GitHub）；环境体检会同时探测直连与代理，不受此开关影响'),
         envCheckedAt,
         envBtn,
         updBtn,

@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import * as paths from './paths.js';
 import * as env from './env.js';
 import * as exec from './exec.js';
+import { resolvePolicy } from './netpolicy.js';
 import { parseRimeAppearance } from './rime-appearance.js';
 
 const { ERR, AppError } = exec;
@@ -330,8 +331,17 @@ function parseDictVersion(text) {
 // 动作辅助
 // ---------------------------------------------------------------------------
 
-const netPolicy = (p) => ({ auto: 'auto', direct: 'direct_first', proxy: 'proxy_first' }[String((p && p.channel) || '')] || 'proxy_first'); // params.channel 覆盖；缺省 proxy_first
-/** 走网络通道执行（默认 proxy_first，可由 params.channel 覆盖）。 */
+/**
+ * 本次联网的通道策略（2026-09-22：改为「模块档位 + 按主机自动」）。
+ *   · params.channel 显式给 proxy / direct → 按其执行（显式优先，与 Homebrew 逐项按钮同口径）
+ *   · 否则交给模块档位（Rime 页顶部的下拉）；auto 档的自动策略是「代理优先」——Rime 的联网目标
+ *     （plum / 语法模型 / 皮肤）基本都在 GitHub。
+ */
+const netPolicy = (p) => {
+  const explicit = { direct: 'direct_first', proxy: 'proxy_first' }[String((p && p.channel) || '')];
+  return explicit || resolvePolicy('rime', 'proxy_first');
+};
+/** 走网络通道执行（通道由 netPolicy 决定；失败自动降级另一条）。 */
 async function runNet(ctx, desc, bin, args, extra = {}) {
   const res = await ctx.exec.runWithChannel(netPolicy(ctx.params), desc, bin, args, {
     timeoutMs: NET_TIMEOUT,

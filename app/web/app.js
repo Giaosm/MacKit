@@ -257,6 +257,62 @@ function emptyState({ icon = '·', title, text, actions = [] }) {
 
 const kv = (k, v) => el('div', { class: 'kv' }, [el('span', { class: 'kv__k', text: k }), el('span', { class: 'kv__v' }, [v && v.nodeType ? v : String(v == null ? '—' : v)])]);
 
+// ============================== 模块网络通道 ==============================
+/**
+ * 模块顶部的「网络通道」小下拉，**选中即保存生效**（唯一事实源是后端 lib/netpolicy.js）。
+ *
+ * 档位语义（前端不能 import node 模块，故文案在此再写一份，两边改动需同步）：
+ *   auto         → 按目标主机自动：走 GitHub 的代理优先（含 brew 官方源 formulae.brew.sh），其余直连优先
+ *   proxy_first  → 优先代理（走不通自动降级直连）
+ *   direct_first → 优先直连（走不通自动降级代理）
+ *
+ * ★ 只挂在**真联网**的模块上（brew / music / rime / selfupdate）；应用隔离、系统初始化不联网，
+ *   不给开关 —— 避免又造出一个「设置了却不生效」的死设置。
+ * ★ Homebrew 的**逐项升级 / 安装**仍严格按用户在每一项上点的「代理 / 直连」按钮执行，不受本开关影响。
+ */
+const CHANNEL_OPTIONS = Object.freeze([
+  ['auto', '自动（按目标）'],
+  ['proxy_first', '优先代理'],
+  ['direct_first', '优先直连'],
+]);
+
+/**
+ * @param {'brew'|'music'|'rime'|'selfupdate'} moduleId 模块 id（存储键 = `<id>Channel`）
+ * @param {string} [label] 前缀文案（默认「通道」；总览页用「自更新通道」避免与体检探测混淆）
+ * @param {string} [hint] 悬浮说明
+ * @returns {HTMLElement}
+ */
+function netChannel(moduleId, label = '通道', hint = '') {
+  const key = `${moduleId}Channel`;
+  const sel = el('select', {
+    class: 'net-channel',
+    title: hint || '该模块联网时优先走哪条通道；走不通会自动换另一条',
+  }, CHANNEL_OPTIONS.map(([v, t]) => el('option', { value: v, text: t })));
+  const wrap = el('label', {
+    class: 'net-channel-wrap',
+    style: 'display:inline-flex; align-items:center; gap:6px; font-size:12px; white-space:nowrap',
+  }, [el('span', { class: 'muted', text: label }), sel]);
+
+  // 自己读初值（GET /api/config 很轻），各视图不必为它额外加载一次配置
+  api('GET', '/api/config').then((cfg) => {
+    const v = (cfg && cfg.mackit && cfg.mackit[key]) || 'auto';
+    sel.value = CHANNEL_OPTIONS.some(([x]) => x === v) ? v : 'auto';
+  }).catch(() => { /* 读不到就保持 auto，不打断页面 */ });
+
+  sel.addEventListener('change', async () => {
+    const v = sel.value;
+    const text = (CHANNEL_OPTIONS.find(([x]) => x === v) || [])[1] || v;
+    sel.disabled = true;
+    try {
+      await api('PUT', '/api/config', { [key]: v });
+      toast('ok', `网络通道已设为「${text}」`);
+    } catch (err) {
+      toast('warn', `通道保存失败：${(err && err.message) || err}`);
+    } finally { sel.disabled = false; }
+  });
+  return wrap;
+}
+
 function card(title, content, { light = null, extra = null } = {}) {
   const head = el('div', { class: 'card__head' }, [el('div', { class: 'card__title' }, [light ? statusLight(light) : null, title])]);
   if (extra) head.append(extra);
@@ -738,7 +794,7 @@ function makeCtx(subs) {
     },
     refreshEnv: refreshEnv,
     fmtTime, fmtDateTime, fmtRel, fmtSize,
-    ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, kv, card, copy: copyText, portOk },
+    ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, kv, card, copy: copyText, portOk, netChannel },
   };
 }
 async function refreshEnv(force) {

@@ -22,6 +22,7 @@ import crypto from 'node:crypto';
 import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
+import { resolvePolicyFrom } from './netpolicy.js';
 import { countSteps } from './runner.js';
 import * as env from './music/env.js';
 import * as session from './music/session.js';
@@ -231,10 +232,11 @@ export function pruneAudioCache() {
 }
 
 /**
- * 解析当前音乐网络通道（config.musicChannel：auto|direct|proxy）→ **统一代理出口**（design v2 §A.1）。
+ * 解析当前音乐网络通道 → **统一代理出口**（design v2 §A.1）。
  *
- * auto 视作直连（musicdl 搜索为单子进程，无法像 runPolicy 那样在进程内降级）；
- * 用户在代理环境下手动切到 proxy 即可。
+ * 通道档位（音乐页顶部下拉，存储键 musicChannel）：auto|proxy_first|direct_first。
+ * **auto 视作直连**：musicdl 搜索是单个子进程，无法像 runPolicy 那样在进程内按主机分通道降级，
+ * 而音乐的目标基本都是国内音源（自动档 = 直连正是它们的正确通道）；代理环境下手动选「优先代理」即可。
  *
  * ★ 返回三件套，覆盖「搜索 / 歌单 / 下载」三条 bridge 路径：
  *   · `channel`     —— 传给 exec.run 的**通道描述**（A-6：仍为 'proxy'，用环境变量代理服务
@@ -252,7 +254,8 @@ export function pruneAudioCache() {
 export function resolveProxy() {
   let c;
   try { c = store.readMackit(); } catch { c = { musicChannel: 'auto', musicProxySource: 'homebrew', musicProxyHttp: '', musicProxySocks5: '' }; }
-  const channel = c.musicChannel === 'proxy' ? 'proxy' : 'direct';
+  // auto（多目标子进程）→ 直连优先；用户选「优先代理」才走代理
+  const channel = resolvePolicyFrom(c, 'music', 'direct_first') === 'proxy_first' ? 'proxy' : 'direct';
   if (channel !== 'proxy') {
     return { channel: 'direct', proxies: null, subprocEnv: { all_proxy: undefined } };
   }
@@ -295,7 +298,7 @@ export function resolveProxy() {
 export function resolveInstallProxyEnv() {
   let c;
   try { c = store.readMackit(); } catch { c = { musicChannel: 'auto', musicProxySource: 'homebrew', musicProxyHttp: '', musicProxySocks5: '' }; }
-  if (c.musicChannel !== 'proxy') return { channel: 'direct', env: {} };
+  if (resolvePolicyFrom(c, 'music', 'direct_first') !== 'proxy_first') return { channel: 'direct', env: {} };
 
   const source = c.musicProxySource === 'custom' ? 'custom' : 'homebrew';
   let http = null;

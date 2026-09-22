@@ -19,7 +19,11 @@ import * as paths from './paths.js';
 
 // ★ 本对象是**唯一**默认值事实源：readMackit 的每一处回落都必须引用它，不得写字面量。
 const MACKIT_DEFAULTS = Object.freeze({
-  defaultChannel: 'auto', autoFallback: true, autoCleanup: true, lastCheckedAt: null, version: 1,
+  // ★ 2026-09-22：通道从「全局一个」改为「每个模块一个档位」（见 lib/netpolicy.js）：
+  //   auto（默认，按目标主机自动）/ proxy_first / direct_first，界面上是各模块顶部的小下拉。
+  //   原先的全局 defaultChannel 已删除（它是死设置：存/校验/回显/备份都有，却无人读取）。
+  brewChannel: 'auto', rimeChannel: 'auto', selfupdateChannel: 'auto',
+  autoFallback: true, autoCleanup: true, lastCheckedAt: null, version: 1,
   // Homebrew 元数据自动同步（2026-09-21）：启动后若元数据过期就自动跑一次 `brew update`（实测 1.7~3.2s），
   // 让「可更新 N 项」重开项目即为真值，而不是等用户自己点按钮。可关（计量网络 / 公司代理场景）。
   brewAutoRefreshMeta: true,
@@ -46,8 +50,31 @@ const MACKIT_DEFAULTS = Object.freeze({
   // 下载并发度（默认 3，可调 1–5）；=1 时与「每曲一步」的历史行为一致
   musicDownloadConcurrency: 3,
 });
-/** 音乐模块可选的网络通道策略（auto = 直连，必要时由用户手动切代理） */
-const MUSIC_CHANNELS = Object.freeze(['auto', 'direct', 'proxy']);
+/**
+ * 每模块网络通道档位（**唯一值域事实源**，lib/netpolicy.js 从这里取）：
+ *   auto（默认，按目标主机）/ proxy_first（优先代理）/ direct_first（优先直连）。
+ * 存储键 = `<module>Channel`；哪些模块有开关见 netpolicy.CHANNEL_MODULES。
+ */
+export const CHANNEL_VALUES = Object.freeze(['auto', 'proxy_first', 'direct_first']);
+/** 有通道档位的配置键（与 CHANNEL_MODULES 一一对应，顺序无关）。 */
+export const CHANNEL_KEYS = Object.freeze(['brewChannel', 'musicChannel', 'rimeChannel', 'selfupdateChannel']);
+/**
+ * 音乐模块的**旧值域**（auto / direct / proxy）→ 统一档位。2026-09-22 迁移：
+ * 读到旧值即按新值用，下次写回自然升级 —— 老配置文件不用手工改，也不用写迁移脚本。
+ */
+const LEGACY_MUSIC_CHANNEL = Object.freeze({ auto: 'auto', direct: 'direct_first', proxy: 'proxy_first' });
+
+/**
+ * 归一化一个通道档位值。
+ * @param {unknown} value
+ * @param {boolean} [legacyMusic] 是否允许音乐模块的旧值域
+ * @returns {string|null} 合法档位，或 null（调用方回落默认值 / 忽略本次写入）
+ */
+function normChannel(value, legacyMusic = false) {
+  if (CHANNEL_VALUES.includes(value)) return value;
+  if (legacyMusic && LEGACY_MUSIC_CHANNEL[value]) return LEGACY_MUSIC_CHANNEL[value];
+  return null;
+}
 /** 音乐模块代理地址来源（v2）：跟随 Homebrew 或自定义 */
 const MUSIC_PROXY_SOURCES = Object.freeze(['homebrew', 'custom']);
 /** 音频缓存容量（MB）可调区间 */
@@ -70,7 +97,6 @@ const MIRROR_IDS = Object.freeze(['official', 'tuna', 'ustc', 'aliyun', 'tencent
  * 该值会被原样写进 `MIRROR=<值>`，因此**必须**拒绝换行、`#` 与空白，避免注入新行或注释掉后续配置。
  */
 const MIRROR_VALUE_RE = /^[A-Za-z0-9_.:/@?&=%+-]{1,256}$/;
-const CHANNEL_POLICIES = Object.freeze(['direct_first', 'proxy_first', 'auto']);
 
 const LOG_KEEP_TASKS = 50;
 const LOG_KEEP_DAYS = 30;
@@ -309,7 +335,11 @@ export function normalizeProxyAddr(raw) {
 export function readMackit() {
   const raw = readJsonSafe(paths.CONFIG_JSON, {}) || {};
   return {
-    defaultChannel: CHANNEL_POLICIES.includes(raw.defaultChannel) ? raw.defaultChannel : MACKIT_DEFAULTS.defaultChannel,
+    // 每模块网络通道档位（缺失/非法 → 默认 auto）。music 额外兼容旧值域（proxy/direct）。
+    brewChannel: normChannel(raw.brewChannel) || MACKIT_DEFAULTS.brewChannel,
+    musicChannel: normChannel(raw.musicChannel, true) || MACKIT_DEFAULTS.musicChannel,
+    rimeChannel: normChannel(raw.rimeChannel) || MACKIT_DEFAULTS.rimeChannel,
+    selfupdateChannel: normChannel(raw.selfupdateChannel) || MACKIT_DEFAULTS.selfupdateChannel,
     autoFallback: typeof raw.autoFallback === 'boolean' ? raw.autoFallback : MACKIT_DEFAULTS.autoFallback,
     // 升级完成后是否自动清理缓存：默认 true（对齐用户要求「默认开」）
     autoCleanup: typeof raw.autoCleanup === 'boolean' ? raw.autoCleanup : MACKIT_DEFAULTS.autoCleanup,
@@ -321,7 +351,7 @@ export function readMackit() {
       ? raw.musicDownloadDir : MACKIT_DEFAULTS.musicDownloadDir,
     musicNameTemplate: typeof raw.musicNameTemplate === 'string' && raw.musicNameTemplate.trim()
       ? raw.musicNameTemplate : MACKIT_DEFAULTS.musicNameTemplate,
-    musicChannel: MUSIC_CHANNELS.includes(raw.musicChannel) ? raw.musicChannel : MACKIT_DEFAULTS.musicChannel,
+
     musicSources: Array.isArray(raw.musicSources)
       ? raw.musicSources.filter((s) => typeof s === 'string' && s.length > 0) : MACKIT_DEFAULTS.musicSources,
     musicSaveLyrics: typeof raw.musicSaveLyrics === 'boolean' ? raw.musicSaveLyrics : MACKIT_DEFAULTS.musicSaveLyrics,
@@ -349,9 +379,6 @@ export function writeMackit(patch = {}) {
   const cur = readMackit();
   const next = { ...cur };
 
-  if (patch.defaultChannel !== undefined && CHANNEL_POLICIES.includes(patch.defaultChannel)) {
-    next.defaultChannel = patch.defaultChannel;
-  }
   if (patch.autoFallback !== undefined) {
     next.autoFallback = !!patch.autoFallback;
   }
@@ -370,8 +397,11 @@ export function writeMackit(patch = {}) {
     const v = String(patch.musicNameTemplate || '').trim();
     next.musicNameTemplate = v || MACKIT_DEFAULTS.musicNameTemplate;
   }
-  if (patch.musicChannel !== undefined && MUSIC_CHANNELS.includes(patch.musicChannel)) {
-    next.musicChannel = patch.musicChannel;
+  // 每模块网络通道：非法值一律忽略（保持原值），与其它枚举字段同口径；music 兼容旧值域。
+  for (const key of CHANNEL_KEYS) {
+    if (patch[key] === undefined) continue;
+    const v = normChannel(patch[key], key === 'musicChannel');
+    if (v) next[key] = v;
   }
   if (patch.musicSources !== undefined && Array.isArray(patch.musicSources)) {
     next.musicSources = patch.musicSources.filter((s) => typeof s === 'string' && s.length > 0);

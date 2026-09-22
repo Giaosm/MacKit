@@ -563,10 +563,18 @@ async function handleApi(req, res, url) {
         mirror: typeof body.mirror === 'string' ? body.mirror : undefined,
       });
     }
-    if (body.defaultChannel !== undefined || body.autoFallback !== undefined || body.autoCleanup !== undefined
-      || body.lastCheckedAt !== undefined || body.brewAutoRefreshMeta !== undefined) {
+    // 每模块网络通道档位：把 body 里出现的 <module>Channel 透传（白名单与非法值处理都在 store 侧），
+    // 这样以后新增一个有通道档位的模块，不必回来改这里。
+    const channelPatch = {};
+    for (const key of store.CHANNEL_KEYS) {
+      if (body[key] !== undefined) channelPatch[key] = body[key];
+    }
+    if (body.autoFallback !== undefined || body.autoCleanup !== undefined
+      || body.lastCheckedAt !== undefined || body.brewAutoRefreshMeta !== undefined
+      || Object.keys(channelPatch).length > 0) {
       store.writeMackit({
-        defaultChannel: body.defaultChannel, autoFallback: body.autoFallback, autoCleanup: body.autoCleanup,
+        ...channelPatch,
+        autoFallback: body.autoFallback, autoCleanup: body.autoCleanup,
         lastCheckedAt: body.lastCheckedAt, brewAutoRefreshMeta: body.brewAutoRefreshMeta,
       });
     }

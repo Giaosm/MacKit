@@ -502,6 +502,10 @@ function createApp(root, ctx) {
       el('h1', { text: '音乐下载' }),
       el('div', { class: 'muted', text: '跨 57 个音源搜索并下载 · Python 依赖独立隔离在 ~/.mackit/py，不使用 sudo、不污染系统' }),
     ]),
+    // 模块级通道（2026-09-22 从「设置 → 下载目录」卡里搬上来）：搜索 / 下载 / 依赖安装都走它。
+    el('div', { class: 'row' }, [
+      ctx.ui.netChannel('music', '通道', '音乐搜索 / 下载 / Python 依赖安装的联网通道；目标基本都是国内音源，自动档 = 直连'),
+    ]),
   ]);
   const body = el('div');
   root.append(head, body);
@@ -2069,12 +2073,8 @@ function createApp(root, ctx) {
 
     const tmplField = renderTemplateField();
 
-    // 网络通道：文案收敛为「直连 / 走代理」两项；旧 auto 显示为直连（**存储枚举不变**，改动时才落盘）
-    const chSel = el('select', { on: { change: (e) => doSetChannel(e.target.value) } }, [
-      el('option', { value: 'direct', text: '直连', selected: c.channel !== 'proxy' }),
-      el('option', { value: 'proxy', text: '走代理', selected: c.channel === 'proxy' }),
-    ]);
-    const chField = el('div', { class: 'field' }, [el('label', { text: '网络通道' }), chSel]);
+    // 网络通道已搬到页面**顶部**的下拉（2026-09-22）：档位统一为 自动 / 优先代理 / 优先直连，
+    // 与其它模块一致，并走通用的 PUT /api/config 保存（不再经音乐自己的配置接口）。
 
     // 歌词开关：musicdl 下载时自动旁写 .lrc；关掉则下载完成后删除旁车歌词文件
     const lyrCheck = el('input', { type: 'checkbox', checked: c.saveLyrics !== false, id: 'music-savelyrics' });
@@ -2113,9 +2113,9 @@ function createApp(root, ctx) {
       ]),
     ]);
 
-    const children = [dirField, tmplField, chField, lyrField, enhField, perfField];
-    // Q8：代理设置子区仅在通道=「走代理」时展开
-    if (c.channel === 'proxy') children.push(renderProxySubarea());
+    const children = [dirField, tmplField, lyrField, enhField, perfField];
+    // Q8：代理设置子区仅在通道=「优先代理」时展开（顶部下拉选它，才需要填代理地址）
+    if (c.channel === 'proxy_first') children.push(renderProxySubarea());
 
     app.dirCardNode = el('div', { class: 'section' }, [ctx.ui.card('下载目录', el('div', {}, children))]);
     return app.dirCardNode;
@@ -2126,11 +2126,6 @@ function createApp(root, ctx) {
     const old = app.dirCardNode;
     const fresh = renderDirCard();
     if (old && old.parentNode) old.parentNode.replaceChild(fresh, old);
-  }
-
-  async function doSetChannel(value) {
-    const next = await saveConfig({ channel: value });
-    if (next) rerenderDirCard();
   }
 
   async function doSetSaveLyrics(value) {

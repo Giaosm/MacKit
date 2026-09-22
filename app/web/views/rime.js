@@ -17,7 +17,8 @@
  *   - 输入方案无切换入口（2026-09-16 删除，F4 选单由 Rime 记住选择）；当前方案在状态卡只读展示。联网固定代理优先。
  */
 
-// 联网策略固定为「代理优先」：后端 netPolicy 缺省 proxy_first，失败自动降级直连，前端不再提供通道选择。
+// 联网通道：调用方可显式传 params.channel 覆盖；否则由模块档位（顶部下拉）决定，
+// 自动档下的策略是「代理优先」（Rime 的联网目标基本都在 GitHub）。失败会自动降级到另一条通道。
 const SOURCE_LABEL = { squirrel: 'squirrel.yaml', build: 'build/squirrel.yaml', degraded: '降级（仅名称）' };
 
 export default {
@@ -56,7 +57,12 @@ export default {
       head.innerHTML = '';
       head.append(
         el('div', {}, [el('h1', { text: 'Rime 输入法' }), el('div', { class: 'muted', text: '词库 · 方案 · 语法模型 · 外观' })]),
-        el('button', { class: 'btn', type: 'button', text: '⟳ 重新检测', on: { click: load } }),
+        el('div', { class: 'row' }, [
+          // 模块级通道（2026-09-22 恢复选择权）：Rime 的联网目标（plum / 语法模型 / 皮肤）基本都在 GitHub，
+          // 所以自动档下的策略是「代理优先」。此前这里写死 proxy_first、前端不给选择。
+          ui.netChannel('rime', '通道', 'Rime 联网动作（拉取 plum / 语法模型 / 皮肤）的通道；目标基本在 GitHub，自动档 = 代理优先'),
+          el('button', { class: 'btn', type: 'button', text: '⟳ 重新检测', on: { click: load } }),
+        ]),
       );
       body.innerHTML = '';
       body.append(statusCard(), vocabCard(), grammarCard(), skinGrid(), appearanceCard());

@@ -11,7 +11,8 @@
  *       · 底部「▶ 开始逐项升级」→ upgrade_one_by_one（items: [{name,kind,mode}]，mode∈proxy|direct|skip）
  *   - 卸载管理：Formula / Cask（多选 + 二次确认 + brew info 前 5 行）/ Tap（核心源加强警告 + 空态解释）
  *   - 软件下载：Formula / Cask 双类别，本地全量索引搜索（brew info --json=v2 补详情），结果逐项「代理/直连」直接安装
- *   - 设置（端口 / 镜像 5 卡 / 默认通道 / 自动降级 / 缓存清理；改端口后仅提示，不自动改 Git）
+ *   - 设置（端口 / 镜像 5 卡 / 自动降级 / 缓存清理；改端口后仅提示，不自动改 Git）
+ *     注：通道不再手选 —— 由后端按目标主机自动决定（走 GitHub 代理优先，其余直连优先）。
  *
  * 已移除：原「更新中心」标签与 6 步完整更新前端入口、「更新策略」单选、已装统计入口。
  *         原「历史」标签（升级/卸载历史表）—— 任务历史统一由侧边栏「任务历史」承载，避免两处重复。
@@ -44,7 +45,12 @@ export default {
 
     root.append(el('div', { class: 'view-head' }, [
       el('div', {}, [el('h1', { text: 'Homebrew 管家' }), el('div', { class: 'muted', text: '升级 · 卸载 · 设置' })]),
-      el('div', { class: 'row' }, [metaSync, envMeta, envBtn]),
+      el('div', { class: 'row' }, [
+        // 模块级通道：只管**索引下载 / brew update / 元数据同步**。
+        // 逐项升级与安装仍按用户在每一项上点的「代理 / 直连」按钮执行（用户明确要求）。
+        ui.netChannel('brew', '通道', '影响索引下载与 brew update；逐项升级 / 安装仍按你点的「代理 / 直连」按钮执行'),
+        metaSync, envMeta, envBtn,
+      ]),
     ]), envBox, tabsBox, panelBox);
 
     const TABS = [['upgrade', '升级列表'], ['download', '软件下载'], ['uninstall', '卸载管理'], ['settings', '设置']];
@@ -290,6 +296,22 @@ export default {
           : [el('div', { class: 'muted', text: filter ? '（无匹配项）' : '（无）' })];
         return ui.card(title, el('div', {}, rows));
       }
+      // 自带更新（auto_updates）的 cask：brew 默认不管，MacKit 也不交给 brew 升级
+      // —— brew 只比版本字符串是否相等，会把应用自更新到的更高版本「升」回旧版（版本回退）。
+      // 但仍然列出来：否则列表为空时用户只看到「无需更新」，不知道这些应用为什么不见了
+      // （2026-09-22 用户反馈「没检测到啊」）。
+      function autoCaskCard() {
+        const items = Array.isArray(data.autoCasks) ? data.autoCasks : [];
+        if (items.length === 0) return null;
+        const rows = items.map((it) => el('div', { class: 'row row--between', style: 'padding:6px 0' }, [
+          el('span', {}, [
+            el('span', { class: 'mono', text: it.name }), ' ', ui.badge('自带更新', 'muted'), ' ',
+            el('span', { class: 'muted', text: `brew 记账 ${it.current || '—'} → cask ${it.latest || '—'}` }),
+          ]),
+          el('span', { class: 'muted', text: '由应用自身升级' }),
+        ]));
+        return ui.card(`自带更新的应用（${items.length}，不参与 brew 升级）`, el('div', {}, rows));
+      }
       function drawList() {
         listHost.innerHTML = '';
         const total = data.counts.formula + data.counts.cask;
@@ -300,6 +322,8 @@ export default {
             // 这里原先还有一个「重新检查」按钮：与正上方工具条的按钮同名同功能，
             // 两处并存只会让用户分不清各自做什么（2026-09-21 去掉重复入口，说明文字里已给出时间）。
           })));
+          const emptyAc = autoCaskCard();
+          if (emptyAc) listHost.append(emptyAc);
           renderSummary();
           return;
         }
@@ -316,13 +340,9 @@ export default {
           groupCard(`Formula（${data.formulae.length}）`, data.formulae, 'formula'),
           groupCard(`Cask（${data.casks.length}）`, data.casks, 'cask'),
         ]));
-        // 说清为什么某些应用不在列表里：brew 对 cask 只比「版本字符串是否相等」，把 auto_updates
-        // （自带更新）的应用交给 brew 升级会把它回退到 cask 里的旧版本 —— 2026-09-22 反向更新事故。
-        listHost.append(el('div', {
-          class: 'muted',
-          style: 'margin-top:8px; font-size:12px',
-          text: '说明：自带更新（auto_updates）的应用由应用自身升级，不在本列表中，以免 brew 升级造成版本回退；Cask 仅列 brew 能正常升级的项（含 version :latest）。',
-        }));
+        // 说清为什么某些应用不在升级列表里（auto_updates 由应用自身升级，交给 brew 只会版本回退）
+        const ac = autoCaskCard();
+        if (ac) listHost.append(ac);
         renderSummary();
       }
       function draw() {
@@ -568,12 +588,12 @@ export default {
           on: { click: () => saveConfig({ mirror: m.id }, `镜像源已切换为「${m.label}」`) },
         }))));
 
-        // 默认通道 + 自动降级
-        const chSel = el('select', { style: 'max-width:220px', on: { change: (e) => saveConfig({ defaultChannel: e.target.value }, '默认通道已保存') } },
-          [['auto', '自动（等价直连优先）'], ['direct_first', '直连优先'], ['proxy_first', '代理优先']].map(([v, l]) => el('option', { value: v, text: l, selected: mk.defaultChannel === v })));
+        // 通道由目标主机自动决定（无需手动选）+ 自动降级开关
         const chk = el('input', { type: 'checkbox', checked: mk.autoFallback !== false, on: { change: (e) => saveConfig({ autoFallback: e.target.checked }, e.target.checked ? '已开启自动降级' : '已关闭自动降级（失败即终止）') } });
-        const chCard = ui.card('🎚 默认通道 / 降级', el('div', { class: 'card__rows' }, [
-          el('div', { class: 'row' }, [el('span', { class: 'muted', style: 'width:120px', text: '默认通道' }), chSel]),
+        const chCard = ui.card('🎚 网络通道', el('div', { class: 'card__rows' }, [
+          // 2026-09-22：原先这里是「默认通道」下拉（自动/直连优先/代理优先）—— 那个设置从未被读取，
+          // 是死设置；通道现在按目标主机自动选，不再需要手选。
+          el('div', { class: 'muted', text: '通道按目标自动选择：走 GitHub 的一律代理优先（含 brew 官方源 formulae.brew.sh，它是 GitHub Pages），其余直连优先。换国内镜像源后对应地址自动走直连。' }),
           el('label', { class: 'check section' }, [chk, el('span', { text: '自动降级（首选通道失败时尝试另一通道）' })]),
         ]));
 

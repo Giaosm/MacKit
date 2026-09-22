@@ -29,6 +29,7 @@ import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
 import * as env from './env.js';
+import { policyForHost, policyForUrl, resolvePolicy } from './netpolicy.js';
 import { countSteps, isBusy as runnerIsBusy } from './runner.js';
 
 const { ERR, AppError } = exec;
@@ -56,7 +57,43 @@ const UPGRADE_TIMEOUT = 1_800_000;
 const lineList = paths.lines;
 
 function cfg() {
-  try { return store.readMackit(); } catch { return { defaultChannel: 'auto', autoFallback: true }; }
+  try { return store.readMackit(); } catch { return { autoFallback: true }; }
+}
+
+// ------------------------------ 通道策略（见 lib/netpolicy.js） ------------------------------
+/**
+ * brew 模块在 auto 档位下的策略：按目标主机判。
+ * 规则本身与全部档位语义都在 lib/netpolicy.js（唯一事实源），这里只负责「算出自动档该走哪条」。
+ *
+ * ★ 逐项升级 / 安装**不走这里** —— 那条路径的用户点了「代理 / 直连」按钮，必须按点击执行
+ *   （用户明确要求，模块档位不得覆盖），见 upgrade_one_by_one / installSteps。
+ */
+function brewAutoPolicy(target) {
+  return typeof target === 'string' && /[:/]/.test(target) ? policyForUrl(target) : policyForHost(target);
+}
+
+/**
+ * brew 模块最终策略 = 模块档位（默认 auto）→ auto 时按目标主机。
+ * @param {string} target URL 或主机名
+ * @returns {'proxy_first'|'direct_first'}
+ */
+function brewPolicy(target) {
+  return resolvePolicy('brew', brewAutoPolicy(target));
+}
+
+/**
+ * 当前 brew 仓库远端（受「设置 → 镜像源」影响）对应的自动策略。
+ * 官方（或无 MIRROR 行）远端即 github.com → 代理优先；国内镜像 / 自定义镜像 → 按主机判（通常直连优先）。
+ * 之所以读文件原值（mirrorRaw）而不是枚举值：自建镜像只有原值能反映真实远端。
+ * @returns {'proxy_first'|'direct_first'}
+ */
+function policyForMirror() {
+  let raw = '';
+  try { raw = String(store.readBrewgo().mirrorRaw || '').trim(); } catch { /* ignore */ }
+  const auto = (raw && raw !== 'official')
+    ? policyForUrl(exec.MIRROR_REMOTES[raw] || raw)
+    : 'proxy_first'; // 官方：brew 远端 = github.com
+  return resolvePolicy('brew', auto);
 }
 
 /**
@@ -265,7 +302,7 @@ export async function repairStaleGitState(ctx, opts = {}) {
 async function runPolicyWithSelfHeal(ctx) {
   const args = ['update'];
   try {
-    await runPolicy(ctx, 'proxy_first', 'Homebrew 更新', args);
+    await runPolicy(ctx, policyForMirror(), 'Homebrew 更新', args);
     markMetaRefreshed(); // `brew update` 成功 = 元数据已是最新，记时间戳避免启动自动同步再跑一遍
   } catch (err) {
     if (!looksLikeStaleGitLock(err)) throw err;
@@ -275,7 +312,7 @@ async function runPolicyWithSelfHeal(ctx) {
     ctx.log('warn', `上次更新被中断，留下了 git 锁（${names.join('、')}）—— 自动修复后重试`);
     await repairStaleGitState(ctx, { report });
     try {
-      await runPolicy(ctx, 'proxy_first', 'Homebrew 更新', args);
+      await runPolicy(ctx, policyForMirror(), 'Homebrew 更新', args);
       markMetaRefreshed();
       ctx.log('ok', '已自动修复 Homebrew 仓库的陈旧锁并完成更新');
     } catch (retryErr) {
@@ -339,43 +376,79 @@ function parseOutdatedJson(text, key) {
 }
 
 async function queryOutdated() {
-  const formulae = await querySection('formulae');
-  const casks = await querySection('casks');
+  const formulae = await rawOutdated('formulae', ['outdated', '--json=v2', '--formula']);
+  const { items: casks, autoUpdates: autoCasks } = await queryCaskOutdated();
   const checkedAt = Date.now();
   try { store.writeMackit({ lastCheckedAt: checkedAt }); } catch { /* ignore */ }
-  return { formulae, casks, counts: { formula: formulae.length, cask: casks.length }, checkedAt };
+  return {
+    formulae,
+    casks,
+    autoCasks,
+    counts: { formula: formulae.length, cask: casks.length, autoCask: autoCasks.length },
+    checkedAt,
+  };
 }
 
 /**
- * cask 的「可更新」口径必须是 `--greedy-latest`，**绝不能用 `--greedy`**（2026-09-22 反向更新事故）。
+ * cask 的「可更新」查询：先按 `--greedy` 拿全（含 auto_updates），再用 `brew info` 标注
+ * `auto_updates`，拆成两组返回。
  *
- * brew 对 cask 的 outdated 判定是「已装版本字符串 ≠ cask 版本」——**不比大小**；而 `--greedy`
- * 会把 `auto_updates true` 的 cask 一并纳入（brew 默认是跳过的，见 `brew outdated --help`）。
- * 于是自带更新的应用被误列为可更新：实测 clash-verge-rev 由应用内更新到 2.5.4、cask 元数据仍是
- * 2.5.2，用户点升级后 brew 输出 `2.5.4 -> 2.5.2` 并真的把它**降级**（任务日志实证）。
- * 这类应用由自身负责更新，故用 `--greedy-latest` 只保留 `version :latest` 的 cask，
- * 把 auto_updates 挡在「可更新列表」与升级链路之外。
+ * 为什么 auto_updates（自带更新）的应用不能交给 brew 升级（2026-09-22 实测）：
+ *   brew 对 cask 的 outdated 判定是「已装版本字符串 ≠ cask 版本」，**不比大小**；而 brew 默认
+ *   会跳过 auto_updates 的 cask（须 `--greedy` 才纳入，见 `brew outdated --help`）。这类应用
+ *   自己会更新，一旦应用内版本领先于 cask 里的记录，`brew upgrade` 就会把它「升」回旧版本
+ *   = 版本回退。故只有 `items` 交给 brew 升级；`autoUpdates` 仅返回给界面说明原因，不参与升级。
+ *
+ * 为什么不直接用 `--greedy-latest` 把 auto_updates 滤掉：列表会凭空变空，用户只看到
+ * 「无需更新」却不知道那些应用为什么消失（2026-09-22 用户反馈「没检测到啊」）。
  */
-async function querySection(kind) {
-  const isCask = kind === 'casks';
-  const args = isCask
-    ? ['outdated', '--json=v2', '--cask', '--greedy-latest']
-    : ['outdated', '--json=v2', '--formula'];
+async function queryCaskOutdated() {
+  const all = await rawOutdated('casks', ['outdated', '--json=v2', '--cask', '--greedy']);
+  if (all.length === 0) return { items: [], autoUpdates: [] };
+  const auto = await caskAutoUpdatesSet(all.map((it) => it.name));
+  return {
+    items: all.filter((it) => !auto.has(it.name)),
+    autoUpdates: all.filter((it) => auto.has(it.name)),
+  };
+}
+
+/**
+ * `brew outdated` 原始查询：JSON 优先，失败降级为 `--quiet` 名字列表（brew 7 容错）。
+ * @param {string} key 'casks' | 'formulae'
+ * @param {string[]} args 含 `--json=v2` 的完整参数
+ * @returns {Promise<{name:string,current:string|null,latest:string|null}[]>}
+ */
+async function rawOutdated(key, args) {
   const res = await safeRun('brew', args);
-  const parsed = res.code === 0 ? parseOutdatedJson(res.stdout, kind) : null;
+  const parsed = res.code === 0 ? parseOutdatedJson(res.stdout, key) : null;
   if (parsed) return parsed;
-  // 降级：名字列表（brew 7 --quiet 输出）
-  const quietArgs = isCask
-    ? ['outdated', '--cask', '--greedy-latest', '--quiet']
-    : ['outdated', '--formula', '--quiet'];
+  const quietArgs = [...args.filter((a) => a !== '--json=v2'), '--quiet'];
   const q = await safeRun('brew', quietArgs);
   return lineList(q.stdout).map((n) => ({ name: n, current: null, latest: null }));
 }
 
 /**
- * 单个 cask 是否声明 `auto_updates`（自带更新）。
- * 升级动作的兜底：列表口径已排除这类应用，但参数若来自旧缓存 / 手工调用，也不能让 brew 去动它
- * —— brew 只比版本字符串是否相等，会把更高的已装版本「升」回 cask 里的旧版本（版本回退）。
+ * 批量取 cask 的 `auto_updates` 标记（一次 `brew info --json=v2 --cask a b c` 拿回）。
+ * 取不到时返回空集合 —— 宁可多列（走 brew 升级），也不静默把更新藏掉。
+ * @param {string[]} names
+ * @returns {Promise<Set<string>>}
+ */
+async function caskAutoUpdatesSet(names) {
+  const out = new Set();
+  if (!Array.isArray(names) || names.length === 0) return out;
+  try {
+    const res = await safeRun('brew', ['info', '--json=v2', '--cask', ...names]);
+    const obj = JSON.parse(res.stdout || '{}');
+    const arr = Array.isArray(obj.casks) ? obj.casks : [];
+    for (const c of arr) if (c && c.auto_updates === true) out.add(String(c.token));
+  } catch { /* ignore */ }
+  return out;
+}
+
+/**
+ * 单个 cask 是否声明 `auto_updates`（自带更新）—— 升级动作的逐项兜底。
+ * 列表已按 auto_updates 分组，这里再查一次是防「旧缓存 / 手工参数」绕过列表直接升级：
+ * brew 只比版本字符串是否相等，会把更高的已装版本「升」回 cask 里的旧版本（版本回退）。
  * @param {(bin:string,args:string[],opts?:object)=>Promise<{code:number,stdout:string}>} run
  * @param {string} name cask token
  * @returns {Promise<boolean>}
@@ -672,27 +745,67 @@ function writeIndexCache(kind, items) {
 }
 
 /**
- * 直连优先（失败换代理）下载全量元数据。
+ * 下载全量元数据（全量落盘 → 解析成精简索引）。
  * ★ 必须用 `curl -o 临时文件` 落盘再读：exec 层 stdout 捕获上限 4MB，
  *   而 cask.json 约 18MB、formula.json 约 32MB，走 stdout 会被静默截断导致 JSON 解析失败（2026-09-16 实测踩坑）。
  * ★ `--compressed` 让 curl 协商 gzip：formula.json 32MB→5MB、cask.json 18MB→2MB，首次搜索明显更快。
+ * ★ 通道由 **brewPolicy(url)** 决定（2026-09-22 修正，原为写死 direct_first）：
+ *   模块档位（顶部下拉，默认 auto）优先，auto 时按目标主机 —— 官方源 URL 是 formulae.brew.sh，
+ *   它是 GitHub Pages，故走**代理优先**（实测直连 ~20KB/s、代理 ~1.4~3.4MB/s，差 35~150 倍）；
+ *   换了国内镜像源则地址是国内域名 → 自动直连优先。
+ *   旧写法的问题：`direct_first` 只在**失败**时才换通道，而直连是「慢但成功」，
+ *   于是永远走最慢那条 —— 实测 cask 137s / formula 304s（后者已贴着 --max-time）。
+ * ★ 双向兜底走本函数自管的两段尝试，**不用 runWithChannel**：它的换通道只看「非零退出码」，
+ *   而两条通道用的是同一个 --max-time，首选通道卡住就得先等满整个预算才换（实测最坏白等 10 分钟）。
+ *   这里改成「首选通道有限预算 + 兜底通道充足预算」，且**超时也换通道**（下载场景下卡住就等于此路不通）。
  */
+
+/** 索引下载：首选通道的预算（秒）。正常走对通道只需 1~2s，给 180s 只是给「慢但能通」留余量。 */
+const INDEX_TRY_TIMEOUT_S = 180;
+/** 兜底通道的预算（秒）：它后面没有第三次尝试，「没配代理 + 直连慢」的用户只能靠它下完。 */
+const INDEX_LAST_TIMEOUT_S = 600;
+
 async function downloadIndex(kind, deps = {}) {
   const spec = KIND_SPEC[normKind(kind)];
   const url = indexApiUrl(kind);
   // ★ 临时文件名必须唯一（2026-09-21）：一键刷新索引与「搜索触发的按需下载」可能同时进行，
   //   固定用 `<索引>.download` 会让两个 curl 写同一个文件、先结束者删掉对方正在读的内容。
   const tmpFile = `${indexPath(kind)}.${process.pid}-${crypto.randomBytes(3).toString('hex')}.download`;
-  // 任务步骤里注入 ctx.exec.runWithChannel：自动带 AbortSignal 与 lane（可取消、可代理回退）；
-  // 查询路径沿用默认的 exec.runWithChannel。
-  const run = typeof deps.run === 'function' ? deps.run : exec.runWithChannel;
+  // 单通道执行器（任务步骤注入 ctx.exec.run：自动带 AbortSignal 与 lane，可取消）。
+  const run = typeof deps.run === 'function' ? deps.run : exec.run;
   const log = typeof deps.log === 'function' ? deps.log : () => {};
   const t0 = Date.now();
-  log('info', `下载最新元数据：${url}`);
+  const order = brewPolicy(url) === 'proxy_first' ? ['proxy', 'direct'] : ['direct', 'proxy'];
+  // 尊重「设置 → 自动降级」开关：关掉就只试首选通道（与 runPolicy 的单通道语义保持一致）。
+  // 此前这里直接走 runWithChannel，会无视该开关强行两条通道都试 —— 用户关了却照旧降级。
+  const attempts = cfg().autoFallback === false ? order.slice(0, 1) : order;
+  log('info', `下载最新元数据：${url}（约 2~5MB；可点「取消任务」中断）`);
   try {
-    await run('direct_first', `下载 ${spec.label} 索引`, 'curl',
-      ['-fsSL', '--compressed', '--max-time', '300', '-o', tmpFile, url],
-      { timeoutMs: 320_000, env: { HOMEBREW_NO_ENV_HINTS: '1' } });
+    let lastErr = null;
+    let downloaded = false;
+    for (let i = 0; i < attempts.length && !downloaded; i++) {
+      const channel = attempts[i];
+      const label = channel === 'proxy' ? '代理' : '直连';
+      const isLast = i === attempts.length - 1;
+      const budgetS = isLast ? INDEX_LAST_TIMEOUT_S : INDEX_TRY_TIMEOUT_S;
+      log('info', `尝试${label}下载 ${spec.label} 索引 ...`);
+      try {
+        const res = await run('curl', [
+          '-fsSL', '--compressed', '--connect-timeout', '15', '--max-time', String(budgetS),
+          '-o', tmpFile, url,
+        ], { channel, timeoutMs: budgetS * 1000 + 20_000, env: { HOMEBREW_NO_ENV_HINTS: '1' } });
+        if (res.code === 0) { log('ok', `${spec.label} 索引下载成功（${label}）`); downloaded = true; break; }
+        lastErr = new AppError(ERR.CMD_FAILED, `${label}下载 ${spec.label} 索引失败`, paths.tailLines(res.stderr || res.stdout));
+        log('warn', `${label}下载失败（exit=${res.code}）`);
+      } catch (err) {
+        // 用户取消：立即停止，绝不换通道重试（否则任务压根停不下来）
+        if (err && err.code === ERR.CANCELLED) throw err;
+        lastErr = err;
+        log('warn', `${label}下载失败（${(err && err.message) || err}）`);
+      }
+      if (!isLast) log('warn', `改用另一条通道继续 ...`);
+    }
+    if (!downloaded) throw lastErr || new AppError(ERR.NET_UNREACHABLE, `${spec.label} 索引下载失败`);
     const raw = fs.readFileSync(tmpFile, 'utf8');
     const items = buildSlimIndex(raw, kind);
     if (items.length < spec.minCount) {
@@ -999,7 +1112,8 @@ function installSteps(items, kind) {
  *
  * 语义：索引是**尽力而为**的附加收益 —— 本体更新成功才是用户的主要目的，所以索引失败只记
  * warn 并让本步落到 `skip`（runner 的 SKIP 机制），任务整体仍算成功；日志里明确写「可重试」。
- * 注入 ctx.exec.runWithChannel：自动带本步 AbortSignal 与 lane（可取消、直连失败自动换代理）。
+ * 注入 ctx.exec.run（单通道）：通道选择与双向兜底都由 downloadIndex 自管（见那里的注释），
+ * 这里只负责把本步的 AbortSignal 与 lane 带上（可取消）。
  * @param {object} ctx 步骤上下文
  * @param {'cask'|'formula'} kind
  */
@@ -1008,7 +1122,7 @@ async function refreshIndexStep(ctx, kind) {
   try {
     const res = await ensureIndex(kind, {
       force: true,
-      run: ctx.exec.runWithChannel,
+      run: ctx.exec.run,
       log: (level, text) => ctx.log(level, text),
     });
     // 条数与耗时已在 downloadIndex 内打过，这里只补索引时间戳（前端也展示这个值）
@@ -1194,7 +1308,7 @@ export async function refreshBrewMeta(opts = {}) {
   metaState.refreshing = true;
   metaState.inflight = (async () => {
     try {
-      await run('proxy_first', '同步 Homebrew 元数据', 'brew', ['update'], { timeoutMs: META_TIMEOUT_MS, env: BREW_ENV });
+      await run(policyForMirror(), '同步 Homebrew 元数据', 'brew', ['update'], { timeoutMs: META_TIMEOUT_MS, env: BREW_ENV });
       markMetaRefreshed();
       metaState.failedAt = 0;
       metaState.lastError = null;

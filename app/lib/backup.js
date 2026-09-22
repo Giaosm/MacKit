@@ -7,7 +7,7 @@
  * 从远程列出 / 下载 / 删除。`applyPayloadSteps` 是「把信封应用到本机」的唯一实现。
  *
  * 备份内容（全部小体量文本；词库 / 模型等大文件不打包，导入后按需重新下载）：
- *   - mackit  : MacKit 设置（defaultChannel / autoFallback / autoCleanup）
+ *   - mackit  : MacKit 设置（autoFallback / autoCleanup）
  *   - brewgo  : ~/.brewgo_config（HTTP / SOCKS5 代理端口、镜像源）
  *   - git     : Git 全局配置（sysinit 白名单 6 键，仅记录非空值）
  *   - github  : 钥匙串 GitHub 凭据（**明文 Token**，用户已确认打入；绝不写日志）
@@ -81,7 +81,12 @@ async function collectData() {
     if (v !== null && v !== '') gitCfg[key] = v;
   }
   return {
-    mackit: { defaultChannel: mackit.defaultChannel, autoFallback: mackit.autoFallback, autoCleanup: mackit.autoCleanup },
+    // 每模块网络通道档位一并备份（2026-09-22）：换电脑/重装后不用重新一个个设。
+    mackit: {
+      brewChannel: mackit.brewChannel, musicChannel: mackit.musicChannel,
+      rimeChannel: mackit.rimeChannel, selfupdateChannel: mackit.selfupdateChannel,
+      autoFallback: mackit.autoFallback, autoCleanup: mackit.autoCleanup,
+    },
     // mirrorRaw 一并备份：自定义镜像（枚举外的自建源 / URL）只存在原始行里，
     // 只带枚举 mirror 的话「备份 → 恢复」会把它悄悄改写成 official。
     brewgo: { httpPort: brewgo.httpPort, socksPort: brewgo.socksPort, mirror: brewgo.mirror, mirrorRaw: brewgo.mirrorRaw },
@@ -151,7 +156,7 @@ function applyPayloadSteps(getPayload, params) {
         const { data } = validatePayload(getPayload());
         if (!data.mackit || typeof data.mackit !== 'object') { ctx.log('info', '备份中无 MacKit 设置，跳过'); return; }
         store.writeMackit(data.mackit);
-        ctx.log('ok', 'MacKit 设置已恢复（默认联网策略 / 失败降级 / 自动清理缓存）');
+        ctx.log('ok', 'MacKit 设置已恢复（网络通道 / 失败降级 / 自动清理缓存）');
       },
     },
     {
