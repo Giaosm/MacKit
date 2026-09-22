@@ -28,10 +28,11 @@ export default {
     root.append(head, body);
 
     // ============================ 数据加载 ============================
-    async function load() {
+    async function load(force) {
       body.innerHTML = '';
       body.append(el('div', { class: 'view-loading', text: '正在检测 DeepSeek Harness 环境…' }));
-      try { st.data = await api('GET', '/api/dsh/status'); }
+      // force=1 绕过后端 1 小时的「最新版本」缓存 —— 否则刚发布的新版最长 1 小时内看不到
+      try { st.data = await api('GET', `/api/dsh/status${force ? '?force=1' : ''}`); }
       catch (err) {
         body.innerHTML = '';
         body.append(el('div', { class: 'err-box', text: `检测失败：${err.message || err}` }));
@@ -52,7 +53,7 @@ export default {
         ]),
         el('div', { class: 'row' }, [
           el('span', { class: 'view-head__meta', text: dshInstalled ? `dsh ${(d.dsh && d.dsh.version) || ''}` : '未安装' }),
-          el('button', { class: 'btn btn--ghost', type: 'button', text: '⟳ 重新检测', on: { click: () => load() } }),
+          el('button', { class: 'btn btn--ghost', type: 'button', text: '⟳ 重新检测', title: '绕过 1 小时缓存，重新向 npm registry 查询最新版本', on: { click: () => load(true) } }),
         ]),
       );
       body.innerHTML = '';
@@ -114,7 +115,7 @@ export default {
         class: 'btn btn--primary', type: 'button',
         text: host.text,
         title: host.title,
-        on: { click: () => installDsh(cmds, dshInstalled) },
+        on: { click: () => installDsh(cmds, dshInstalled, dsh) },
       });
       dshBtn.disabled = !ready || host.disabled;
 
@@ -145,7 +146,12 @@ export default {
     function hostButtonState(dsh) {
       if (!dsh.installed) return { text: '安装', disabled: false, title: '' };
       if (dsh.updateAvailable && dsh.latestVersion) {
-        return { text: `更新到 ${dsh.latestVersion}`, disabled: false, title: `本地 ${dsh.version || '未知'} → registry 上最新 ${dsh.latestVersion}` };
+        const ch = dsh.latestTag && dsh.latestTag !== 'latest' ? `（${dsh.latestTag} 频道）` : '';
+        return {
+          text: `更新到 ${dsh.latestVersion}`,
+          disabled: false,
+          title: `本地 ${dsh.version || '未知'} → npm registry 上最新 ${dsh.latestVersion}${ch}`,
+        };
       }
       if (!dsh.latestVersion) {
         return { text: '重新安装 / 更新', disabled: false, title: '未能连接到 npm registry，无法确认是否已是最新；点这里可直接重新安装 / 更新' };
@@ -157,7 +163,11 @@ export default {
     function hostStatus(dsh) {
       if (!dsh.installed) return '未安装';
       const ver = `已安装 ${dsh.version || ''}`.trim();
-      if (dsh.updateAvailable) return `${ver} · 有新版本 ${dsh.latestVersion}`;
+      if (dsh.updateAvailable) {
+        // 频道名要写出来：新版本常常只在 next / alpha 上（实测 latest 停在 rc.2，而 next/alpha 已有新版）
+        const ch = dsh.latestTag && dsh.latestTag !== 'latest' ? `（${dsh.latestTag} 频道）` : '';
+        return `${ver} · 有新版本 ${dsh.latestVersion}${ch}`;
+      }
       if (!dsh.latestVersion) return `${ver} · 未能检查更新`;
       return ver;
     }
@@ -179,17 +189,26 @@ export default {
     }
 
     /** 安装 / 更新宿主（与插件市场完全独立）。 */
-    async function installDsh(cmds, dshInstalled) {
+    async function installDsh(cmds, dshInstalled, dsh = {}) {
+      // 「更新到 x.y.z」必须真的装那个版本：新版本常常只在 next / alpha 频道（装 latest 等于没装，
+      // 甚至把本地从预发布降级回去）。所以这里把版本显式带进任务参数。
+      const pkg = dsh.packageName || '@deepseek-ai/dsh';
+      const ver = dsh.updateAvailable && dsh.latestVersion ? dsh.latestVersion : null;
+      const cmd = `npm install -g ${ver ? `${pkg}@${ver}` : pkg}`;
       const ok = await ui.confirmDialog({
-        title: dshInstalled ? '确认重新安装 / 更新 DeepSeek Harness' : '确认安装 DeepSeek Harness',
-        confirmLabel: dshInstalled ? '重新安装 / 更新' : '开始安装',
+        title: ver ? `确认更新 DeepSeek Harness 到 ${ver}`
+          : (dshInstalled ? '确认重新安装 / 更新 DeepSeek Harness' : '确认安装 DeepSeek Harness'),
+        confirmLabel: ver ? `更新到 ${ver}` : (dshInstalled ? '重新安装 / 更新' : '开始安装'),
         body: el('div', {}, [
           el('p', { text: '将执行（全局安装；走代理优先、失败自动降级）：' }),
-          el('ol', { class: 'card__rows mono' }, [el('li', { text: cmds.install })]),
+          el('ol', { class: 'card__rows mono' }, [el('li', { text: cmd })]),
+          ver && dsh.latestTag && dsh.latestTag !== 'latest'
+            ? el('p', { class: 'muted', text: `该版本来自 npm 的 ${dsh.latestTag} 频道（不是 latest 稳定频道）。` })
+            : null,
         ]),
       });
       if (!ok) return;
-      try { await ctx.runTask('dsh', 'install_dsh', {}, { confirm: true }); }
+      try { await ctx.runTask('dsh', 'install_dsh', ver ? { version: ver } : {}, { confirm: true }); }
       catch { /* runTask 内部已提示 */ }
       // 不在此处再 load()：done 订阅已刷新状态，否则一次安装会发两次 /api/dsh/status。
     }

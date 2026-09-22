@@ -120,14 +120,23 @@ function pnpmInvocation(prefix) {
 
 // ------------------------------ 最新版本检查 ------------------------------
 /**
- * npm registry 的 latest dist-tag 接口（scoped 包的斜杠可以原样写）。
+ * npm registry 的 **dist-tags** 接口（一次拿到全部频道；scoped 包的斜杠可以原样写）。
+ *
+ * ★ 2026-09-22 修：此前查的是 `/<pkg>/latest` —— **只认 latest 一个频道**。实测该项目把新版本
+ *   发在 `next` / `alpha` 上（`latest=0.1.5-rc.2`、`next=0.1.5-rc.3`、`alpha=0.1.7-alpha.1`），
+ *   于是本地 0.1.5-rc.2 被判定「已是最新」，用户在 GitHub releases 上却能看到两个更新的版本。
+ *   现在改查 dist-tags 并取**所有频道里 semver 最高**的那个（`pickNewestDistTag`），
+ *   同时把「它来自哪个频道」一并告诉界面。
+ *
  * 用 curl 而不是 `npm view`：后者要起一个 node 进程 + 读 npm 配置，慢一个数量级。
  */
-const REGISTRY_LATEST_URL = `https://registry.npmjs.org/${paths.DSH_PACKAGE}/latest`;
-const LATEST_TTL_MS = 12 * 60 * 60 * 1000;
-/** 失败结果的缓存时长（1 小时）——失败也缓存，免得每次开页面都去撞一次网络 */
-const LATEST_FAIL_TTL_MS = 60 * 60 * 1000;
-const LATEST_CACHE_KEY = 'dsh-latest-version';
+const REGISTRY_DIST_TAGS_URL = `https://registry.npmjs.org/-/package/${paths.DSH_PACKAGE}/dist-tags`;
+/** 成功结果的缓存时长（1 小时）。原为 12h —— 该项目隔几天就发新版，12h 太钝。 */
+const LATEST_TTL_MS = 60 * 60 * 1000;
+/** 失败结果的缓存时长（15 分钟）——失败也缓存，免得每次开页面都去撞一次网络 */
+const LATEST_FAIL_TTL_MS = 15 * 60 * 1000;
+/** 缓存键（改名过一次：旧值是「latest 单频道」的结构，不能复用，否则会继续误报已是最新） */
+const LATEST_CACHE_KEY = 'dsh-dist-tags';
 
 /**
  * 解析版本号（只认 semver 三段 + 可选预发布后缀）。
@@ -184,29 +193,63 @@ function compareVersions(a, b) {
 }
 
 /**
+ * 从 npm 的 dist-tags 里挑出「最新的那个版本」（纯函数，便于单测）。
+ *
+ * 语义：在**所有频道**（latest / next / alpha / beta …）里按 semver 取最高者，并回报它来自哪个
+ * 频道 —— 因为各频道之间并不保证单调（实测 `0.1.5-rc.3` 比 `0.1.6-alpha.2` 更晚发布，
+ * 但 semver 上更小），所以「发布时间最新」与「版本号最高」可能不是同一个。这里选**版本号最高**，
+ * 与 npm/GitHub 对「最新版本」的呈现一致。
+ * 无法解析的取值直接忽略（例如 `latest: "beta"` 这种别名）。
+ * @param {Record<string,string>} tags
+ * @returns {{tag:string, version:string}|null}
+ */
+export function pickNewestDistTag(tags) {
+  const entries = Object.entries(tags && typeof tags === 'object' ? tags : {})
+    .filter(([tag, v]) => typeof tag === 'string' && tag && typeof v === 'string' && parseVersion(v) !== null);
+  if (entries.length === 0) return null;
+  // 同版本多频道时优先报 latest（更符合直觉）
+  entries.sort((a, b) => (a[0] === 'latest' ? -1 : b[0] === 'latest' ? 1 : a[0].localeCompare(b[0])));
+  let best = entries[0];
+  for (const e of entries.slice(1)) {
+    if (compareVersions(e[1], best[1]) === 1) best = e;
+  }
+  return { tag: best[0], version: best[1] };
+}
+
+/**
  * 查宿主包在 npm registry 上的最新版本。
  *
  * 磁盘缓存 + 失败也缓存：调用方是 30s 一次的环境体检链路，没有缓存会把 registry
  * 打成筛子；离线、被墙、返回非 JSON 一律**静默降级为 null**（更新提示属于锦上添花，
  * 绝不能让它拖垮状态查询）。
  *
- * @returns {Promise<{version:string|null, checkedAt:number, cached:boolean}>}
+ * @param {boolean} [force] true 时绕过磁盘缓存（供模块页的「⟳ 重新检测」使用）
+ * @returns {Promise<{version:string|null, tag:string|null, tags:object|null,
+ *                    checkedAt:number, cached:boolean}>}
  */
-async function latestHostVersion() {
-  const cached = store.getCached(LATEST_CACHE_KEY);
-  if (cached && cached.value && typeof cached.value === 'object') {
-    const ttl = cached.value.version ? LATEST_TTL_MS : LATEST_FAIL_TTL_MS;
-    if (Date.now() - cached.at < ttl) return { ...cached.value, cached: true };
+async function latestHostVersion(force = false) {
+  if (!force) {
+    const cached = store.getCached(LATEST_CACHE_KEY);
+    if (cached && cached.value && typeof cached.value === 'object') {
+      const ttl = cached.value.version ? LATEST_TTL_MS : LATEST_FAIL_TTL_MS;
+      if (Date.now() - cached.at < ttl) return { ...cached.value, cached: true };
+    }
   }
-  let version = null;
+  let tags = null;
+  let picked = null;
   try {
     const res = await exec.runWithChannel('direct_first', '查询 DSH 最新版本', 'curl',
-      ['-fsSL', '--max-time', '6', REGISTRY_LATEST_URL],
+      ['-fsSL', '--max-time', '6', REGISTRY_DIST_TAGS_URL],
       { env: NPM_ENV, noMirror: true, timeoutMs: 20_000 });
     const obj = JSON.parse(res.stdout);
-    if (obj && typeof obj.version === 'string') version = obj.version;
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) { tags = obj; picked = pickNewestDistTag(obj); }
   } catch { /* 离线 / 超时 / 非 JSON：降级为「这次没查到」 */ }
-  const value = { version, checkedAt: Date.now() };
+  const value = {
+    version: picked ? picked.version : null,
+    tag: picked ? picked.tag : null,
+    tags,
+    checkedAt: Date.now(),
+  };
   try { store.setCached(LATEST_CACHE_KEY, value); } catch { /* 缓存写失败不影响本次结果 */ }
   return { ...value, cached: false };
 }
@@ -219,7 +262,7 @@ async function latestHostVersion() {
  * 更新检查走 latestHostVersion() 的 12h 磁盘缓存，不会每次都打 registry。
  * @returns {Promise<any>}
  */
-export async function queryStatus() {
+export async function queryStatus(opts = {}) {
   const nodeInstalled = paths.exists(paths.NODE_BIN);
   const npmInstalled = paths.exists(paths.NPM_BIN);
   const prefix = npmInstalled ? await npmPrefix() : null;
@@ -232,7 +275,7 @@ export async function queryStatus() {
     npmInstalled ? probe('npm', ['--version']) : null,
     pnpmInv ? probe(pnpmInv.bin, [...pnpmInv.argv, '--version']) : null,
     dshInv ? probe(dshInv.bin, [...dshInv.argv, '--version']) : null,
-    dshInv ? latestHostVersion() : null,
+    dshInv ? latestHostVersion(opts.force === true) : null,
   ]);
 
   const nodeVersion = firstLine(nodeRes);
@@ -276,6 +319,9 @@ export async function queryStatus() {
       profileExists: paths.exists(paths.DSH_WEB_PROFILE_DIR),
       // 更新检查：latestVersion 为 null 表示「这次没查到」（离线等），而非「没有新版」
       latestVersion,
+      // 它来自哪个 npm 频道（latest / next / alpha …）：界面上要写出来，用户才知道自己装的是不是预发布
+      latestTag: latest ? (latest.tag || null) : null,
+      latestTags: latest ? (latest.tags || null) : null,
       updateAvailable,
       updateCheckedAt: latest ? latest.checkedAt : null,
     },
@@ -392,14 +438,26 @@ function toolchainStep() {
 }
 
 /** 「npm install -g <pkg>」步骤。 */
-function npmInstallStep(pkg, label, timeoutMs = INSTALL_TIMEOUT_MS) {
+function npmInstallStep(pkg, label, opts = {}) {
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : INSTALL_TIMEOUT_MS;
+  // 指定版本 → 安装 `pkg@<version>`：界面按钮写「更新到 0.1.7-alpha.1」，就必须真的装那个版本
+  // （此前一律装 latest，而新版本可能只在 next / alpha 频道上，装了等于没装、甚至降级）。
+  const version = typeof opts.version === 'string' && VERSION_SPEC_RE.test(opts.version) ? opts.version : null;
+  const spec = version ? `${pkg}@${version}` : pkg;
   return {
     id: `install_${pkg.replace(/[^A-Za-z0-9]+/g, '_')}`,
-    title: `安装 ${label}`,
-        timeoutMs,
-    run: (ctx) => installGlobal(ctx, pkg, label, timeoutMs),
+    title: version ? `更新 ${label} 到 ${version}` : `安装 ${label}`,
+    timeoutMs,
+    run: (ctx) => installGlobal(ctx, spec, version ? `${label} ${version}` : label, timeoutMs),
   };
 }
+
+/**
+ * 显式指定安装版本时的取值白名单（semver 形状）。
+ * 只允许 `x.y.z` 或 `x.y.z-<预发布>`，既挡住空格/引号，也挡住 `--flag` 这类**会被 npm 当成选项**
+ * 的取值（exec 层用参数数组、无 shell，但选项注入仍是真实风险）。
+ */
+const VERSION_SPEC_RE = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/;
 
 /** 「准备 pnpm」步骤：已装则跳过（插件市场的前置）。 */
 function pnpmStep() {
@@ -522,9 +580,10 @@ const actions = {
   install_dsh: {
     title: '安装 / 更新 DeepSeek Harness',
     destructive: true,
-    steps: () => [
+    // params.version：界面点「更新到 x.y.z」时带上具体版本（只在 VERSION_SPEC_RE 允许时生效）
+    steps: (params) => [
       toolchainStep(),
-      npmInstallStep(paths.DSH_PACKAGE, 'DeepSeek Harness'),
+      npmInstallStep(paths.DSH_PACKAGE, 'DeepSeek Harness', { version: params && params.version }),
       verifyDshStep(),
     ],
   },

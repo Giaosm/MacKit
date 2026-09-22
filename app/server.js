@@ -633,7 +633,11 @@ async function handleApi(req, res, url) {
   }
 
   // DeepSeek Harness（安装状态 / 版本探测；安装本身走任务流 POST /api/tasks）
-  if (method === 'GET' && pathname === '/api/dsh/status') { ok(res, await queryModule('dsh', 'status', {})); return; }
+  // force=1 绕过最新版本的 1 小时缓存（模块页「⟳ 重新检测」用）
+  if (method === 'GET' && pathname === '/api/dsh/status') {
+    ok(res, await queryModule('dsh', 'status', { force: url.searchParams.get('force') === '1' }));
+    return;
+  }
 
   // 音乐模块（只读查询 + 搜索/歌单会话；下载/安装走任务流 POST /api/tasks）
   // deployStatus：四态（not_deployed/broken/deployed/outdated）；/api/music/env 作为旧路径别名保留。
