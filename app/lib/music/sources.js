@@ -125,14 +125,6 @@ const LABELS = Object.freeze({
   ITingWaMusicClient: '爱听蛙', SgogoMusicClient: '搜狗音乐', XMFWAVMusicClient: '熊猫无损',
 });
 
-/** 每个音源所属分组（由 GROUPS 反查，避免两处手工维护漂移）。 */
-const GROUP_OF = (() => {
-  /** @type {Record<string,string>} */
-  const map = {};
-  for (const g of GROUPS) for (const k of g.keys) map[k] = g.id;
-  return map;
-})();
-
 /**
  * 「注册键名 → 元数据」表。未登记的运行时音源由 merge() 归入「未分类」且 defaultOn=false。
  * @type {Record<string,{label:string,group:string,defaultOn:boolean,drm:boolean,radio:boolean,note:string}>}

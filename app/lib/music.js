@@ -23,6 +23,7 @@ import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
 import { resolvePolicyFrom } from './netpolicy.js';
+import { compare, parseStrict } from './version.js';
 import { countSteps } from './runner.js';
 import * as env from './music/env.js';
 import * as session from './music/session.js';
@@ -350,21 +351,19 @@ function badStep(message) {
 }
 
 // ------------------------------ 查询 ------------------------------
-/** 解析 `MAJOR.MINOR.PATCH`；失败返回 null。 */
-function parseVersion(v) {
-  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(v == null ? '' : v).trim());
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-}
-
-/** 比较两个版本号：a<b → -1、a=b → 0、a>b → 1；任一不可解析按相等处理。 */
+/**
+ * 比较两个版本号：a<b → -1、a=b → 0、a>b → 1。
+ *
+ * ★ 必须保留音乐模块的**历史语义**（它决定「要不要提示更新」，不能顺手改）：
+ *   · 只认 `MAJOR.MINOR.PATCH`，多于三段只取前三段（`0.2.6.1` 视作 `0.2.6`）；
+ *   · **任一不可解析即按「相等」处理**（返回 0）—— 避免把不认识的版本串误报成「有更新」。
+ *   比较算法本身复用 lib/version.js 的 compare()（2026-09-25 去重），不再自带一份。
+ */
 function compareVersions(a, b) {
-  const pa = parseVersion(a);
-  const pb = parseVersion(b);
+  const pa = parseStrict(a);
+  const pb = parseStrict(b);
   if (!pa || !pb) return 0;
-  for (let i = 0; i < 3; i++) {
-    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
-  }
-  return 0;
+  return compare(pa.join('.'), pb.join('.'));
 }
 
 /**

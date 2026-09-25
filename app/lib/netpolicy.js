@@ -29,13 +29,6 @@ export const CHANNEL_VALUES = store.CHANNEL_VALUES;
 /** 有通道档位的模块（只有真联网的模块才给开关，避免出现「设置了却不生效」的死设置）。 */
 export const CHANNEL_MODULES = Object.freeze(['brew', 'music', 'rime', 'selfupdate']);
 
-/** 档位 → 展示名（前端下拉与后端日志共用一套文案）。 */
-export const CHANNEL_LABELS = Object.freeze({
-  auto: '自动（按目标）',
-  proxy_first: '优先代理',
-  direct_first: '优先直连',
-});
-
 /**
  * GitHub 生态主机：github.com、*.githubusercontent.com、github.io、ghcr.io（Homebrew bottle 镜像）。
  * 这些目标在国内直连普遍不可用/极慢，一律代理优先。
@@ -83,15 +76,6 @@ export function channelFromConfig(modCfg, moduleId) {
 }
 
 /**
- * 读某模块的通道档位（自己读配置的便捷版）。
- * @param {string} moduleId
- * @returns {'auto'|'proxy_first'|'direct_first'}
- */
-export function readModuleChannel(moduleId) {
-  try { return channelFromConfig(store.readMackit(), moduleId); } catch { return 'auto'; }
-}
-
-/**
  * 最终通道策略：模块档位优先，档位为 auto 时用调用方给出的「按目标自动」策略。
  * @param {object|undefined} modCfg 已读到的配置（避免为一个档位再读一次磁盘）
  * @param {string} moduleId brew|music|rime|selfupdate
@@ -124,8 +108,3 @@ export function resolvePolicy(moduleId, autoPolicy) {
 export function bareChannel(policy) {
   return policy === 'proxy_first' ? 'proxy' : 'direct';
 }
-
-export default {
-  CHANNEL_VALUES, CHANNEL_MODULES, CHANNEL_LABELS,
-  policyForHost, policyForUrl, channelFromConfig, readModuleChannel, resolvePolicyFrom, resolvePolicy, bareChannel,
-};

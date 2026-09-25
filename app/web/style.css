@@ -16,7 +16,6 @@
   --fg:         #1c1b18;
   --fg-muted:   #76716a;
   --border:     #e7e2d7;
-  --border-soft:#efebe2;
 
   --accent:     #3b4fd6;
   --accent-2:   #5b6cf0;
@@ -64,7 +63,6 @@
     --fg:         #ecebe6;
     --fg-muted:   #9a958c;
     --border:     #262a35;
-    --border-soft:#1d2029;
 
     --accent:     #8b9bff;
     --accent-2:   #a6b2ff;
@@ -533,12 +531,6 @@ label.check { display: inline-flex; align-items: center; gap: var(--space-2); cu
 }
 .filelist { list-style: none; margin: 0; padding: 0; }
 .filelist li { padding: var(--space-2); border-bottom: 1px solid var(--border); }
-.dropzone {
-  border: 2px dashed var(--border); border-radius: var(--radius);
-  padding: var(--space-6); text-align: center; color: var(--fg-muted);
-  transition: border-color .15s, background .15s;
-}
-.dropzone.is-over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 
 /* ------------------------------ 解隔离：扫描结果图标网格 ------------------------------ */
 .app-grid {

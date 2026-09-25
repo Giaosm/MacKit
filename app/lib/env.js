@@ -68,6 +68,8 @@ function normLines(text) {
  * @returns {Promise<{code:number, stdout:string, stderr:string}>}
  */
 const warnedNotAllowed = new Set();
+/** `--greedy-latest` 不被支持时只告警一次（见 outdatedCask 的回落逻辑）。 */
+let warnedGreedyLatest = false;
 async function runQuiet(bin, args, opts = {}) {
   // ★ 2026-09-21：brew 的读命令统一带上与 brew.js 相同的 env（常量唯一在 paths.BREW_READ_ENV）。
   //   此前这条体检路径没带 HOMEBREW_NO_AUTO_UPDATE=1，于是 brew 可能在命令执行中途自己刷新元数据：
@@ -342,11 +344,31 @@ async function brewSnapshot() {
   const oF = await runQuiet('brew', ['outdated', '--formula', '--quiet'], { timeoutMs: 60_000 });
   snap.outdatedFormula = nonEmptyLines(oF.stdout).length;
 
-  // 口径：用 --greedy-latest（排除 auto_updates 的自带更新应用）。
-  // 为什么不跟 brew 管家页完全一致：那边要逐个读 .app 真实版本才能纠偏（含上游探测），
-  // 这里只是总览的轻量计数。取舍 —— auto_updates 里「应用已自更新、只有 brew 记账滞后」的
-  // 假阳性（如 codebuddy-cn）会常年虚报 1 项，比「偶尔漏计一个真落后的自带更新应用」更烦人。
-  const oC = await runQuiet('brew', ['outdated', '--cask', '--greedy-latest', '--quiet'], { timeoutMs: 60_000 });
+  // 口径：`--greedy-latest` = **brew 默认口径 + `version :latest` 的 cask**，不带 auto_updates
+  // 那一档 greedy。
+  // ★ 为什么不用 `--greedy`（2026-09-25 查 brew 源码 cask.rb#outdated_version 后更正）：
+  //   不带 greedy 时，brew 对 `auto_updates true` 的 cask 会走 `auto_updates_bundle_outdated?`
+  //   —— 真去读已装 .app 的 Info.plist 判断是否落后（由 HOMEBREW_NO_UPGRADE_AUTO_UPDATES_CASKS
+  //   控制，默认关 → 即默认启用该检查）。所以「应用已自更新到位、只是 brew 记账滞后」的假阳性
+  //   （本机实测 codebuddy-cn）**本来就不会被列出**；而 `--greedy` 会跳过这个 bundle 检查、
+  //   无条件纳入，于是总览常年虚报 1 项。
+  //   （更正：此前这里写「--greedy-latest 排除 auto_updates 应用」是错的 —— keka / wechat 同样是
+  //     auto_updates，但它们确实落后，所以照常列出，实测两边都是 3 项。）
+  // 为什么不跟 brew 管家页完全一致：那边要逐个读 .app 真实版本 + 探上游版本才能纠偏，
+  // 这里只是总览的轻量计数；**管家页才是权威口径**，总览只是同一个数字的近似。
+  //
+  // ★ 回落（2026-09-25）：`--greedy-latest` 是较新的开关，老 brew 不认会直接报错，而 runQuiet
+  //   把错误吞掉了 → 总览会**静默显示 0 项**（数字错得无声无息，最难排查）。故失败时回落到
+  //   不带 greedy 的口径（至少不漏普通 cask）；**不要回落 `--greedy`** —— 那会把上面那个假阳性
+  //   算回来。附带一条一次性 console.warn（与 warnedNotAllowed 同款），让「为什么是 0」有据可查。
+  let oC = await runQuiet('brew', ['outdated', '--cask', '--greedy-latest', '--quiet'], { timeoutMs: 60_000 });
+  if (oC.code !== 0) {
+    if (!warnedGreedyLatest) {
+      warnedGreedyLatest = true;
+      console.warn(`[env] 本机 brew 不支持 --greedy-latest（exit=${oC.code}），可更新计数回落到 --cask 口径`);
+    }
+    oC = await runQuiet('brew', ['outdated', '--cask', '--quiet'], { timeoutMs: 60_000 });
+  }
   snap.outdatedCask = nonEmptyLines(oC.stdout).length;
 
   const taps = await runQuiet('brew', ['tap'], { timeoutMs: 15_000 });

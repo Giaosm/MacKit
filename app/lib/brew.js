@@ -10,8 +10,12 @@
  *
  * brew 7 容错：`brew tap` 空输出属正常；所有 JSON 解析 try/catch 降级为空数组。
  * 只读命令统一注入 HOMEBREW_NO_AUTO_UPDATE=1（常量唯一事实源在 paths.BREW_READ_ENV）：
- * 既避免隐式自动更新导致的 index.lock 冲突与噪声，也保证「可更新」数字只在用户显式刷新后才变。
- * ★ 唯一的刷新入口是 actions.brew_update（一键更新本体并刷新索引，2026-09-21 起含 MacKit 索引）。
+ * 避免「查一次就顺手 brew update」带来的 index.lock 冲突与噪声，让刷新时机可控。
+ * ★ 会跑 `brew update` 的入口有**两个**（2026-09-25 更正，此前这里写「唯一入口」是错的）：
+ *   1. actions.brew_update —— 用户点「⬆ 一键更新本体并刷新索引」；
+ *   2. refreshBrewMeta()   —— 元数据自动同步：服务启动时一次（brewAutoRefreshMeta 默认开、
+ *      30min TTL）、POST /api/brew/meta/refresh、以及管家页的「⟳ 重查可更新项」。
+ *   所以「可更新」数字**可能不经用户显式刷新就变化**（有意为之：重开页面即为真值）。
  * 端口 / 镜像源读写一律走 store.readBrewgo() / store.writeBrewgo()。
  *
  * 软件包类别（2026-09-18）：搜索 / 索引 / 安装对 cask 与 formula 完全共用，
@@ -30,6 +34,7 @@ import * as store from './store.js';
 import * as exec from './exec.js';
 import * as env from './env.js';
 import { bareChannel, policyForHost, policyForUrl, resolvePolicy } from './netpolicy.js';
+import { compare, samePrefix } from './version.js';
 import { countSteps, isBusy as runnerIsBusy } from './runner.js';
 
 const { ERR, AppError } = exec;
@@ -420,57 +425,51 @@ function githubRepoFromCaskUrl(url) {
   return m ? `${m[1]}/${m[2]}` : null;
 }
 
-/** 版本串 → 逐段数组（去前导 v；`,` `-` `_` `+` 都当分隔符）。 */
-function verSegments(v) {
-  return String(v == null ? '' : v).replace(/^v/i, '').split(/[.,\-_+]/).filter((s) => s !== '');
-}
-
+// 版本比较统一走 lib/version.js（compare / samePrefix），本文件不再自带实现。
 /**
- * 版本比较（逐段：数字段按数值、其余按字典序；缺段视为更小）。
- * @returns {number} a>b → 1；a<b → -1；相等 → 0
- */
-function compareVer(a, b) {
-  const A = verSegments(a);
-  const B = verSegments(b);
-  for (let i = 0; i < Math.max(A.length, B.length); i += 1) {
-    const x = A[i];
-    const y = B[i];
-    if (x === undefined) return -1;
-    if (y === undefined) return 1;
-    if (/^\d+$/.test(x) && /^\d+$/.test(y)) {
-      const d = Number(x) - Number(y);
-      if (d !== 0) return d > 0 ? 1 : -1;
-    } else if (x !== y) return x > y ? 1 : -1;
-  }
-  return 0;
-}
-
-/**
- * 应用版本是否「就是」cask 版本 —— cask 版本常在后面追加 build / commit
- * （如应用 `4.12.1` vs cask `4.12.1.39217423,757a5b2f`），所以按**前缀**判定，不能用大小比较。
- * @param {string} appVer
- * @param {string} caskVer
- */
-function sameVersion(appVer, caskVer) {
-  const a = verSegments(appVer);
-  const c = verSegments(caskVer);
-  if (a.length === 0 || c.length === 0 || a.length > c.length) return false;
-  return a.every((seg, i) => seg === c[i]);
-}
-
-/**
- * 读 .app 的真实已装版本（CFBundleShortVersionString）。读不到 → null（调用方回退 brew 口径）。
+ * 读 .app 的真实已装版本：**短版本 + build 号**（CFBundleShortVersionString / CFBundleVersion）。
+ * 两个都要，理由见 sameAsCask()。读不到短版本 → null（调用方回退 brew 口径）。
  * @param {string|null} appTarget 形如 /Applications/Clash Verge.app
+ * @returns {Promise<{short:string,build:string|null}|null>}
  */
 async function readAppVersion(appTarget) {
   if (!appTarget) return null;
-  try {
-    const plist = path.join(appTarget, 'Contents', 'Info.plist');
-    const r = await exec.run('plutil', ['-extract', 'CFBundleShortVersionString', 'raw', '-o', '-', plist],
-      { noMirror: true, timeoutMs: 10_000 });
-    const v = String(r.stdout || '').trim();
-    return r.code === 0 && v ? v : null;
-  } catch { return null; }
+  const plist = path.join(appTarget, 'Contents', 'Info.plist');
+  const read = async (key) => {
+    try {
+      const r = await exec.run('plutil', ['-extract', key, 'raw', '-o', '-', plist],
+        { noMirror: true, timeoutMs: 10_000 });
+      const v = String(r.stdout || '').trim();
+      return r.code === 0 && v ? v : null;
+    } catch { return null; }
+  };
+  const [short, build] = await Promise.all([read('CFBundleShortVersionString'), read('CFBundleVersion')]);
+  return short ? { short, build } : null;
+}
+
+/**
+ * 应用是否**已经就是** cask 记录的那一版 —— 据此剔除 brew 的假阳性（「应用早自更新到位、
+ * 只是 brew 记账没跟上」）。
+ *
+ * ★ 为什么不能只比短版本前缀（2026-09-25 实测踩到，本机 wechat 上翻车）：
+ *   cask 版本常把 build / commit 拼在后面，且各家拼法不同 ——
+ *     · codebuddy-cn：cask `4.12.1.39217423,757a5b2f`，应用短版本 `4.12.1`（已自更新到位 → 该剔除）
+ *     · wechat      ：cask `4.1.15.22,270102`，应用短版本 `4.1.15` 但 **build 是 270100**（其实落后）
+ *   只比前缀这两个都会被判成「已是最新」，wechat 就被漏报、永远升不上去。
+ *   所以把应用的 **build 号一起拼进版本串**（build 与短版本相同则不重复拼），要求它是 cask 版本
+ *   **逗号之前**那一截的前缀；拼不上就说明无从确认它已跟上，**仍然列出**交给 brew 升级（宁可多提，
+ *   不可漏报 —— 漏报会让用户永远停在旧版）。
+ *
+ * @param {string} appShort 应用 CFBundleShortVersionString
+ * @param {string|null} appBuild 应用 CFBundleVersion
+ * @param {string} caskVer cask 的 version（可能形如 `x.y.z,hash`）
+ * @returns {boolean}
+ */
+function sameAsCask(appShort, appBuild, caskVer) {
+  const build = String(appBuild || '').trim();
+  const short = String(appShort || '').trim();
+  const composed = build && build !== short ? `${short}.${build}` : short;
+  return samePrefix(composed, String(caskVer || '').split(',')[0]);
 }
 
 /**
@@ -541,11 +540,11 @@ async function queryCaskOutdated() {
   for (const it of flagged) {
     const m = meta.get(it.name);
     if (!m || !m.autoUpdates) { items.push({ ...it }); continue; }   // 非自带更新：brew 口径即真值
-    const appVer = await readAppVersion(m.appTarget);
-    if (!appVer) { items.push({ ...it, autoUpdates: true }); continue; }  // 读不到版本 → 保守按 brew 口径列出
-    if (sameVersion(appVer, m.version)) continue;        // 假阳性：应用已是 cask 版本（记账滞后）
-    if (compareVer(appVer, m.version) > 0) continue;      // 应用反而更新 → brew 装下去是降级，不列
-    items.push({ ...it, autoUpdates: true });             // 真落后 → 参与 brew 升级
+    const app = await readAppVersion(m.appTarget);
+    if (!app) { items.push({ ...it, autoUpdates: true }); continue; }  // 读不到版本 → 保守按 brew 口径列出
+    if (sameAsCask(app.short, app.build, m.version)) continue;  // 假阳性：应用已是 cask 版本（记账滞后）
+    if (compare(app.short, m.version) > 0) continue;            // 应用反而更新 → brew 装下去是降级，不列
+    items.push({ ...it, autoUpdates: true });                   // 真落后 → 参与 brew 升级
   }
 
   // ② 上游探测：抓「cask 自己没跟上」的假阴性（brew 完全不报的那种）
@@ -553,12 +552,14 @@ async function queryCaskOutdated() {
   const upstream = [];
   await Promise.all(cands.map(async (m) => {
     const tag = await probeUpstreamTag(m.repo);
-    if (!tag || compareVer(tag, m.version) <= 0) return;   // 上游没超过 cask → 无话可说
-    const appVer = await readAppVersion(m.appTarget);
-    if (appVer && compareVer(tag, appVer) <= 0) return;    // 本机已经不比上游旧 → 不提示
+    if (!tag || compare(tag, m.version) <= 0) return;   // 上游没超过 cask → 无话可说
+    const app = await readAppVersion(m.appTarget);
+    // ★ 这里用**短版本**比较：上游 tag 的拼法与 cask 的 build 后缀未必对齐，带上 build 容易误判成
+    //   「本机更新」而把提示吞掉（宁可多提示，不可漏报）。
+    if (app && compare(tag, app.short) <= 0) return;    // 本机已经不比上游旧 → 不提示
     upstream.push({
       name: m.token,
-      current: appVer || m.installed || null,
+      current: (app && app.short) || m.installed || null,
       cask: m.version || null,
       latest: tag,
     });

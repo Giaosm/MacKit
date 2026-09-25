@@ -473,15 +473,11 @@ export function cancel(taskId) {
 /** 是否有**任一** lane 正在执行任务（waitForIdle 依赖它）。 */
 export function isBusy() { return [...LANES.values()].some((l) => l.running); }
 
-export function isBusyLane(name) { return lane(name).running; }
-
 /**
  * 当前运行任务 id（default lane）。
  * ★ 保持向后兼容：原语义即「全局唯一运行任务 id」，现在等价于 default lane 的当前任务。
  */
 export function currentTaskId() { return lane(DEFAULT_LANE).currentId; }
-
-export function currentTaskIdLane(name) { return lane(name).currentId; }
 
 /** 所有 lane 的当前运行任务 id（不含空槽），供 gracefulShutdown 逐任务取消。 */
 export function activeTaskIds() {
@@ -498,11 +494,3 @@ export function activeTaskIds() {
  * @returns {number} 实际尝试发信号的子进程数
  */
 export function forceKill() { return exec.killAllNow('SIGKILL'); }
-
-/**
- * 只强杀指定 lane 的存活子进程（SIGKILL）。
- * 用途：音乐模块「取消全部下载」时只清 music lane，不动 music-search lane 的搜索子进程。
- * @param {string} name
- * @returns {number}
- */
-export function forceKillLane(name) { return exec.killLaneNow(name, 'SIGKILL'); }

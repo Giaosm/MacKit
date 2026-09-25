@@ -261,7 +261,8 @@ const kv = (k, v) => el('div', { class: 'kv' }, [el('span', { class: 'kv__k', te
 /**
  * 模块顶部的「网络通道」小下拉，**选中即保存生效**（唯一事实源是后端 lib/netpolicy.js）。
  *
- * 档位语义（前端不能 import node 模块，故文案在此再写一份，两边改动需同步）：
+ * 档位语义（浏览器端无法 import node 模块，**下拉文案只在这一处**；语义的完整说明在后端
+ * lib/netpolicy.js 的文件头。若那边档位取值有变，这里要跟着改）：
  *   auto         → 按目标主机自动：走 GitHub 的代理优先（含 brew 官方源 formulae.brew.sh），其余直连优先
  *   proxy_first  → 优先代理（走不通自动降级直连）
  *   direct_first → 优先直连（走不通自动降级代理）
