@@ -7,7 +7,7 @@ MacKit · 音乐模块 · Python 桥接脚本
 全项目**唯一** import `musicdl` 的文件。Node 侧通过一次性子进程调用它：
     <venv>/bin/python bridge.py <command>
 
-协议（见 docs/design-music-module.md §3.2）：
+协议（§3.2）：
     · stdin  : 一条 JSON 指令 {"command": "...", ...}
     · stdout : **只出 NDJSON**（每行一个 JSON 事件），供 Node 逐行解析
     · stderr : 其余一切（musicdl / rich 进度条 / 本脚本日志）
@@ -120,7 +120,7 @@ def load_musicdl():
     try:
         import musicdl as pkg  # noqa: F401  —— 读 __version__
         from musicdl.modules import MusicClientBuilder, SongInfo
-        # ★ D1：SongInfoUtils 为**可选**依赖 —— 老版本 / 测试桩可能不导出；
+        # ★ D1：SongInfoUtils 为**可选**依赖 —— 上游不同版本未必导出；
         #   缺失时内嵌功能静默降级（返回全 False），绝不因此让整个模块 ENV_MISSING。
         try:
             from musicdl.modules import SongInfoUtils as _SongInfoUtils
@@ -140,7 +140,7 @@ def load_musicdl():
         "MusicClient": MusicClient,
         "MusicClientBuilder": MusicClientBuilder,
         "SongInfo": SongInfo,
-        # D1：显式内嵌（歌词 / 基础标签 / 封面）复用同一实现；可能为 None（老版本 / 桩件）。
+        # D1：显式内嵌（歌词 / 基础标签 / 封面）复用同一实现；上游未导出时为 None。
         "SongInfoUtils": _SongInfoUtils,
         "version": str(getattr(pkg, "__version__", "unknown")),
         "registered": list(MusicClientBuilder.REGISTERED_MODULES.keys()),
@@ -283,7 +283,7 @@ def project_song(info, uid: str, parent_uid=None, kind: str = "track") -> dict:
         "singers": getattr(info, "singers", None) or "",
         "album": getattr(info, "album", None) or "",
         "duration": int(getattr(info, "duration_s", 0) or 0),
-        "ext": str(getattr(info, "ext", "") or "").lstrip("."),
+        "ext": _safe_ext(getattr(info, "ext", "")),
         "bitrate": _int_or_none(getattr(info, "bitrate", None)),
         "codec": _str_or_none(getattr(info, "codec", None)),
         "samplerate": _int_or_none(getattr(info, "samplerate", None)),
@@ -331,7 +331,8 @@ def cache_entry(info, source: str) -> dict:
         "song_name": getattr(info, "song_name", None) or "",
         "singers": getattr(info, "singers", None) or "",
         "album": getattr(info, "album", None) or "",
-        "ext": str(getattr(info, "ext", "") or "").lstrip("."),
+        # 投影给前端 / 落快照的 ext 一律先过白名单（它会经 Node 变成缓存文件名的一部分）
+        "ext": _safe_ext(getattr(info, "ext", "")),
         "clean": safe_todict(info),
     }
 
@@ -570,15 +571,18 @@ def _ext_from_url(url: str):
     return e if e in ("mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "ape", "alac", "mp4") else None
 
 
-_SAFE_EXT_RE = re.compile(r"^[A-Za-z0-9]{2,4}$")
+_SAFE_EXT_RE = re.compile(r"^[A-Za-z0-9]{2,8}$")
 
 
 def _safe_ext(v) -> str:
-    """把任意来源的扩展名收敛为安全值：转字符串 → 去首部 '.' → lower → 只留 ^[A-Za-z0-9]{2,4}$，否则 'mp3'。
+    """把任意来源的扩展名收敛为安全值：转字符串 → 去首部 '.' → lower → 只留 ^[A-Za-z0-9]{2,8}$，否则 'mp3'。
 
-    ★ 该值会被拼进**文件路径**（download_proxy_one 的临时文件名；快照里的 `ext` 还会被 Node 侧
-      拼成 `snd-<digest>.<ext>` 缓存文件名）。远端 / 上游数据（酷我 `types[].format`、
-      musicdl 的 `info.ext`）**绝不可直接采信** —— 否则 `../`、`/` 之类的取值会逃出目标目录。
+    ★ 该值会被拼进**文件路径**（download_one 的 `info._save_path`、download_proxy_one 的临时文件名；
+      快照里的 `ext` 还会被 Node 侧拼成 `snd-<digest>.<ext>` 缓存文件名）。远端 / 上游数据
+      （酷我 `types[].format`、musicdl 的 `info.ext`）**绝不可直接采信** —— 否则 `../`、`/`
+      之类的取值会逃出目标目录（musicdl 写入前只做 sanitize_filepath，而实测它保留 `..`）。
+    长度上限 8：既是路径安全，也为了容纳 `dtshd` / `mpc2k` 这类合法的长扩展名
+    （与 Node 侧 `AUDIO_CACHE_KEY_RE` 的 `[A-Za-z0-9]{1,8}` 对齐）。
     """
     s = str(v or "").strip().lstrip(".").lower()
     return s if _SAFE_EXT_RE.match(s) else "mp3"
@@ -1578,7 +1582,11 @@ def download_one(uid: str, out_dir: str, template: str, threads: int, proxies, c
         if info is None or not has_valid_url(info):
             raise DownloadFailed("链接已失效且重搜未匹配到可用曲目")
 
-        ext = str(getattr(info, "ext", "") or rec.get("ext") or "mp3").lstrip(".") or "mp3"
+        # ★ 必须过 _safe_ext：这个 ext 会拼进文件路径（下行 `info._save_path`），
+        #   而它可能来自上游字段（如 moov 的 `dataObject.format`），值不可信。
+        #   代理路径（download_proxy_one）一直有这层白名单，这里此前漏了 —— 是本模块唯一的
+        #   安全级缺口：`ext = '../../../../tmp/x'` 可让 musicdl 写到目标目录之外。
+        ext = _safe_ext(getattr(info, "ext", "") or rec.get("ext"))
         stem = sanitize_filename(getattr(info, "song_name", None) or rec.get("song_name"), "未命名")
         # 把 product 落到临时目录，避免污染下载目录（save_path 由 musicdl 读取）
         try:
@@ -1596,7 +1604,8 @@ def download_one(uid: str, out_dir: str, template: str, threads: int, proxies, c
         )
         # ★ A-3 / Q3：优先直调 per-source 客户端并**显式** auto_supplement_song=True（不依赖上游默认值）。
         #   传给它的 request_overrides 必须是**扁平** overrides.get(source)（= {'proxies': …}）。
-        #   回退 client.download([info]) 仅为兼容测试桩（其 music_clients[*] 无 download），保 109 基线不红。
+        #   回退 client.download([info]) 是必要的兼容路径：部分音源的 per-source 客户端不暴露
+        #   download()，只有聚合客户端有。
         src_clients = getattr(client, "music_clients", None)
         src_client = src_clients.get(source) if isinstance(src_clients, dict) else None
         if src_client is not None and hasattr(src_client, "download"):

@@ -180,8 +180,18 @@ function parseDavUrl(raw, label = 'WebDAV 地址') {
     throw new AppError(DAV_ERR.CONFIG, `${label}里不要写账号密码`,
       '请把它们填到「用户名」/「密码」栏：URL 里的 userinfo 不参与认证，还会被写进任务日志');
   }
+  // ★ 拒绝查询串 / 片段（2026-09-25 修）：字符串拼接时 `https://host/dav/base?token=abc`
+  //   会被拼成 `.../base?token=abc/MacKit/` —— 文件夹名落进 query，实际 pathname 只有
+  //   `/dav/base`，PUT / PROPFIND 必然打错资源，而报错信息完全看不出原因。
+  if (u.search || u.hash) {
+    throw new AppError(DAV_ERR.CONFIG, `${label}不要带查询串或 # 片段`,
+      '请只填到目录为止（例如 https://nas.local/dav/MacKit）');
+  }
   return u;
 }
+
+/** 校验一个用户填写的 WebDAV 地址（**写入口**用；不合法抛 DAV_ERR.CONFIG）。 */
+export function validateDavUrl(raw) { parseDavUrl(raw); }
 
 /**
  * 在 base 末尾拼接一个已百分号编码的路径段。
@@ -533,7 +543,11 @@ function cfgAuth(cfg, opts) {
 export function remoteDirUrl(cfg) {
   const base = String(cfg && cfg.url ? cfg.url : '').trim();
   if (!base) throw new AppError(DAV_ERR.CONFIG, '请先在「WebDAV 设置」中填写服务器地址');
-  return ensureTrailingSlash(base) + REMOTE_FOLDER + '/';
+  // ★ 用 origin + pathname 重建（2026-09-25 修）：直接字符串拼接时，带 query 的地址会把
+  //   目录名拼进查询串（见 parseDavUrl 的注释）；而 ensureCollection 用的是 origin+pathname，
+  //   两处口径不一致会互相打架。这里与它对齐。
+  const u = parseDavUrl(base);
+  return ensureTrailingSlash(`${u.origin}${u.pathname}`) + REMOTE_FOLDER + '/';
 }
 
 /**

@@ -109,6 +109,25 @@ const readTextSafe = paths.readTextSafe;
 const writeTextSafe = paths.writeText;
 function escapeRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+/**
+ * 读取一个「即将被整份覆盖」的配置文件。
+ *
+ * ★ 为什么不能写成 `readTextSafe(p) || ''`（2026-09-25 修，P0）：readTextSafe 对
+ *   ENOENT / EACCES / EMFILE **一律**返回 null，把它当「空文件」继续覆盖，就会在
+ *   「读不到但可写」的情形下（ACL 拒读允许写 / 只写模式 / 瞬时 EMFILE）把用户的
+ *   Rime 配置整份替换成几行补丁 —— 而本模块明确**不做自动备份**，属于不可逆的数据破坏。
+ *   sysinit.js 与 brew.js 的同类写入点早有 `text === null` 护栏，这里补齐。
+ * @param {string} p
+ * @returns {string} 真不存在 → ''（新建）；存在且可读 → 原文；存在但读不到 → 抛 IO_ERROR
+ */
+function readBeforeOverwrite(p) {
+  const text = readTextSafe(p);
+  if (text !== null) return text;
+  if (!paths.exists(p)) return '';
+  throw new AppError(ERR.IO_ERROR, `无法读取 ${p}，已中止以免覆盖你的配置`,
+    '请检查该文件权限或属主（例如是否被 root 创建），或改用「保留原样」手动添加');
+}
+
 /** 剥离值两侧引号并 trim。 */
 function unquote(s) {
   let v = String(s == null ? '' : s).trim();
@@ -184,7 +203,10 @@ function parseSquirrelSchemes(text) {
   for (const raw of lines) {
     const line = raw.replace(/\r$/, '');
     if (!inSchemes) {
-      if (/^preset_color_schemes:\s*$/.test(line)) inSchemes = true;
+      // 放宽到「可带前导空白 / 行尾注释」（2026-09-25 修）：原正则要求顶格且冒号后直接换行，
+      // 一旦写法略有不同就整段认不出来 → 静默走兜底链降级成「22 个名字 + 无色值」，
+      // 界面上没有任何提示，极难排查。
+      if (/^\s*preset_color_schemes\s*:/.test(line)) inSchemes = true;
       continue;
     }
     const trimmed = line.trim();
@@ -247,8 +269,50 @@ function readSkins() {
 // ---------------------------------------------------------------------------
 
 /**
- * patch_yaml：命中 `^\s*<key>:` 则原地替换该行整行值，
- * 否则在 `^patch:` 行之后插入；无 `patch:` 行则先追加 `patch:`。
+ * 在 `parent:` **嵌套块**里落地 `parent/child` 键：
+ *   · 块里已有 `child:` → 就地改值（保留行尾注释）；
+ *   · 块在、但 `child:` 缺失 → 插进该块（按块内最后一个子键的缩进），**不**另插扁平键；
+ *   · 没有该 parent 块 → 返回 null（调用方回落扁平插入）。
+ * @param {string[]} lines
+ * @param {string} key 形如 `style/color_scheme`
+ * @param {string} value
+ * @returns {string[]|null}
+ */
+function patchYamlNested(lines, key, value) {
+  const segs = String(key).split('/');
+  if (segs.length !== 2) return null;
+  const [parent, child] = segs;
+  const parentRe = new RegExp(`^(\\s*)${escapeRe(parent)}\\s*:`);
+  const childRe = new RegExp(`^(\\s*)${escapeRe(child)}\\s*:`);
+  for (let i = 0; i < lines.length; i += 1) {
+    const pm = parentRe.exec(lines[i]);
+    if (!pm) continue;
+    const baseLen = pm[1].length;
+    let insertAt = -1;
+    let insertIndent = ' '.repeat(baseLen + 2);
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const line = lines[j];
+      if (line.trim() === '') continue;
+      const ind = /^\s*/.exec(line)[0];
+      if (ind.length <= baseLen) break;                 // 回到同级 / 更浅 → 该块结束
+      const cm = childRe.exec(line);
+      if (cm) {
+        lines[j] = `${cm[1]}${child}: ${value}${trailingYamlComment(line)}`;
+        return lines;
+      }
+      insertAt = j + 1;                                  // 记住块内最后一个子键之后
+      insertIndent = ind;
+    }
+    lines.splice(insertAt >= 0 ? insertAt : i + 1, 0, `${insertIndent}${child}: ${value}`);
+    return lines;
+  }
+  return null;
+}
+
+/**
+ * patch_yaml：命中 `^\s*<key>:` 则原地替换该行值（保留行尾注释），
+ * 否则就地更新嵌套写法（`style:` 下的 `color_scheme:`），
+ * 再否则在顶层 `patch:` 行之后插入；无 `patch:` 行则先追加 `patch:`。
  * @param {string} text
  * @param {string} key
  * @param {string} value
@@ -258,15 +322,23 @@ function patchYaml(text, key, value) {
   let lines = String(text == null ? '' : text).split('\n');
   if (lines.length === 1 && lines[0] === '') lines = []; // 空文件：不留前导空行
   const re = new RegExp(`^(\\s*)${escapeRe(key)}:`);
-  let idx = -1;
-  for (let i = 0; i < lines.length; i++) { if (re.test(lines[i])) { idx = i; break; } }
-  if (idx >= 0) {
-    const indent = re.exec(lines[idx])[1];
-    lines[idx] = `${indent}${key}: ${value}`;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!re.test(lines[i])) continue;
+    // 原地替换 + **保留行尾注释**（此前整行重写会把 `style/color_scheme: ink # 我喜欢的` 的注释吞掉）
+    lines[i] = `${re.exec(lines[i])[1]}${key}: ${value}${trailingYamlComment(lines[i])}`;
     return lines.join('\n');
   }
-  let patchIdx = lines.findIndex((l) => /^patch:/.test(l));
-  if (patchIdx < 0) { lines.push('patch:'); patchIdx = lines.length - 1; }
+  // ★ 嵌套写法兜底（2026-09-25 修）：用户写的是
+  //     patch:
+  //       style:
+  //         color_scheme: ink
+  //   时，只认扁平键就会**再插入一份扁平表示**，同一配置路径出现两种写法，而读取侧
+  //   （rime-appearance.js 与「当前皮肤」状态卡）只认扁平 → 界面显示为空、点了「应用外观」
+  //   也说不清最终以哪个为准。这里优先就地改嵌套块里的同名子键。
+  const nested = patchYamlNested(lines, key, value);
+  if (nested) return nested.join('\n');
+  const patchIdx = findPatchLine(lines);   // 与 mergeGrammarPatch 共用同一套「什么算 patch 行」的判定
+  if (patchIdx < 0) { lines.push('patch:', `  ${key}: ${value}`); return lines.join('\n'); }
   lines.splice(patchIdx + 1, 0, `  ${key}: ${value}`);
   return lines.join('\n');
 }
@@ -423,7 +495,8 @@ function pickAppearance(params) {
  */
 function writeAppearanceConfig(ctx, skin, layoutDef) {
   if (!paths.exists(paths.RIME_DIR)) throw new AppError(ERR.NOT_FOUND, `Rime 目录不存在：${paths.RIME_DIR}`);
-  let text = readTextSafe(paths.RIME_CUSTOM) || '';
+  // ★ 读失败必须中止（不能回落空串）：否则会在「读不到但可写」时把整份外观配置覆盖掉
+  let text = readBeforeOverwrite(paths.RIME_CUSTOM);
   if (skin) {
     text = patchYaml(text, 'style/color_scheme', skin);
     text = patchYaml(text, 'style/color_scheme_dark', skin);
@@ -500,40 +573,125 @@ function readGrammarApplied() {
 /** 语法补丁里由 MacKit 管理的键（合并 / 移除时用来定位）。 */
 const GRAMMAR_KEYS = ['grammar', 'translator/contextual_suggestions', 'translator/max_homophones'];
 
-/**
- * 把语法补丁**合并**进已有的 ${schema}.custom.yaml —— 不覆盖用户自己的 patch。
- *
- * 语义：其它键原样保留；只把 MacKit 管的那几个键替换成最新值；没有 `patch:` 行就补一个。
- * 幂等：重复执行结果一致。
- * @param {string} text 现有文件内容
- * @returns {string} 合并后的内容
- */
-function mergeGrammarPatch(text) {
-  const block = GRAMMAR_PATCH_TEXT.split('\n').filter((l) => l.trim() !== '' && l.trim() !== 'patch:');
-  const lines = String(text == null ? '' : text).split('\n');
-  while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
+/** 语法补丁正文：去掉 `patch:` 头行，并把缩进**归一化到 0 基准**（便于按容器缩进重新缩进）。 */
+const GRAMMAR_BLOCK_LINES = Object.freeze(
+  GRAMMAR_PATCH_TEXT.split('\n')
+    .slice(1)                          // 第 0 行是 `patch:` 头
+    .map((l) => l.replace(/\s+$/, ''))
+    .filter((l) => l.trim() !== '')
+    .map((l) => l.replace(/^ {2}/, ''))
+);
 
-  // 1) 摘掉旧的 grammar 块（含缩进更深的子行）与两个 translator 键
+/** 取行尾注释（`key: v # 注释` → ` # 注释`）；引号内的 `#` 不算。无注释返回 ''。 */
+function trailingYamlComment(line) {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const c = line[i];
+    if (c === "'" && !inDouble) inSingle = !inSingle;
+    else if (c === '"' && !inSingle) inDouble = !inDouble;
+    else if (c === '#' && !inSingle && !inDouble && i > 0 && /\s/.test(line[i - 1])) return line.slice(i - 1);
+  }
+  return '';
+}
+
+/** 定位顶层 `patch:` 行（允许行尾注释）；`__patch:` 不算 —— 那是另一种机制，见 findRxPatchBody。 */
+function findPatchLine(lines) {
+  for (let i = 0; i < lines.length; i += 1) {
+    if (/^patch\s*:/.test(lines[i])) return i;
+  }
+  return -1;
+}
+
+/**
+ * 定位 plum Rx 写法里的补丁体：`  - patch/+:` 这一行，体在它**之下**（缩进更深）。
+ * 官方 grammar 配方生成的就是这种形态（本机 ~/Library/Rime/rime_ice.custom.yaml 即如此）。
+ * @param {string[]} lines
+ * @returns {{header:number, baseIndent:string}|null}
+ */
+function findRxPatchBody(lines) {
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!/^\s*-\s*patch\/\+:\s*(#.*)?$/.test(lines[i])) continue;
+    const headerIndent = /^\s*/.exec(lines[i])[0];
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (lines[j].trim() === '') continue;
+      const ind = /^\s*/.exec(lines[j])[0];
+      if (ind.length <= headerIndent.length) break;
+      return { header: i, baseIndent: ind };
+    }
+    // 体为空：按「键列 + 2」缩进（`- key:` 的键列 = 破折号缩进 + 2）
+    return { header: i, baseIndent: ' '.repeat(headerIndent.length + 4) };
+  }
+  return null;
+}
+
+/**
+ * 把一个 grammar 补丁块合并进**已经取出的 patch 体**，返回新的体行。
+ * @param {string[]} body 体行（保留原有缩进）
+ * @param {string} baseIndent 体行的基准缩进
+ * @returns {string[]}
+ */
+function mergeIntoPatchBody(body, baseIndent) {
+  const baseLen = baseIndent.length;
   const out = [];
-  let inGrammarBlock = false;
-  for (const line of lines) {
-    if (inGrammarBlock) {
-      if (line.trim() === '' || /^\s{4,}/.test(line)) continue;
-      inGrammarBlock = false;
+  let inGrammar = false;
+  for (const line of body) {
+    if (inGrammar) {
+      // grammar 的子行比基准更深 → 一并摘掉
+      if (line.trim() === '' || /^\s*/.exec(line)[0].length > baseLen) continue;
+      inGrammar = false;
     }
     const m = /^\s*([A-Za-z_][\w/-]*)\s*:/.exec(line);
     if (m && GRAMMAR_KEYS.includes(m[1])) {
-      if (m[1] === 'grammar') inGrammarBlock = true;
+      if (m[1] === 'grammar') inGrammar = true;
       continue;
     }
     out.push(line);
   }
-  // 2) 定位（或补上）顶层 patch: 行
-  let patchIdx = out.findIndex((l) => /^patch:\s*$/.test(l));
-  if (patchIdx < 0) { out.push('patch:'); patchIdx = out.length - 1; }
-  // 3) 插入我们管理的块
-  out.splice(patchIdx + 1, 0, ...block);
-  return `${out.join('\n')}\n`;
+  return [...GRAMMAR_BLOCK_LINES.map((l) => baseIndent + l), ...out];
+}
+
+/**
+ * 把语法补丁**合并**进已有的 ${schema}.custom.yaml —— 绝不覆盖用户自己的 patch。
+ *
+ * 语义：其它键原样保留；只把 MacKit 管的那几个键替换成最新值；没有 patch 容器就补一个。
+ * 幂等：重复执行结果一致。
+ *
+ * ★ 2026-09-25 修（此前会**毁掉**官方 Rx 块）：本函数过去只认顶层 `patch:` 行，而 plum 的
+ *   grammar 配方生成的是 `__patch:` + `  - patch/+:` 形态 —— 于是它既找不到容器（另起一个
+ *   顶层 `patch:`，同一文件出现两套 patch 机制），又会把 `- patch/+:` 下的 `grammar:` 当
+ *   「旧块」摘掉，把官方块掏空成 `- patch/+:`（值为 null）。现在两种写法都识别，并且只在
+ *   **对应的容器体内部**做替换。
+ * @param {string} text 现有文件内容
+ * @returns {string} 合并后的内容
+ */
+function mergeGrammarPatch(text) {
+  const lines = String(text == null ? '' : text).split('\n');
+  while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
+
+  // ① plum Rx：`- patch/+:` 形态
+  const rx = findRxPatchBody(lines);
+  const container = rx || { header: findPatchLine(lines), baseIndent: '  ' };
+
+  if (container.header < 0) {
+    // 两种容器都没有 → 新建扁平 `patch:`
+    return `${[...lines, 'patch:', ...GRAMMAR_BLOCK_LINES.map((l) => `  ${l}`)].join('\n')}\n`;
+  }
+
+  const headerIndent = /^\s*/.exec(lines[container.header])[0];
+  // 容器体的范围：头行之后、缩进仍深于头行的行（尾部空行不算入）
+  let start = container.header + 1;
+  let end = start;
+  for (let i = start; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.trim() === '') continue;
+    if (/^\s*/.exec(line)[0].length <= headerIndent.length) break;
+    end = i + 1;
+  }
+  while (end > start && lines[end - 1].trim() === '') end -= 1;
+
+  const merged = mergeIntoPatchBody(lines.slice(start, end), container.baseIndent);
+  return `${[...lines.slice(0, start), ...merged, ...lines.slice(end)].join('\n')}\n`;
 }
 
 /**
@@ -543,8 +701,9 @@ function mergeGrammarPatch(text) {
  */
 function applyGrammarPatch(ctx, schema) {
   const p = grammarCustomPath(schema);
-  const existing = readTextSafe(p);
-  if (existing === null || existing.trim() === '') {
+  // ★ 读失败必须中止（不能当成「文件为空」直接覆盖）—— 见 readBeforeOverwrite 的注释。
+  const existing = readBeforeOverwrite(p);
+  if (existing.trim() === '') {
     paths.writeText(p, GRAMMAR_PATCH_TEXT);
     ctx.log('ok', `已为 ${schema} 启用万象语法模型`);
     return;
@@ -568,14 +727,20 @@ const GRAMMAR_PATCH_LINES = new Set([
 function removeGrammarPatch(ctx, schema) {
   const p = grammarCustomPath(schema);
   if (!paths.exists(p)) { ctx.log('info', `${schema} 未启用语法模型，无需移除`); return; }
-  const text = readTextSafe(p);
-  if (text === null) { ctx.log('info', `${schema} 未启用语法模型，无需移除`); return; }
+  // ★ 读失败不能报「未启用」（那是静默失败：用户以为移除成功）：存在却读不到 → 明确抛错。
+  const text = readBeforeOverwrite(p);
+  if (text.trim() === '') {
+    // 空文件：没有任何补丁可移除，但仍按存在处理（下面会删掉这个空文件）
+    ctx.log('info', `${schema}.custom.yaml 为空，直接删除`);
+  }
   const foreign = text
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#') && !GRAMMAR_PATCH_LINES.has(l));
   if (foreign.length) {
-    throw new AppError(ERR.IO_ERROR, `${schema}.custom.yaml 含语法补丁之外的配置，为避免误删请手动处理：${p}`, foreign.slice(0, 3).join(' | '));
+    // ★ 错误码语义（2026-09-25 修）：这是「拒绝自动执行、需要人工判断」，不是 IO 故障；
+    //   原先用 IO_ERROR → HTTP 500，把可处理的用户情形报成了服务端异常。
+    throw new AppError(ERR.FORBIDDEN, `${schema}.custom.yaml 含语法补丁之外的配置，为避免误删请手动处理：${p}`, foreign.slice(0, 3).join(' | '));
   }
   try { fs.unlinkSync(p); }
   catch (err) { throw new AppError(ERR.IO_ERROR, `删除 ${p} 失败`, String(err && err.message)); }

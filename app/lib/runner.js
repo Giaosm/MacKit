@@ -2,7 +2,7 @@
  * MacKit · 任务调度层
  *
  *   - 按 lane 分区的串行队列（设计 §5.2）：同一 lane 内串行、不同 lane 间并行。
- *     default lane = 现有 7 个模块（行为不变）；music lane = 音乐下载/安装；music-search lane = 搜索会话。
+ *     default lane = 现有 6 个模块（行为不变）；music lane = 音乐下载/安装；music-search lane = 搜索会话。
  *     这样既保住 brew 串行（不抢 index.lock），又让音乐下载可与其它任务并行。
  *   - Step 状态机：pending → running → ok/fail/skip/cancelled
  *   - SSE 广播：单一来源在后端（内存环形缓冲 + 落盘）
@@ -30,7 +30,7 @@ const records = new Map();
 
 // ------------------------------ lane 分区队列（设计 §5.2） ------------------------------
 // 每个 lane 有各自独立的 queue / running / currentId：**同一 lane 内串行、不同 lane 间并行**。
-//   · default lane = 现有 7 个模块（不传 lane 即落这里，行为 100% 不变）；
+//   · default lane = 现有 6 个模块（不传 lane 即落这里，行为 100% 不变）；
 //   · music lane  = 音乐模块的下载 / 安装等写任务；
 //   · music-search lane = 音乐搜索会话的子进程（独立于 music lane，取消下载时不误杀）。
 // brew 抢锁安全：只有 default lane 会跑 brew，且 default lane 内部仍严格串行 ⇒ 任意时刻
@@ -90,46 +90,39 @@ function snapshotTask(task) {
 }
 
 // ------------------------------ 上下文构造 ------------------------------
-/** 构造 steps(params, ctx) 阶段的基础上下文。 */
+/**
+ * 构造 steps(params, ctx) 阶段的基础上下文。
+ *
+ * 此阶段没有「当前步骤」，所以 exec 出口无需绑定信号——直接把 exec 命名空间交出去。
+ * （模块自己给子进程传 signal 时也照样生效，取消逻辑在 exec 内部。）
+ */
 function makeBaseCtx(rec) {
-  // 把本任务的 lane 注入每一条 exec 出口，使 steps() 阶段发起的子进程也被正确打标
-  // （设计 §5.2）。显式传入的 opts.lane 优先级更高，允许模块在特殊场景覆盖。
-  const boundExec = {
-    ...exec,
-    run: (bin, args, opts = {}) => exec.run(bin, args, { lane: rec.lane, ...opts }),
-    runWithChannel: (policy, desc, bin, args, opts = {}) => exec.runWithChannel(policy, desc, bin, args, { lane: rec.lane, ...opts }),
-    osascriptAdmin: (shellCmd, opts = {}) => exec.osascriptAdmin(shellCmd, { lane: rec.lane, ...opts }),
-    openInFinder: (dir, opts = {}) => exec.openInFinder(dir, { lane: rec.lane, ...opts }),
-  };
   return {
     params: rec.task.params,
     taskId: rec.task.id,
-    lane: rec.lane,
     signal: rec.controller.signal,
     log: (level, text) => pushLog(rec, level, text),
     setChannel: () => { /* steps() 阶段无当前步骤，忽略 */ },
-    exec: boundExec,
+    exec,
   };
 }
 
 /**
  * 构造单步执行上下文。
  * ★ 注入到 ctx.exec 的执行接口会把本步 AbortSignal **默认绑定**，
- *   即使模块调用 exec.run 时忘记传 signal，取消 / 超时依然能终止子进程；
- *   并同时注入本任务的 lane，使下载 / 安装子进程落在 music lane（设计 §5.2）。
+ *   即使模块调用 exec.run 时忘记传 signal，取消 / 超时依然能终止子进程。
  */
 function makeStepCtx(rec, step, stepSignal) {
   const boundExec = {
     ...exec,
-    run: (bin, args, opts = {}) => exec.run(bin, args, { signal: stepSignal, lane: rec.lane, ...opts }),
-    runWithChannel: (policy, desc, bin, args, opts = {}) => exec.runWithChannel(policy, desc, bin, args, { signal: stepSignal, lane: rec.lane, ...opts }),
-    osascriptAdmin: (shellCmd, opts = {}) => exec.osascriptAdmin(shellCmd, { signal: stepSignal, lane: rec.lane, ...opts }),
-    openInFinder: (dir, opts = {}) => exec.openInFinder(dir, { signal: stepSignal, lane: rec.lane, ...opts }),
+    run: (bin, args, opts = {}) => exec.run(bin, args, { signal: stepSignal, ...opts }),
+    runWithChannel: (policy, desc, bin, args, opts = {}) => exec.runWithChannel(policy, desc, bin, args, { signal: stepSignal, ...opts }),
+    osascriptAdmin: (shellCmd, opts = {}) => exec.osascriptAdmin(shellCmd, { signal: stepSignal, ...opts }),
+    openInFinder: (dir, opts = {}) => exec.openInFinder(dir, { signal: stepSignal, ...opts }),
   };
   return {
     params: rec.task.params,
     taskId: rec.task.id,
-    lane: rec.lane,
     signal: stepSignal,
     log: (level, text) => pushLog(rec, level, text),
     setChannel: (c) => { step.channel = c; },
@@ -164,7 +157,7 @@ export function submit(spec) {
   if (!actionDef || typeof actionDef.steps !== 'function') {
     throw new exec.AppError(exec.ERR.NOT_FOUND, '未知动作，无法创建任务');
   }
-  // 缺省 lane 落 default：现有 7 个模块调用 submit() 不传 lane，行为与改动前完全等价。
+  // 缺省 lane 落 default：现有 6 个模块调用 submit() 不传 lane，行为与改动前完全等价。
   const laneName = typeof spec.lane === 'string' && spec.lane ? spec.lane : DEFAULT_LANE;
 
   const task = {
@@ -252,6 +245,12 @@ async function runTask(rec) {
   task.steps = plans.map((p, i) => ({
     id: typeof p.id === 'string' && p.id ? p.id : `step_${i}`,
     title: typeof p.title === 'string' && p.title ? p.title : `步骤 ${i + 1}`,
+    // ★ 显式透传可选的 `path`（2026-09-25 修）：unseal 的每一步都带被处理项的完整路径，
+    //   前端靠它显示 / 复制失败项的**真实路径**（此前字段根本不下发，`step.path` 永远
+    //   undefined，界面上「复制路径」复制到的是裸文件名，粘回粘贴框只会报「路径不存在」）。
+    //   只透传这一个已知字段，**刻意不做 `...p` 展开**：plan 里还带着 run 等函数与闭包，
+    //   而快照会经 SSE / 任务历史直达 HTTP 响应。
+    path: typeof p.path === 'string' ? p.path : undefined,
     status: 'pending',
     channel: null,
     startedAt: null, endedAt: null, exitCode: null, error: null,
@@ -310,7 +309,7 @@ async function runTask(rec) {
       } else {
         const obj = exec.toErrObj(err);
         if (obj.code === exec.ERR.CANCELLED) { cancelled = true; step.status = 'cancelled'; step.error = obj; }
-        else if (obj.code === exec.ERR.AUTH_CANCELLED || obj.code === 'SKIP') { step.status = 'skip'; step.error = obj; } // -128 授权取消 / 主动跳过 → skip
+        else if (obj.code === exec.ERR.AUTH_CANCELLED || obj.code === exec.ERR.SKIP) { step.status = 'skip'; step.error = obj; } // -128 授权取消 / 主动跳过 → skip
         else { step.status = 'fail'; step.error = obj; }
       }
     } finally {

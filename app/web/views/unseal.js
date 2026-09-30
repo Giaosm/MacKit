@@ -4,8 +4,9 @@
  * 语义移植自原 `shell/unseal.sh`（参考脚本已于 2026-09-16 从仓库移除）。
  *
  * 契约：
- *   - GET /api/unseal/precheck?paths=a|b|c → { items:[{input,path,exists,isDir,hasQuarantine,
- *                                              needsAdmin,note?,discovered?}] }（多路径用 | 连接并 encodeURIComponent）
+ *   - GET /api/unseal/precheck?path=a&path=b → { items:[{input,path,exists,isDir,hasQuarantine,
+ *                                              needsAdmin,note?,discovered?}] }（每条路径一个 path 参数）
+ *     ★ 用重复参数而不是 `|` 拼接：路径名本身可能含 `|`，拼接会把一项拆成两项，items 与输入错位。
  *   - GET /api/unseal/scan → { items:[{name,path,reason,icon}], total, quarantined, blocked, unevaluated }
  *     （unevaluated = 隔离了但 spctl 评估失败、无法判定的项数，如实显示不猜结论）
  *   - unseal.unseal_paths{ paths } → 逐项 xattr -dr；普通权限失败才降级 osascript 授权框
@@ -30,7 +31,9 @@ export default {
     // ============================ 头部 ============================
     root.append(el('div', { class: 'view-head' }, [
       el('div', {}, [el('h1', { text: '应用解隔离' }), el('div', { class: 'muted', text: '检查 /Applications 中被隔离且打不开的应用，或手工粘贴任意路径，批量移除 com.apple.quarantine。' })]),
-      el('button', { class: 'btn btn--ghost', type: 'button', text: '清空', on: { click: () => { S.paths = []; S.items = null; S.selected = new Set(); S.scan = null; render(); } } }),
+      // ★ 清空必须连扫描区一起重绘（2026-09-25 修）：此前只 render()（= 待处理 / 结果两块），
+      //   扫描出来的图标网格与勾选仍留在页面上，用户还能对残留项点「解隔离选中」。
+      el('button', { class: 'btn btn--ghost', type: 'button', text: '清空', on: { click: () => { S.paths = []; S.items = null; S.selected = new Set(); S.scan = null; S.scanSelected = new Set(); updateScanBtn(); renderScan(); render(); } } }),
     ]));
 
     // ============================ 单一内容卡片 ============================
@@ -137,7 +140,9 @@ export default {
       pendingBox.innerHTML = '';
       pendingBox.append(el('div', { class: 'view-loading', text: '正在预检…' }));
       let items;
-      try { items = (await api('GET', `/api/unseal/precheck?paths=${encodeURIComponent(S.paths.join('|'))}`)).items || []; }
+      const qs = new URLSearchParams();
+      for (const p of S.paths) qs.append('path', p);
+      try { items = (await api('GET', `/api/unseal/precheck?${qs.toString()}`)).items || []; }
       catch (err) {
         if (my !== precheckSeq) return;
         pendingBox.innerHTML = '';
@@ -203,8 +208,12 @@ export default {
       });
       if (!ok) return;
       if (fromScan) S.scanUnsealing = true;
-      try { await ctx.runTask('unseal', 'unseal_paths', { paths: pathsToUnseal }); }
-      catch { /* runTask 内部已 toast */ }
+      // ★ runTask 返回 null 表示「已有任务在跑、本次没提交」（它内部已 toast）——
+      //   此时必须把标记复位，否则下一次**无关的** unseal 任务完成会被当成扫描收尾，
+      //   白跑一次 runScan()（2026-09-25 修）。
+      try {
+        if (await ctx.runTask('unseal', 'unseal_paths', { paths: pathsToUnseal }) === null) S.scanUnsealing = false;
+      } catch { S.scanUnsealing = false; /* runTask 内部已 toast */ }
       // 结果卡只由 done 订阅（下方 ctx.on('done')）重建一次；此处不再重复 renderResult()。
     }
 

@@ -53,10 +53,11 @@ const MACKIT_DEFAULTS = Object.freeze({
 /**
  * 每模块网络通道档位（**唯一值域事实源**，lib/netpolicy.js 从这里取）：
  *   auto（默认，按目标主机）/ proxy_first（优先代理）/ direct_first（优先直连）。
- * 存储键 = `<module>Channel`；哪些模块有开关见 netpolicy.CHANNEL_MODULES。
+ * 存储键 = `<module>Channel`，有开关的模块见下方 CHANNEL_KEYS（界面只给真联网的模块开关，
+ * 避免出现「设置了却不生效」的死设置）。
  */
 export const CHANNEL_VALUES = Object.freeze(['auto', 'proxy_first', 'direct_first']);
-/** 有通道档位的配置键（与 CHANNEL_MODULES 一一对应，顺序无关）。 */
+/** 有通道档位的配置键（界面为 brew / music / rime / selfupdate 各给一个下拉）。 */
 export const CHANNEL_KEYS = Object.freeze(['brewChannel', 'musicChannel', 'rimeChannel', 'selfupdateChannel']);
 /**
  * 音乐模块的**旧值域**（auto / direct / proxy）→ 统一档位。2026-09-22 迁移：
@@ -586,8 +587,10 @@ function historyFilePath(taskId) { return path.join(paths.HISTORY_DIR, `${taskId
  *   - token    ← 系统初始化「GitHub 凭据」
  *   - password ← WebDAV 配置
  *   - payload  ← 备份信封（内含明文 GitHub Token 与 Rime 配置原文）
+ *   - changes  ← 系统初始化「Git 全局配置」的变更表；http.proxy / https.proxy 常见
+ *                `http://user:pass@host:port` 形态（2026-09-25 加入）
  */
-const REDACTED_PARAM_KEYS = Object.freeze(['token', 'password', 'secret', 'payload']);
+const REDACTED_PARAM_KEYS = Object.freeze(['token', 'password', 'secret', 'payload', 'changes']);
 
 /**
  * 任务参数脱敏：敏感键替换为占位符，其余键原样保留。

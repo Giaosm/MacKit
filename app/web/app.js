@@ -10,7 +10,7 @@
  *   - 零外部资源：图标全部内联 SVG，字体/配色走 style.css 的 CSS 变量
  *
  * ★ 视图扩展方式（加一行即可）：
- *   1) VIEW_MODULES 已预置 6 个 id → 动态 import()（缺失的视图会被安全跳过并提示"开发中"）；
+ *   1) VIEW_MODULES 已预置 7 个 id → 动态 import()（缺失的视图会被安全跳过并提示"开发中"）；
  *      继续新增视图：在 VIEW_MODULES 与 NAV 各加一行即可。
  *   2) 视图通过 ctx 使用外壳能力，契约见下方 makeCtx（只暴露视图实际需要的成员）。
  */
@@ -161,9 +161,11 @@ function toast(level, text) {
   setTimeout(() => { node.style.opacity = '0'; setTimeout(() => node.remove(), 200); }, TOAST_MS);
 }
 
-/** 共享剪贴板：空文本忽略；成功 toast('ok', okMsg) / 失败 toast('warn', …)。 */
+/** 共享剪贴板：空文本给出可见反馈（否则按钮「点了没反应」）；成功 toast('ok', okMsg)。 */
 async function copyText(text, okMsg = '已复制') {
-  if (!text) return;
+  // ★ 空文本也要有反馈（2026-09-25 修）：本项目硬性要求所有按钮有可见反馈，
+  //   而「复制路径」在无任务 / 无失败项时拿到的就是空串，静默 return 会被当成按钮坏了。
+  if (!text) { toast('warn', '没有可复制的内容'); return; }
   try { await navigator.clipboard.writeText(text); toast('ok', okMsg); }
   catch { toast('warn', '复制失败，请手动选择'); }
 }
@@ -307,6 +309,10 @@ function netChannel(moduleId, label = '通道', hint = '') {
     try {
       await api('PUT', '/api/config', { [key]: v });
       toast('ok', `网络通道已设为「${text}」`);
+      // ★ 广播给视图（2026-09-25 新增）：有些模块的界面要按当前档位决定显示什么
+      //   （如音乐页的「代理设置」子区只在优先代理时出现），而它们读的是自己缓存的配置。
+      //   不发这个事件的话，用户改了通道必须切走视图再切回才看得到变化。
+      emit('channel', { moduleId, value: v, label: text });
     } catch (err) {
       toast('warn', `通道保存失败：${(err && err.message) || err}`);
     } finally { sel.disabled = false; }
@@ -359,7 +365,7 @@ function dataTable(cfg) {
       tbody.append(tr);
     }
     syncHead();
-    countEl.textContent = selectable ? `已选 ${selected.size} / 共 ${vis.length}` : `共 ${vis.length}`;
+    countEl.textContent = selectable ? `已选 ${selected.size} · 显示 ${vis.length} 项` : `共 ${vis.length}`;
   }
   function setRows(r) { items = (r || []).map((row, i) => ({ row, key: String(rowKey(row, i)) })); selected.clear(); render(); }
   if (headCb) headCb.addEventListener('change', (e) => { for (const it of visible()) { if (e.target.checked) selected.add(it.key); else selected.delete(it.key); } render(); });
@@ -436,7 +442,15 @@ function attach(taskId, opts = {}) {
     state.running = true;
     const es = new EventSource(`/api/tasks/${taskId}/log`);
     let settled = false;
-    const finish = (task) => { if (settled) return; settled = true; es.close(); resolve(task); };
+    /** 兜底轮询定时器（SSE 断流后接替跟随，见下方 fallback）。 */
+    let fallbackTimer = null;
+    const finish = (task) => {
+      if (settled) return;
+      settled = true;
+      if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+      es.close();
+      resolve(task);
+    };
     es.addEventListener('message', (evt) => {
       let msg; try { msg = JSON.parse(evt.data); } catch { return; }
       if (msg.type === 'hello') {
@@ -464,12 +478,22 @@ function attach(taskId, opts = {}) {
       retries = 0;
       pollHealth(); // 顺带把顶栏从「日志流中断…」恢复成真实服务状态
     };
+    // ★ 兜底：SSE 断了就改为**轮询到终态**（2026-09-25 修）。
+    //   此前只查一次，拿到非终态任务就 finish —— state.running 会永久停在 true，之后
+    //   所有 runTask 都被「有任务正在运行」挡死（只能刷新页面），而调用方还会把仍在运行
+    //   的任务误报成失败（如备份面板弹「备份失败」）。music.js 的 startFallback 早就是
+    //   「持续轮询」这套正确写法，这里对齐；in-flight 守卫避免超限后重复兜底。
+    let fallbackRunning = false;
     const fallback = async () => {
+      if (settled || fallbackRunning) return;
+      fallbackRunning = true;
       let t = null;
       // api() 已把响应解包到 data，而 /api/tasks/:id 返回的**就是任务对象本身**
       // （不是 { task }）。若在这里再取一次 .task 会恒为 undefined，t 恒为 null。
       try { const r = await api('GET', `/api/tasks/${encodeURIComponent(taskId)}`); t = r && typeof r === 'object' && r.id ? r : null; }
       catch { setService('err', '日志流已断开'); }
+      fallbackRunning = false;
+      if (settled) return;
       if (t) {
         state.task = t; state.running = !isTerminal(t.status);
         emit('task', t); setLogTaskLabel(taskLabel(t));
@@ -479,15 +503,19 @@ function attach(taskId, opts = {}) {
           // 不必等下一个 15s 轮询（用户刚点完更新，正是最需要看到「需要重启」的时刻）。
           if (t.action === 'update') pollHealth();
           if (opts.onDone) { try { opts.onDone(t); } catch (e) { console.error(e); } }
-        } else setService('warn', '日志流已断开，任务仍在后台运行');
-      } else {
-        // ★ 连兜底查询也失败：必须复位运行态。否则 state.running 永久停在 true，
-        //   之后每次 runTask 都会被首行的「有任务正在运行」挡掉，用户只能刷新页面。
-        //   （后端 runner 本身有串行队列，前端放行不会造成并发执行。）
-        state.running = false;
-        state.currentTaskId = null;
+          finish(t);
+          return;
+        }
+        setService('warn', '日志流已断开，任务仍在后台运行（正在轮询）');
+        fallbackTimer = setTimeout(fallback, 2000);
+        return;
       }
-      finish(t);
+      // ★ 连兜底查询也失败/查不到：必须复位运行态。否则 state.running 永久停在 true，
+      //   之后每次 runTask 都会被首行的「有任务正在运行」挡掉，用户只能刷新页面。
+      //   （后端 runner 本身有串行队列，前端放行不会造成并发执行。）
+      state.running = false;
+      state.currentTaskId = null;
+      finish(null);
     };
     es.onerror = () => {
       if (settled) return;
@@ -503,11 +531,15 @@ function attach(taskId, opts = {}) {
 /** 发起任务：POST → attach。confirm=true 满足后端的危险操作校验。 */
 async function runTask(module, action, params = {}, opts = {}) {
   if (state.running) { toast('warn', '有任务正在运行，请等待结束或取消后再试'); return null; }
+  // ★ 先占位再 await（2026-09-25 修）：state.running 原本要等 POST 返回后才置位，
+  //   同一 tick 内连点两次就能提交两个任务（brew 的「一键更新」「逐项升级」等按钮没有本地忙碌态）。
+  //   提交失败时回滚，避免把界面永久卡在「运行中」。
+  state.running = true;
   const body = { module, action, params };
   if (opts.confirm === true) body.confirm = true;
   let submitted;
   try { submitted = await api('POST', '/api/tasks', body); }
-  catch (err) { toast('err', err.message || '提交任务失败'); throw err; }
+  catch (err) { state.running = false; toast('err', err.message || '提交任务失败'); throw err; }
   const t = submitted.task;
   clearLogs();
   state.task = t; state.running = true;
@@ -748,10 +780,16 @@ async function route() {
   let mod;
   try { mod = await VIEW_MODULES[id](); }
   catch (err) {
+    if (token !== routeToken) return;   // 已被更新的路由取代：不要动 DOM（否则会抹掉新视图）
     dom.main.innerHTML = '';
     dom.main.append(emptyState({ icon: '🚧', title: '该视图尚未实现', text: `views/${id}.js 加载失败或不存在（${err && err.message}）。` }));
     return;
   }
+  // ★ 令牌校验必须在这里也做一次（2026-09-25 修）：上面那次 `await import()` 在首次加载某个
+  //   视图时可能耗时较久，「连点两个导航项 → 旧的那次后完成」会继续走到下面的
+  //   `dom.main.innerHTML = ''`，把新视图已经挂好的 DOM 抹掉 —— 表现为「导航高亮在 A、
+  //   内容却空白 / 错位」。此前只在 mount 之后校验令牌，管不住这一步。
+  if (token !== routeToken) return;
   const view = mod && mod.default;
   if (!view || typeof view.mount !== 'function') {
     dom.main.innerHTML = '';
@@ -809,7 +847,11 @@ async function refreshEnv(force) {
 async function recoverTasks() {
   try {
     const tasks = await api('GET', '/api/tasks');
-    const running = tasks.find((t) => t.status === 'running' || t.status === 'pending');
+    // ★ 只看 default lane 的任务（2026-09-25 修）：音乐下载跑在自己的 lane 上，由音乐页
+    //   自己跟随（它刻意不用 runTask，以免占用全局 state.running）。这里若把它 attach 进来，
+    //   整个界面会以为「有任务正在运行」，brew / rime / 解隔离 / 备份全部点不动，
+    //   而音乐日志还会灌进全局日志抽屉。
+    const running = tasks.find((t) => (t.status === 'running' || t.status === 'pending') && t.module !== 'music');
     if (running) {
       state.task = running; setLogTaskLabel(taskLabel(running)); openLogDrawer();
       appendLogLine({ seq: 0, ts: Date.now(), level: 'info', text: `检测到正在运行的任务「${running.title}」，已重新订阅日志…` });

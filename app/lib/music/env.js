@@ -5,7 +5,7 @@
  * 探测结果缓存 60s（force 可绕过），避免每次打开页面都重新起 python 探针。
  *
  * ★ 边界纪律：本文件是「懒探测」的执行者 —— 只有 env 查询被调用时才起子进程；
- *   服务启动与其余 7 个模块绝不因为它而引入任何 Python 依赖（P0-7）。
+ *   服务启动与其余 6 个模块绝不因为它而引入任何 Python 依赖（P0-7）。
  */
 
 import fs from 'node:fs';
@@ -113,8 +113,8 @@ export async function findPython312() {
 
 /**
  * 探测用的内嵌 Python 代码。★ 必须 `import sys` 在前——曾因漏写导致
- * NameError: name 'sys' is not defined（真实安装验证步骤 100% 失败，测试难以覆盖，
- * 见 test/music-probe-code.test.js 的行为级守护）。
+ * `NameError: name 'sys' is not defined`，安装流程的「验证 musicdl 可导入」这一步
+ * 100% 失败，而探针本身的失败原因又会被包装成一句笼统的 import 错误，极难定位。
  */
 export const MUSICDL_PROBE_CODE =
   "import sys,musicdl;sys.stdout.write('MACKITMUSICDL='+str(getattr(musicdl,'__version__','unknown')))";
@@ -139,11 +139,12 @@ export async function probeMusicdl() {
 }
 
 // ---------------------------------------------------------------------------
-// 虚拟环境管理（建 venv / 可用性自检 / 自愈）—— 第 8 模块安装流程专用
+// 虚拟环境管理（建 venv / 可用性自检 / 自愈）—— 音乐模块安装流程专用
 //
 // ★ 为什么这些逻辑放在 env.js 而非 music.js：它们全都是「环境」的读写与探测，与 detect()
 //   同源；music.js 的 createVenvStep 只负责「编排 + 日志」。下沉到这里既让步骤保持精简，
-//   也便于单测直接驱动（注入 run，无需真实子进程 / 真实解释器）。
+//   也把「编排」与「执行」分开：`run` 由调用方注入（安装步骤传 ctx.exec.run，使这些子进程
+//   带上本步的取消信号与通道策略）。
 // ---------------------------------------------------------------------------
 
 /** stdlib 目录名匹配：python3 / python3.12 等。 */
@@ -258,7 +259,7 @@ export function repairVenvHome(venvDir, realPy, log = () => {}) {
 function probeFailure(err, reason) {
   const obj = exec.toErrObj(err);
   if (obj.code === exec.ERR.CANCELLED || obj.code === exec.ERR.TIMEOUT || obj.code === exec.ERR.AUTH_CANCELLED) throw err;
-  // reason 的取值是**对外契约**（单测 music-venv-selfheal 精确断言 'pip 无法运行'），
+  // reason 的取值是**对外契约**（前端据此显示「pip 无法运行」这类可读原因），
   // 因此底层错误只并进 detail 供日志排查，不改写 reason 本身。
   return { usable: false, reason, detail: obj.message || '' };
 }

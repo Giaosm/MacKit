@@ -4,7 +4,7 @@
  *      昨天「昨天 HH:MM」；前天「前天 HH:MM」；3–6 天「N 天前」；
  *      同年更早「MM-DD」；跨年「YYYY-MM-DD」。
  * @param {number} ms  目标时间戳（毫秒）
- * @param {number} [now] 基准时刻，默认 Date.now()（注入以便测试）
+ * @param {number} [now] 基准时刻，默认 Date.now()（显式传入可复现同一输出）
  * @returns {string} 无法解析时返回 ''
  */
 export function fmtRel(ms, now = Date.now()) {
@@ -28,7 +28,8 @@ export function fmtRel(ms, now = Date.now()) {
   const hh = String(target.getHours()).padStart(2, '0');
   const mm = String(target.getMinutes()).padStart(2, '0');
 
-  if (dayDiff <= 0) return `${Math.floor(diff / 3600000)} 小时前`; // 同一自然日
+  // 同一自然日：diff 可能因为时钟偏差 / 跨机器历史而略为负 → 夹到 0（否则会显示「-2 小时前」）
+  if (dayDiff <= 0) return `${Math.max(0, Math.floor(diff / 3600000))} 小时前`;
   if (dayDiff === 1) return `昨天 ${hh}:${mm}`;
   if (dayDiff === 2) return `前天 ${hh}:${mm}`;
   if (dayDiff >= 3 && dayDiff <= 6) return `${dayDiff} 天前`;

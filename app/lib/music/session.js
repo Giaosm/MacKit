@@ -359,7 +359,8 @@ export function start(opts) {
 
   exec.run(paths.MUSIC_VENV_PY, [paths.MUSIC_BRIDGE, command], {
     stdin: JSON.stringify(payload),
-    lane: 'music-search', // 独立 lane：取消音乐下载时不得误杀搜索子进程
+    // 取消只影响本子进程：signal 绑到 session 自己的 controller，且 spawn 时自成进程组，
+    // 因此取消音乐下载不会误伤正在跑的搜索子进程。
     signal: session.controller.signal,
     channel: payload.channel,
     // ★ A-6：环境变量代理（服务 HLS 子下载器与 trust_env 裸 requests）；subprocEnv 在 applyProxyEnv 之后覆盖

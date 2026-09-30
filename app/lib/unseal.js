@@ -134,16 +134,29 @@ function expandTargets(inputs) {
  *     还会和扫描的口径打架（预检说「有隔离」、扫描却不认）。
  *   · 非 .app 路径（用户粘贴的文件 / 文件夹）保留递归语义：用户想知道的是「里面有没有东西被隔离」，
  *     只查根会给出误导性的「无隔离」。
- *   · 根级读取时 `xattr -p` 对「无该属性」返回退出码 1（实测 stderr 为 No such xattr），
- *     故 code!==0 一律按 present=false 处理 —— 与扫描原有行为一致；递归分支保持
- *     「code!==0 → 无法判定」的旧语义（`xattr -l` 对无属性的路径返回 0 + 空输出）。
+ *   · 根级读取时 `xattr -p` 对「无该属性」返回退出码 1（stderr 为 No such xattr），但
+ *     **路径不存在 / 权限不足同样是 1**（分别是 `No such file` 与 `[Errno 13] Permission denied`，
+ *     2026-09-25 实测）。所以只认「明确说没有该属性」为 present=false，其余非 0 一律
+ *     present=null（无法判定）。此前一律判 false，等于把「读不到」当成「没有隔离」，
+ *     会静默漏报「打不开的应用」，而递归分支却如实返回 null —— 两个分支口径不一致。
  */
 async function probeQuarantine(p, opts = {}) {
   const recursive = opts.recursive === true;
   try {
     if (!recursive) {
       const r = await exec.run('xattr', ['-px', QUARANTINE, p], { noMirror: true, timeoutMs: 10_000 });
-      if (r.code !== 0) return { present: false, flags: null };
+      if (r.code !== 0) {
+        // 退出码 1 有三义（本机实测）：
+        //   · 真的没有该属性   → `xattr: <p>: No such xattr: com.apple.quarantine`
+        //   · 路径不存在       → `xattr: No such file: <p>`
+        //   · 权限不足         → `xattr: [Errno 13] Permission denied: '<p>'`
+        // 只有第一种能判「没有隔离」，其余一律「无法判定」（present=null）——否则权限不足
+        // 会被静默当成「无隔离」而漏报。前端已按 hasQuarantine===null 渲染「隔离：未知」
+        // 并仍把它算作可操作项（app/web/views/unseal.js），所以语义是通的。
+        const err = `${r.stderr || ''} ${r.stdout || ''}`;
+        if (/no such xattr/i.test(err)) return { present: false, flags: null };
+        return { present: null, flags: null };
+      }
       const hex = r.stdout.replace(/\s+/g, '');
       if (!hex) return { present: true, flags: null };
       const token = Buffer.from(hex, 'hex').toString('utf8').split(';')[0];

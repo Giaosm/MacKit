@@ -23,6 +23,24 @@ const { ERR, AppError } = exec;
 /** 允许写入的 Git 全局配置键（白名单，防止任意键注入；唯一事实源见 lib/git.js） */
 const GIT_KEYS = git.GIT_KEYS;
 
+/**
+ * 日志用的 URL 脱敏：`http://user:pass@host:8080` → `http://***@host:8080`。
+ * 非 URL（或本就不含 userinfo）原样返回；解析失败时整体隐去，绝不冒明文泄漏的风险。
+ * @param {unknown} v
+ * @returns {string}
+ */
+function maskUrlCredentials(v) {
+  const s = String(v == null ? '' : v);
+  if (!s.includes('@')) return s;
+  try {
+    const u = new URL(s);
+    if (!u.username && !u.password) return s;
+    u.username = u.username ? '***' : '';
+    u.password = '';
+    return u.toString();
+  } catch { return '<含凭据的值，已隐去>'; }
+}
+
 // ------------------------------ 工具 ------------------------------
 const readText = paths.readTextSafe;
 const writeText = paths.writeText;
@@ -227,6 +245,8 @@ const actions = {
             ctx.log('info', '仅移除 alias 定义块，注释行全部保留');
           }
           writeText(rcFile, next);
+          // rc 改了 → 作废环境体检缓存（否则 30s 内其它标签页的「代理别名」状态卡还是旧的）
+          try { env.invalidate(); } catch { /* ignore */ }
           ctx.log('ok', mode === 'replace' ? '代理别名已覆盖更新' : '代理别名已移除');
           ctx.log('info', `生效命令：source ${rcFile}`);
         },
@@ -254,7 +274,12 @@ const actions = {
             ctx.log('info', `跳过未变更项：${key}`);
             continue;
           }
-          ctx.log('info', `git config --global ${key} ${key.includes('proxy') ? value : JSON.stringify(value)}`);
+          // ★ 代理地址里可能带账号密码（`http://user:pass@proxy:8080`）。此前三元表达式刻意把
+          //   proxy 类键排除在 JSON.stringify 之外，反而**按明文**打印 —— 于是凭据进了
+          //   ~/.mackit/logs/*.log（同时 params.changes 也会落进 history，见 store.REDACTED_PARAM_KEYS）。
+          //   统一走脱敏后再打印。
+          const shown = key.includes('proxy') ? maskUrlCredentials(value) : JSON.stringify(value);
+          ctx.log('info', `git config --global ${key} ${shown}`);
           const res = await safeGit(['config', '--global', key, value]);
           if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, `设置 ${key} 失败`, res.stderr.trim());
           applied += 1;
@@ -296,15 +321,29 @@ const actions = {
       id: 'save_ports', title: '保存代理端口',
       run: async (ctx) => {
         const cur = store.readBrewgo();
-        // 非纯数字输入一律忽略、保持原值
-        const httpPort = /^[0-9]+$/.test(String(params.httpPort)) ? Number(params.httpPort) : cur.httpPort;
-        const socks5Port = /^[0-9]+$/.test(String(params.socksPort)) ? Number(params.socksPort) : cur.socksPort;
+        // 端口必须是 1–65535 的整数；否则忽略、保持原值（此前只判「纯数字」，
+        // 越界值会被 store 静默回落 7897，而日志回显的是用户输入的 99999 —— 日志与事实不符）。
+        const pick = (v, fallback) => {
+          const n = Number(String(v));
+          return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : fallback;
+        };
+        const httpPort = pick(params.httpPort, cur.httpPort);
+        const socks5Port = pick(params.socksPort, cur.socksPort);
+        if (String(params.httpPort) !== '' && httpPort !== Number(params.httpPort)) {
+          ctx.log('warn', `HTTP 端口 ${params.httpPort} 非法（需 1–65535 的整数），保持原值 ${cur.httpPort}`);
+        }
+        if (String(params.socksPort) !== '' && socks5Port !== Number(params.socksPort)) {
+          ctx.log('warn', `SOCKS5 端口 ${params.socksPort} 非法（需 1–65535 的整数），保持原值 ${cur.socksPort}`);
+        }
         // 不传 mirror：本次只改端口，MIRROR 行原样保留（含自定义的枚举外镜像）
-        store.writeBrewgo({ httpPort, socksPort: socks5Port });
-        ctx.log('ok', `已保存到 ~/.brewgo_config：HTTP=${httpPort}, SOCKS5=${socks5Port}`);
+        // 用**返回值**打日志：它是唯一事实（写入侧还会再校验一次），不要回显入参。
+        const saved = store.writeBrewgo({ httpPort, socksPort: socks5Port });
+        ctx.log('ok', `已保存到 ~/.brewgo_config：HTTP=${saved.httpPort}, SOCKS5=${saved.socksPort}`);
+        // 端口变了 → 作废环境体检缓存，否则 30s 内其它标签页仍显示旧端口（apply_alias 同理）
+        try { env.invalidate(); } catch { /* ignore */ }
         // 不自动改 Git 代理，仅提示
         const gp = await git.config('http.proxy');
-        const want = `http://127.0.0.1:${httpPort}`;
+        const want = `http://127.0.0.1:${saved.httpPort}`;
         if (gp && gp !== want) {
           ctx.log('warn', `Git 全局代理仍为 ${gp}，如需同步请在「系统初始化 → Git 全局配置」中修改`);
         } else if (!gp) {

@@ -1,5 +1,5 @@
 /**
- * MacKit · 音乐模块（第 8 模块）
+ * MacKit · 音乐模块（第 7 模块，注册表里唯一带 lane 的模块）
  *
  * ModuleDefinition { id:'music', lane:'music', queries, actions }。它把纯 Python 桥接脚本
  * `lib/music/bridge.py` 收编进 MacKit 的查询 / 任务两层：
@@ -7,7 +7,7 @@
  *   · 搜索：独立会话（lib/music/session.js）+ 轮询，**不进任务队列**（只读，避免阻塞 brew）；
  *   · 歌单解析（playlist）：同为独立会话，产出与搜索**同构**的 rows，用户勾选后走已有 download；
  *   · 选择目录（chooseFolder）：osascript 弹系统目录框（只读，不写配置），失败由前端回落手输；
- *   · 下载 / 安装：走 runner 的独立 lane（lane:'music'），与 default lane 的 7 个模块并行。
+ *   · 下载 / 安装：走 runner 的独立 lane（lane:'music'），与 default lane 的 6 个模块并行。
  *
  * ★ 启动纪律（P0-7）：本文件顶层**只** import Node 内建与本项目 lib，绝不在顶层探测或
  *   启动 Python。bridge.py 缺失、venv 缺失一律让查询返回 not_ready，绝不抛错影响服务启动。
@@ -409,7 +409,7 @@ async function queryDeployStatus(params = {}) {
 
 // ------------------------------ musicdl 上游版本（PyPI，纯提示） ------------------------------
 
-/** 上游版本缓存键（store.getCached/setCached 磁盘缓存；导出供单测）。 */
+/** 上游版本缓存键（store.getCached/setCached 的磁盘缓存键）。 */
 export const MUSICDL_UPSTREAM_CACHE_KEY = 'music-musicdl-upstream';
 /** 上游版本缓存 TTL：24h（上游发布频率低，一天一查足够）。 */
 const MUSICDL_UPSTREAM_TTL_MS = 24 * 60 * 60 * 1000;
@@ -418,7 +418,7 @@ const MUSICDL_PYPI_URL = 'https://pypi.org/pypi/musicdl/json';
 
 /**
  * 比较上游版本与**已装版本**：'newer' | 'equal' | 'older'；任一缺失 → null（无从比较）。
- * 纯函数（导出供单测）。复用既有 compareVersions（不可解析的版本按相等处理）。
+ * 纯函数。复用既有 compareVersions（不可解析的版本按相等处理）。
  * @param {string|null} upstream PyPI 上的版本
  * @param {string|null} installed venv 内已装版本
  * @returns {'newer'|'equal'|'older'|null}
@@ -433,7 +433,7 @@ export function compareUpstreamVersion(upstream, installed) {
 
 /**
  * 解析 PyPI `/pypi/<pkg>/json` 响应文本，取 `info.version`。
- * 纯函数（导出供单测）：非法 JSON / 缺 `info` / 缺版本 / 版本号形状不对 → ok:false。
+ * 纯函数：非法 JSON / 缺 `info` / 缺版本 / 版本号形状不对 → ok:false。
  * @param {string} text 响应全文
  * @returns {{ok:true, version:string}|{ok:false, error:string}}
  */
@@ -471,17 +471,13 @@ function cachedUpstreamSummary(installedVersion) {
  * 4MB，PyPI musicdl JSON 含全部历史版本，走 stdout 有截断风险），finally 删临时文件。
  * 24h 磁盘缓存；`force=true` 绕过。
  *
- * ★ 依赖注入（deps）：`runWithChannel` / `detect` 可被单测替换成桩件，避免单测真发网络。
  * @param {{force?:boolean}} [params]
- * @param {{runWithChannel?:Function, detect?:Function}} [deps]
  * @returns {Promise<{fetchOk:boolean, version:string|null, checkedAt:number|null,
  *                     installed:boolean, installedVersion:string|null, target:string,
  *                     comparison:'newer'|'equal'|'older'|null, error?:string}>}
  */
-export async function queryMusicdlUpstream(params = {}, deps = {}) {
-  const runWithChannel = deps.runWithChannel || exec.runWithChannel;
-  const detect = deps.detect || env.detect;
-  const st = await detect();
+export async function queryMusicdlUpstream(params = {}) {
+  const st = await env.detect();
   const installedVersion = (st.musicdl && st.musicdl.installed && st.musicdl.version) || null;
   const base = { installed: installedVersion != null, installedVersion, target: MUSICDL_TARGET_VERSION };
 
@@ -500,7 +496,7 @@ export async function queryMusicdlUpstream(params = {}, deps = {}) {
   //   配置页触发一次）会写同一个文件 —— 一个已经 rmSync 掉，另一个读不到 → 误报解析失败（2026-09-21 修）。
   const tmpFile = path.join(paths.CACHE_DIR, `musicdl-upstream-${process.pid}-${crypto.randomBytes(4).toString('hex')}.json`);
   try {
-    await runWithChannel('direct_first', '查询 musicdl 上游版本', 'curl',
+    await exec.runWithChannel('direct_first', '查询 musicdl 上游版本', 'curl',
       ['-fsSL', '--compressed', '--max-time', '20', '-o', tmpFile, MUSICDL_PYPI_URL],
       { timeoutMs: 25_000, noMirror: true });
     const parsed = parsePypiVersion(fs.readFileSync(tmpFile, 'utf8'));
@@ -910,6 +906,9 @@ function pipInstallStep() {
           ctx.log('info', '尝试代理安装 musicdl …');
           const resProxy = await ctx.exec.run(paths.MUSIC_VENV_PIP, args, {
             noMirror: true, channel: 'proxy', env: { ...baseEnv, ...proxyEnv }, onLine,
+            // ★ 必须显式传：步骤上声明的 timeoutMs 不会自动下传到 exec.run，漏了就用 exec 的 600s 默认值，
+            //   而装 musicdl 要下 300–500MB —— 慢链路会在第 10 分钟被误杀成「安装失败」。
+            timeoutMs: PIP_TIMEOUT_MS,
           });
           if (resProxy.code === 0) {
             ctx.setChannel('proxy');
@@ -924,6 +923,7 @@ function pipInstallStep() {
           noMirror: true, channel: 'direct',
           env: { ...baseEnv, http_proxy: undefined, https_proxy: undefined, all_proxy: undefined },
           onLine,
+          timeoutMs: PIP_TIMEOUT_MS, // 同上：与步骤声明保持一致
         });
         if (resDirect.code !== 0) {
           throw new AppError(ERR.CMD_FAILED, '安装 musicdl 失败，试试切换「网络通道」',
@@ -1091,6 +1091,9 @@ async function downloadSingle(ctx, uid, t) {
         if (text) ctx.log('warn', text);
       }
     },
+    // ★ 必须显式传：步骤上声明的 timeoutMs 不会自动下传到 exec.run。漏了就用 exec 的 600s 默认值，
+    //   于是 DOWNLOAD_TIMEOUT_MS（900s）这个分支永远走不到，大文件会在第 600 秒被误杀。
+    timeoutMs: DOWNLOAD_TIMEOUT_MS,
   });
   if (fatal) throw toAppError(fatal);
   if (res.code !== 0) throw new AppError(ERR.CMD_FAILED, '下载子进程异常退出', tail(res.stderr));

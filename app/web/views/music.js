@@ -510,6 +510,18 @@ function createApp(root, ctx) {
   const body = el('div');
   root.append(head, body);
 
+  // ★ 顶部通道下拉走的是 PUT /api/config，而「代理设置」子区是否渲染取决于 app.config.channel。
+  //   app.config 只在挂载时读一次 → 用户切到「优先代理」后，那个子区不会出现，必须切走视图
+  //   再切回（2026-09-25 修）。这里订阅通道变更，重新拉一次配置并重绘设置卡。
+  //   注意：本订阅在 createApp 里**同步**注册（mount 的 await 之前），所以 app.js 的
+  //   subs 快照一定包含它，卸载时能正常解绑。
+  ctx.on('channel', async (ev) => {
+    if (!ev || ev.moduleId !== 'music') return;
+    try { app.config = await api('GET', '/api/music/config'); } catch { return; }
+    if (disposed || !app.dirCardNode) return;
+    rerenderDirCard();
+  });
+
   const app = {
     // 部署 / 元数据
     deploy: null,
@@ -904,8 +916,8 @@ function createApp(root, ctx) {
     if (e.hasPlaceholder || e.lines.length === 1) { e.logEl.innerHTML = ''; e.hasPlaceholder = false; } // 清掉「等待日志…」占位
     e.logEl.append(logLineNode(line));
     // ★ 与 live 表同口径裁剪：超过 LIVE_LOG_MAX 后从 DOM 头部滑出最旧行（不整段重建）。
-    //   只用 children + removeChild：`childNodes` / `firstChild` 在视图单测的轻量 DOM 桩里
-    //   并不存在（music-install-progress 曾因此整例抛 TypeError），而浏览器与桩件都支持前者。
+    //   只用 children + removeChild：两者都是标准 DOM 属性，语义与 childNodes / firstChild 等价，
+    //   但不必再过滤文本节点（本容器只放元素），少一层判空。
     while (e.logEl.children && e.logEl.children.length > e.lines.length) {
       const first = e.logEl.children[0];
       if (!first) break;
@@ -1820,7 +1832,7 @@ function createApp(root, ctx) {
     } else {
       let rendered = Number(e.renderedLines) || 0;
       // ★ 行数回退（live 表超上限后从头部滑出）：只删 DOM 头部多出的行，不整段重建。
-      //   同上：用 children + removeChild（视图单测的 DOM 桩没有 childNodes / firstChild）。
+      //   与上面同款：用 children + removeChild。
       while (rendered > lines.length && box.children && box.children.length > 0) {
         box.removeChild(box.children[0]);
         rendered -= 1;
@@ -2047,7 +2059,7 @@ function createApp(root, ctx) {
             proxyHttp: httpInput.value.trim(),
             proxySocks5: socksInput.value.trim(),
           });
-          if (next) rerenderDirCard();
+          if (next) { rerenderDirCard(); ctx.ui.toast('ok', '代理设置已保存'); }
         },
       },
     });
@@ -2156,7 +2168,11 @@ function createApp(root, ctx) {
     const bodyReq = {
       downloadDir: ('downloadDir' in patch) ? patch.downloadDir : c.downloadDir,
       nameTemplate: ('nameTemplate' in patch) ? patch.nameTemplate : c.nameTemplate,
-      channel: ('channel' in patch) ? patch.channel : c.channel,
+      // ★ 绝不回传 channel（2026-09-25 修，P0）：通道的唯一来源已改为页面顶部的下拉
+      //   （走 PUT /api/config 的 `musicChannel`）。这里原本把挂载时读到的缓存值无条件回写，
+      //   于是音乐页**任何一次保存**（切歌词 / 换模板 / 改音源 / 存性能 / 存代理）都会把用户
+      //   刚选的通道静默改回旧值，而下拉还显示着新档位、再点同一项不触发 change，用户没法改回来。
+      //   server.js 对 `musicChannel: undefined` 的语义是「不改写」，所以直接不发这个字段即可。
       sources: ('sources' in patch) ? patch.sources : [...app.selSources],
       saveLyrics: ('saveLyrics' in patch) ? patch.saveLyrics === true : c.saveLyrics !== false,
       enhancedSearch: ('enhancedSearch' in patch) ? patch.enhancedSearch === true : c.enhancedSearch !== false,

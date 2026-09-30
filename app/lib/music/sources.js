@@ -5,7 +5,7 @@
  *   - GROUPS      : 6 大分组的展示结构（id / 中文标签 / 有序音源键）；
  *   - SOURCE_META : 「注册键名 → { label, group, defaultOn, drm, radio, note }」；
  *   - merge()     : 与运行时 `REGISTERED_MODULES.keys()` 合并成前端可用的视图；
- *   - defaultSelected() / isDrm() / resolveAlias() : 便捷查询。
+ *   - defaultSelected() : 默认勾选的音源键。
  *
  * 口径（与设计文档 §1.1 的 Q1/Q2 决策一致）：
  *   - **默认只勾选「大中华区」12 源**（defaultOn=true），其余 45 源仍全部可选、默认不勾；
@@ -144,30 +144,6 @@ export const SOURCE_META = Object.freeze(
 /** 全部音源的规范顺序（按分组顺序拍平），用于稳定展示与计数。 */
 export const SOURCE_KEYS = Object.freeze(GROUPS.flatMap((g) => g.keys));
 
-/**
- * 别名 → 注册键名（设计 §3.2 手写示例里的 `QQMusic` 等简写 / 常见拼写归一）。
- * 匹配大小写不敏感：先按注册键名精确匹配，再落到本表。
- * @type {Record<string,string>}
- */
-const ALIASES = Object.freeze({
-  qq: 'QQMusicClient', qqmusic: 'QQMusicClient', 'qq音乐': 'QQMusicClient',
-  netease: 'NeteaseMusicClient', '163': 'NeteaseMusicClient', wyy: 'NeteaseMusicClient',
-  kugou: 'KugouMusicClient', kuwo: 'KuwoMusicClient', migu: 'MiguMusicClient',
-  baidu: 'QianqianMusicClient', qianqian: 'QianqianMusicClient', bilibili: 'BilibiliMusicClient',
-  streetvoice: 'StreetVoiceMusicClient', soda: 'SodaMusicClient', fivesing: 'FiveSingMusicClient',
-  bodian: 'BodianMusicClient', moov: 'MOOVMusicClient',
-  youtube: 'YouTubeMusicClient', yt: 'YouTubeMusicClient', joox: 'JooxMusicClient',
-  apple: 'AppleMusicClient', 'apple music': 'AppleMusicClient', soundcloud: 'SoundCloudMusicClient',
-  deezer: 'DeezerMusicClient', qobuz: 'QobuzMusicClient', spotify: 'SpotifyMusicClient',
-  tidal: 'TIDALMusicClient', jiosaavn: 'JioSaavnMusicClient', suno: 'SunoMusicClient', fma: 'FMAMusicClient',
-  jamendo: 'JamendoMusicClient', opengameart: 'OpenGameArtMusicClient',
-  wikimedia: 'WikimediaCommonsMusicClient', audius: 'AudiusMusicClient', ccmixter: 'CCMixterMusicClient',
-  ximalaya: 'XimalayaMusicClient', lizhi: 'LizhiMusicClient', qingting: 'QingtingMusicClient',
-  lrts: 'LRTSMusicClient', itunes: 'ITunesMusicClient',
-  mp3juice: 'MP3JuiceMusicClient', tunehub: 'TuneHubMusicClient', gdstudio: 'GDStudioMusicClient',
-  myfreemp3: 'MyFreeMP3MusicClient', jbsou: 'JBSouMusicClient', xiaobai: 'XiaoBaiMusicClient',
-});
-
 // ---------------------------------------------------------------------------
 // 查询 / 合并
 // ---------------------------------------------------------------------------
@@ -177,28 +153,6 @@ const ALIASES = Object.freeze({
  */
 export function defaultSelected() {
   return SOURCE_KEYS.filter((k) => SOURCE_META[k] && SOURCE_META[k].defaultOn);
-}
-
-/**
- * 是否为 DRM 音源。
- * @param {string} name
- * @returns {boolean}
- */
-export function isDrm(name) {
-  const meta = SOURCE_META[name];
-  return !!(meta && meta.drm);
-}
-
-/**
- * 把任意写法归一为注册键名（精确匹配 → 别名；都失败返回 null）。
- * @param {string} name
- * @returns {string|null}
- */
-export function resolveAlias(name) {
-  const raw = String(name == null ? '' : name).trim();
-  if (!raw) return null;
-  if (SOURCE_META[raw]) return raw;
-  return ALIASES[raw.toLowerCase()] || null;
 }
 
 /** 把一个注册键名投影为前端视图条目。 */

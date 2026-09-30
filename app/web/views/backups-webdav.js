@@ -351,7 +351,7 @@ function openSettingsModal(ctx) {
       form.passInput.placeholder = '已保存，如需修改请输入新密码';
     }
 
-    // 保存成功后自动做一次连通性探测（无「测试连接」按钮）
+    // 保存成功后自动做一次连通性探测（界面上不另设「连接」按钮，就地把结果告诉用户）
     setStatus('正在探测连接…');
     try {
       await api('GET', '/api/webdav/backups');

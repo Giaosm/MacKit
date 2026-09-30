@@ -45,7 +45,7 @@ const BREW_ENV = paths.BREW_READ_ENV;
 /**
  * 取消 / 超时类错误：必须**原样上抛**（任务取消与超时链路依赖它们），不得降级成 SKIP，
  * 也不得被改写成 NET_UNREACHABLE。只按 `code` 判 —— 只认 `instanceof AppError` 会在
- * 错误跨模块包装（或被测试桩替换）时漏判（2026-09-21）。
+ * 错误被跨模块重新包装后漏判（2026-09-21）。
  * @param {unknown} err
  * @returns {boolean}
  */
@@ -145,7 +145,7 @@ const REBASE_DIRS = ['rebase-merge', 'rebase-apply'];
 /**
  * 判定一次 brew update 失败是否是「上次更新被中断留下的 git 锁 / rebase 现场」。
  *
- * 纯函数（只看文本），便于单测。命中任一形态即视为疑似可自愈：
+ * 纯函数（只看文本、无副作用）。命中任一形态即视为疑似可自愈：
  *   · could not lock config file
  *   · cannot lock ref
  *   · Another git process seems to be running
@@ -171,7 +171,7 @@ export function looksLikeStaleGitLock(err) {
  * 扫描 brew 仓库 `.git` 里的 `*.lock` 与未完成的 rebase 现场。
  *
  * 锁只有在 **mtime 距今超过 10 分钟** 才算陈旧 —— 活着的 git 操作必须被保留。
- * 默认目录取 `paths.BREW_PREFIX/.git`（不硬编码路径）；测试可传 `opts.gitDir` 指向临时目录，
+ * 默认目录取 `paths.BREW_PREFIX/.git`（不硬编码路径）；`opts.gitDir` 可指向别处，
  * 绝不触碰真实 `/opt/homebrew`。
  * @param {{gitDir?:string, now?:number, maxAgeMs?:number, maxDepth?:number}} [opts]
  * @returns {{stale:Array<{path:string,mtimeMs:number,ageMs:number}>, freshLocks:Array<{path:string,mtimeMs:number,ageMs:number}>, rebaseDir:string|null}}
@@ -306,6 +306,15 @@ export async function repairStaleGitState(ctx, opts = {}) {
  */
 async function runPolicyWithSelfHeal(ctx) {
   const args = ['update'];
+  // ★ 与「元数据自动同步」互斥（2026-09-25 修）：refreshBrewMeta 的「有任务在跑就跳过」只判
+  //   提交那一刻的状态，而且它自己不占 runner 队列 —— 自动同步启动后的 2~3s 窗口里点
+  //   「一键更新」，两条 `brew update` 就会并发去抢 brew 仓库的 index.lock，任务白失败。
+  //   反方向已由 refreshBrewMeta 的 isBusy() 判据覆盖（本函数跑在 runner 任务里）；
+  //   这里补上正方向：动手前先等在途的那一次收尾。
+  if (metaState.inflight) {
+    ctx.log('info', '元数据同步正在进行，先等它结束（避免两条 brew update 抢 index.lock）…');
+    try { await metaState.inflight; } catch { /* 它失败不影响我们自己的更新 */ }
+  }
   try {
     await runPolicy(ctx, policyForMirror(), 'Homebrew 更新', args);
     markMetaRefreshed(); // `brew update` 成功 = 元数据已是最新，记时间戳避免启动自动同步再跑一遍
@@ -412,7 +421,13 @@ async function queryOutdated() {
  * 非 auto_updates 的 cask 不自己更新，brew 记账即真值 → 口径原样。
  */
 const UPSTREAM_TTL_MS = 6 * 60 * 60 * 1000;
-/** 上游版本缓存：repo(小写) → { at, tag }。6h 内不重复联网（本机 17 个 auto_updates 应用里 6 个走 GitHub）。 */
+/**
+ * 探测**失败**（没拿到 tag）时的短 TTL。
+ * 与成功分开：一次代理抖动不该让某应用 6 小时不再参与「上游已有新版本」提示，
+ * 但也不能每次刷新都去连环撞墙，10 分钟是二者之间的折中。
+ */
+const UPSTREAM_FAIL_TTL_MS = 10 * 60 * 1000;
+/** 上游版本缓存：repo(小写) → { at, tag }。成功 6h / 失败 10min 内不重复联网（本机 17 个 auto_updates 应用里 6 个走 GitHub）。 */
 const upstreamCache = new Map();
 
 /**
@@ -452,13 +467,13 @@ async function readAppVersion(appTarget) {
  * 只是 brew 记账没跟上」）。
  *
  * ★ 为什么不能只比短版本前缀（2026-09-25 实测踩到，本机 wechat 上翻车）：
- *   cask 版本常把 build / commit 拼在后面，且各家拼法不同 ——
- *     · codebuddy-cn：cask `4.12.1.39217423,757a5b2f`，应用短版本 `4.12.1`（已自更新到位 → 该剔除）
- *     · wechat      ：cask `4.1.15.22,270102`，应用短版本 `4.1.15` 但 **build 是 270100**（其实落后）
- *   只比前缀这两个都会被判成「已是最新」，wechat 就被漏报、永远升不上去。
- *   所以把应用的 **build 号一起拼进版本串**（build 与短版本相同则不重复拼），要求它是 cask 版本
- *   **逗号之前**那一截的前缀；拼不上就说明无从确认它已跟上，**仍然列出**交给 brew 升级（宁可多提，
- *   不可漏报 —— 漏报会让用户永远停在旧版）。
+ *   cask 版本常把 build / commit 拼在后面，且各家拼法**不止一种**：
+ *     · codebuddy-cn：cask `4.12.1.39217423,757a5b2f` —— 应用的 build 被拼在**逗号之前**那一截里；
+ *     · wechat      ：cask `4.1.15.22,270102`       —— 应用的 build 就是**逗号之后**那一截。
+ *   只比短版本前缀，两者都会被判成「已是最新」；只判「短版本.build 是逗号前那截的前缀」，
+ *   则只覆盖得了前一种写法（拼出来的串必然比逗号前那截长 → 主流写法恒判不等）。
+ *   所以下面按 A / B / C 三种约定逐条判，任何一条成立才算「已经就是这一版」；
+ *   都不成立就**仍然列出**交给 brew 升级（宁可多提，不可漏报 —— 漏报会让用户永远停在旧版）。
  *
  * @param {string} appShort 应用 CFBundleShortVersionString
  * @param {string|null} appBuild 应用 CFBundleVersion
@@ -468,8 +483,23 @@ async function readAppVersion(appTarget) {
 function sameAsCask(appShort, appBuild, caskVer) {
   const build = String(appBuild || '').trim();
   const short = String(appShort || '').trim();
-  const composed = build && build !== short ? `${short}.${build}` : short;
-  return samePrefix(composed, String(caskVer || '').split(',')[0]);
+  if (!short) return false;
+  const [verPart = '', buildPart = ''] = String(caskVer || '').split(',');
+  const ver = verPart.trim();
+  const buildSeg = buildPart.trim();
+  // 约定 A：应用的 build 被拼在**逗号之前**那一截里（codebuddy-cn `4.12.1.39217423,757a5b2f`）
+  if (build && build !== short && samePrefix(`${short}.${build}`, ver)) return true;
+  // 约定 B：逗号后那一截就是应用的 build（wechat `4.1.15.22,270102`）。
+  // ★ 2026-09-25 修：此前只判 A，而 Cask 主流写法是 `<版本>,<build>` —— 拼出来的
+  //   `4.1.15.270102` 一定比逗号前那截 `4.1.15.22` 长，`samePrefix` 直接 false，
+  //   于是「应用已是 cask 版本、只是记账滞后」的假阳性根本没被剔除（注释点名要剔除的就是这一类）。
+  //   这里要求「短版本是逗号前那截的前缀」+「build 与逗号后那截完全相等」双条件，
+  //   对 wechat 成立、对被判定为真落后的旧版本（build 270100 ≠ 270102）不成立 → 不漏报。
+  if (buildSeg && build && build === buildSeg && samePrefix(short, ver)) return true;
+  // 约定 C：应用没有可用的 build 号（或与短版本相同）→ 只能按短版本前缀判定。
+  // 有独立 build 但逗号后为空的情况下刻意**不**判定相等（宁可多提，不可漏报）。
+  if ((!build || build === short) && samePrefix(short, ver)) return true;
+  return false;
 }
 
 /**
@@ -512,7 +542,13 @@ async function probeUpstreamTag(repo) {
   if (!repo) return null;
   const key = repo.toLowerCase();
   const hit = upstreamCache.get(key);
-  if (hit && Date.now() - hit.at < UPSTREAM_TTL_MS) return hit.tag;
+  if (hit) {
+    // ★ 成功与失败用**不同**的 TTL（2026-09-25 修）：此前两者共用 6h，一次代理抖动就会让
+    //   这个应用在 6 小时内不再出现在「上游已有新版本」里 —— 而那条提示本来就是给
+    //   「brew 不报、上游已发」的假阴性兜底的，静默 6h 等于兜底失效。
+    const ttl = hit.tag ? UPSTREAM_TTL_MS : UPSTREAM_FAIL_TTL_MS;
+    if (Date.now() - hit.at < ttl) return hit.tag;
+  }
   let tag = null;
   try {
     const res = await exec.run('curl',
@@ -521,7 +557,7 @@ async function probeUpstreamTag(repo) {
     const m = /^location:\s*\S*\/releases\/tag\/([^\s]+)/im.exec(res.stdout || '');
     if (m) tag = decodeURIComponent(m[1].trim());
   } catch { /* 探测失败不影响主列表 */ }
-  // 失败也写缓存（tag=null，短 TTL 由下次 6h 后再试），避免每次刷新都打一遍
+  // 失败也写缓存（tag=null，走 UPSTREAM_FAIL_TTL_MS 的短 TTL），避免每次刷新都打一遍
   upstreamCache.set(key, { at: Date.now(), tag });
   return tag;
 }
@@ -581,7 +617,14 @@ async function rawOutdated(key, args) {
   if (parsed) return parsed;
   const quietArgs = [...args.filter((a) => a !== '--json=v2'), '--quiet'];
   const q = await safeRun('brew', quietArgs);
-  return lineList(q.stdout).map((n) => ({ name: n, current: null, latest: null }));
+  if (q.code === 0) return lineList(q.stdout).map((n) => ({ name: n, current: null, latest: null }));
+  // ★ 两条路都失败 → 必须**抛错**，不能返回空数组（2026-09-25 修）。
+  //   返回 [] 会让「brew 跑不起来」和「brew 说 0 项」在界面上完全一样 —— 典型静默错误，
+  //   本项目此前专门修过「总览计数静默为 0」的同类问题（见 env.js 的 --greedy-latest 回落）。
+  const detail = [paths.tailLines(res.stderr || res.stdout), paths.tailLines(q.stderr || q.stdout)]
+    .filter(Boolean).join(' / ');
+  throw new AppError(ERR.CMD_FAILED, '读取 Homebrew 可更新列表失败',
+    detail || res.errCode || q.errCode || undefined);
 }
 
 async function queryInstalled() {
@@ -597,9 +640,12 @@ async function queryInstalled() {
 }
 
 async function queryInfo(params) {
-  const kind = params.kind === 'formula' ? '--formula' : '--cask';
-  const name = String(params.name || '');
-  if (!name) return { lines: [] };
+  const k = normKind(params.kind);
+  const kind = k === 'formula' ? '--formula' : '--cask';
+  const name = String(params.name || '').trim();
+  // ★ name 直接来自 HTTP 查询串，会被原样塞进 brew 的 argv。用与安装 / 卸载同一张 token 表校验，
+  //   挡住 `--json=v2` 这类以 `-` 开头的取值被 brew 当成选项（参数注入面；命令注入已被 shell:false 排除）。
+  if (!name || !tokenRe(k).test(name)) return { lines: [] };
   const res = await safeRun('brew', ['info', kind, name]);
   // 只取 info 前 5 行，并统一缩进两格
   const out = lineList(res.stdout).slice(0, 5).map((l) => `  ${l}`);
@@ -886,6 +932,13 @@ function writeIndexCache(kind, items) {
 const INDEX_TRY_TIMEOUT_S = 180;
 /** 兜底通道的预算（秒）：它后面没有第三次尝试，「没配代理 + 直连慢」的用户只能靠它下完。 */
 const INDEX_LAST_TIMEOUT_S = 600;
+/**
+ * 「刷新索引」这一步的**硬超时**（runner 侧）必须 ≥ 两次尝试的预算之和，否则兜底通道永远跑不完：
+ * 180 + 600 秒（+30s 余量）≈ 13.5 分钟。2026-09-25 修：此前是写死的 320_000 —— 首选通道慢时
+ * 兜底通道实际只剩 ~140s，而且硬超时会让该步直接判 `fail`（不是注释里承诺的 `skip`，
+ * 因为 runner 的 Promise.race 先落定，refreshIndexStep 的 SKIP 转换来不及生效）。
+ */
+const INDEX_STEP_TIMEOUT_MS = (INDEX_TRY_TIMEOUT_S + INDEX_LAST_TIMEOUT_S) * 1000 + 30_000;
 
 async function downloadIndex(kind, deps = {}) {
   const spec = KIND_SPEC[normKind(kind)];
@@ -1100,24 +1153,24 @@ function shellenvStep() {
   };
 }
 
-/** 下载官方安装脚本到缓存目录（代理优先），返回脚本路径。 */
+/** 下载官方安装脚本到缓存目录（走通道兜底：优先直连，走不通换代理 —— 与 downloadIndex 同口径）。 */
 async function downloadInstallScript(ctx) {
   const target = path.join(paths.CACHE_DIR, 'homebrew-install.sh');
   let lastErr = null;
   for (const url of INSTALL_SCRIPT_URLS) {
     try {
       ctx.log('info', `下载官方安装脚本：${url}`);
-      const res = await ctx.exec.run('curl', ['-fsSL', '--max-time', '120', '-o', target, url], {
-        timeoutMs: 150_000, channel: 'proxy',
-        onLine: (line, stream) => { if (line.trim()) ctx.log(stream === 'stderr' ? 'warn' : 'info', line); },
-      });
-      if (res.code !== 0) {
-        // curl 默认不删失败输出：超时中断留下的半截脚本可能仍然 >5KB 并通过下面的校验
-        try { fs.rmSync(target, { force: true }); } catch { /* ignore */ }
-        lastErr = new AppError(ERR.CMD_FAILED, '安装脚本下载失败', paths.tailLines(res.stderr));
-        ctx.log('warn', '该地址下载失败，尝试下一个…');
-        continue;
-      }
+      // ★ 2026-09-25 修：此前写死 `channel: 'proxy'`，两个备用地址都只在代理通路上重试 ——
+      //   没开代理的用户即使直连完全可用也永远装不上 Homebrew；而 jsDelivr 那条备用地址
+      //   本来就是给国内直连准备的，被写死的通道废掉了（autoFallback 开关对它也无效）。
+      //   现在每个地址都走 runWithChannel：目标主机 → 策略（GitHub 系代理优先，jsDelivr 直连优先），
+      //   且任一路走不通会自动换另一条。
+      await ctx.exec.runWithChannel(brewPolicy(url), `下载官方安装脚本（${url}）`, 'curl',
+        ['-fsSL', '--max-time', '120', '-o', target, url],
+        {
+          timeoutMs: 150_000,
+          onLine: (line, stream) => { if (line.trim()) ctx.log(stream === 'stderr' ? 'warn' : 'info', line); },
+        });
       const text = readTextSafe(target) || '';
       if (text.includes('#!/bin/bash') && text.length >= INSTALL_SCRIPT_MIN_BYTES) {
         ctx.log('ok', `脚本已就绪（${text.length} 字节）`);
@@ -1126,8 +1179,11 @@ async function downloadInstallScript(ctx) {
       lastErr = new AppError(ERR.PARSE_FAILED, '安装脚本内容异常', `仅 ${text.length} 字节，疑似未取到官方脚本`);
     } catch (err) {
       lastErr = err;
-      ctx.log('warn', `该地址下载失败，尝试下一个…`);
     }
+    // 失败或内容异常都要清掉落盘文件：curl 默认不删失败输出，超时中断留下的半截脚本
+    // 可能仍然 >5KB 并通过下一次的校验。
+    try { fs.rmSync(target, { force: true }); } catch { /* ignore */ }
+    ctx.log('warn', '该地址下载失败，尝试下一个…');
   }
   throw lastErr instanceof AppError ? lastErr
     : new AppError(ERR.NET_UNREACHABLE, '安装脚本下载失败（代理与直连均不可用）', String(lastErr && lastErr.message));
@@ -1193,12 +1249,21 @@ function homebrewInstallSteps() {
   ];
 }
 
-/** 为 install_casks / install_formulae 生成「每目标一步」的安装步骤（mode: proxy|direct）。 */
+/**
+ * 为 install_casks / install_formulae 生成「每目标一步」的安装步骤。
+ *
+ * ★ 每一项都必须**显式**带 mode（'proxy' | 'direct'）：与「逐项升级」同口径，非法 / 缺失
+ *   一律记为该步 skip，绝不替用户默认成直连 —— 否则调用方漏传一个字段，后端就会悄悄用
+ *   直连去下一个几百 MB 的 cask，而用户以为自己选的通道生效了。
+ */
 function installSteps(items, kind) {
   const spec = KIND_SPEC[normKind(kind)];
   const re = tokenRe(spec.kind);
   const list = (Array.isArray(items) ? items : [])
-    .map((it) => ({ name: String((it && it.name) || '').trim(), mode: it && it.mode === 'proxy' ? 'proxy' : 'direct' }))
+    .map((it) => ({
+      name: String((it && it.name) || '').trim(),
+      mode: it && (it.mode === 'proxy' || it.mode === 'direct') ? it.mode : null,
+    }))
     .filter((it) => it.name && re.test(it.name));
   if (list.length === 0) {
     return [{ id: 'noop', title: '无可安装项', run: async (ctx) => { ctx.log('warn', `未指定要安装的 ${spec.label}`); } }];
@@ -1207,6 +1272,7 @@ function installSteps(items, kind) {
     id: `install_${i}`, title: `安装 ${it.name}`,
     timeoutMs: UPGRADE_TIMEOUT,
     run: async (ctx) => {
+      if (!it.mode) throw new AppError(ERR.SKIP, `未指定「代理 / 直连」通道，已跳过 ${it.name}`);
       const label = `${it.name} ${it.mode === 'proxy' ? '代理' : '直连'}安装`;
       const args = ['install', spec.brewFlag, it.name];
       const c = cfg();
@@ -1253,7 +1319,7 @@ async function refreshIndexStep(ctx, kind) {
     if (isCancelOrTimeout(err)) throw err;
     const msg = (err && err.message) || String(err);
     ctx.log('warn', `${spec.label} 索引刷新失败（不影响本体更新）：${msg} —— 可稍后重试「一键更新」`);
-    throw Object.assign(new AppError('SKIP', `${spec.label} 索引刷新失败`), { code: 'SKIP' });
+    throw new AppError(ERR.SKIP, `${spec.label} 索引刷新失败`);
   }
 }
 
@@ -1284,7 +1350,9 @@ async function checkUpstreamConsistency(ctx) {
   for (const kind of ['cask', 'formula']) {
     const spec = KIND_SPEC[kind];
     let idx = null;
-    try { idx = await ensureIndex(kind); } catch { /* 索引不可用 → 跳过该类别 */ }
+    // ★ 必须注入 run/log：不注入时 downloadIndex 会回落到 `exec.run` 兜底 —— 那条路**不带本步的
+    //   AbortSignal**，于是这一步的 180s 硬超时之后 curl 还在跑（最长 600s+），取消任务也杀不掉。
+    try { idx = await ensureIndex(kind, { run: ctx.exec.run, log: (l, t) => ctx.log(l, t) }); } catch { /* 索引不可用 → 跳过该类别 */ }
     if (!idx) continue;
     const byName = new Map();
     for (const it of idx.items) if (it && it.t) byName.set(String(it.t), String(it.v || ''));
@@ -1308,8 +1376,13 @@ async function checkUpstreamConsistency(ctx) {
       if (!idxVer || !/^[0-9]/.test(idxVer)) continue;
       // 拆掉 revision（`1.5.7_1` → `1.5.7`）再比上游版本：`_N` 只是重新打包、上游版本没变，
       // 不能当成「索引比 brew 新」而误报上游滞后。
-      const idxUp = stripBrewRevision(idxVer);
-      const insUp = stripBrewRevision(installedVer);
+      // ★ 只对 **formula** 剥（2026-09-25 修）：`_N` 是 Homebrew 的 revision 概念，只存在于
+      //   formula 版本串；cask 的 `_N` 是发布方版本的一部分（本机 cask.json 里有 33 个，
+      //   如 `3.3.23,250315_0521`），一起剥会把 `_0521` vs `_0522` 这种真实差异静默吞掉 ——
+      //   而这个核对要抓的恰恰是差异。
+      const strip = kind === 'formula' ? stripBrewRevision : (v) => String(v == null ? '' : v);
+      const idxUp = strip(idxVer);
+      const insUp = strip(installedVer);
       if (idxUp === insUp) continue;
       suspects += 1;
       if (suspects <= 3) {
@@ -1374,8 +1447,13 @@ const META_TIMEOUT_MS = 120_000;
 
 const metaState = { refreshing: false, inflight: null, failedAt: 0, lastError: null };
 
-/** 同步成功时记录时间戳（节流依据；写盘失败不影响本次结果）。 */
+/** 同步成功时记录时间戳，并把「上次失败」一并清掉。 */
 function markMetaRefreshed() {
+  // ★ 清失败状态（2026-09-25 修）：只写时间戳的话，/api/health 仍带着上一次自动同步失败的
+  //   lastError，而时间戳已被刷新 → `stale=false`，管家页「重查可更新项」里的
+  //   `if (bm.stale …)` 不成立 → 不会再触发一次同步去把它清掉，横幅会一直挂到 TTL 过期或重启。
+  metaState.failedAt = 0;
+  metaState.lastError = null;
   try { store.writeMackit({ brewMetaRefreshedAt: Date.now() }); } catch { /* ignore */ }
 }
 
@@ -1407,7 +1485,9 @@ export function brewMetaStatus() {
  *
  * @param {{force?:boolean, maxAgeMs?:number, run?:Function, isBusy?:Function,
  *          log?:(level:string,text:string)=>void}} [opts]
- *   run / isBusy 可注入，便于单测与桩件验证。
+ *   run / isBusy 可注入：`run` 让调用方（如「一键更新」动作）把 `brew update` 计入自己那一步的
+ *   取消信号与通道策略；`isBusy` 让任务内的调用方跳过「有任务在跑就不动」这条判据
+ *   —— 否则任务自己就会把自己挡在门外。
  * @returns {Promise<{ok?:boolean, skipped?:string, error?:string}&object>}
  */
 export async function refreshBrewMeta(opts = {}) {
@@ -1431,9 +1511,7 @@ export async function refreshBrewMeta(opts = {}) {
   metaState.inflight = (async () => {
     try {
       await run(policyForMirror(), '同步 Homebrew 元数据', 'brew', ['update'], { timeoutMs: META_TIMEOUT_MS, env: BREW_ENV });
-      markMetaRefreshed();
-      metaState.failedAt = 0;
-      metaState.lastError = null;
+      markMetaRefreshed(); // 时间戳 + 清失败状态（唯一实现点，别再各写一份）
       log('ok', '已同步 Homebrew 元数据（brew update）');
       // 作废环境体检缓存：下一次 /api/env 就会用新元数据重算「可更新 N 项」
       try { env.invalidate(); } catch { /* ignore */ }
@@ -1474,7 +1552,8 @@ const actions = {
    *   变新，而搜索/安装列表用的 MacKit 自建索引（24h TTL）要再等最多 24 小时 —— 点一次按钮只刷新
    *   了一半数据。现在一次点完两条数据源都新鲜，且这是**唯一**的刷新入口（只读命令一律
    *   HOMEBREW_NO_AUTO_UPDATE，见 paths.BREW_READ_ENV）。
-   *   `params.refreshIndex === false` 时只更新本体（保留给命令行 / 测试使用）。
+   *   `params.refreshIndex === false` 时只更新本体、跳过重下索引（给只想刷新 brew 元数据
+   *   的调用方留的窄口子，界面不传）。
    *   ★ 失败若是「中断残留的 git 锁」→ 安全修复后重试一次（Task A 自愈）。
    */
   brew_update: {
@@ -1487,7 +1566,7 @@ const actions = {
       if (params && params.refreshIndex === false) return plans;
       for (const kind of ['cask', 'formula']) {
         plans.push({
-          id: `index_${kind}`, title: `刷新 ${KIND_SPEC[kind].label} 索引`, timeoutMs: 320_000,
+          id: `index_${kind}`, title: `刷新 ${KIND_SPEC[kind].label} 索引`, timeoutMs: INDEX_STEP_TIMEOUT_MS,
           run: async (ctx) => { await refreshIndexStep(ctx, kind); },
         });
       }
@@ -1514,11 +1593,11 @@ const actions = {
           run: async (ctx) => {
             if (mode === 'skip') {
               ctx.log('warn', `已跳过 ${it.name}`);
-              throw Object.assign(new AppError('SKIP', `已跳过 ${it.name}`), { code: 'SKIP' });
+              throw new AppError(ERR.SKIP, `已跳过 ${it.name}`);
             }
             if (!tokenRe(kind).test(it.name)) {
               ctx.log('error', `名称不合法（含 brew 选项或非法字符），已跳过：${it.name}`);
-              throw Object.assign(new AppError('SKIP', `名称不合法：${it.name}`), { code: 'SKIP' });
+              throw new AppError(ERR.SKIP, `名称不合法：${it.name}`);
             }
             // ★ 自带更新（auto_updates）的 cask **照常交给 brew 升级**（2026-09-22 用户要求）：
             //   列表侧已用「应用真实版本」纠过偏，只会列出真正落后的项（应用版本 > cask 的会被挡在

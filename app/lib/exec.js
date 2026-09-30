@@ -34,6 +34,13 @@ export const ERR = Object.freeze({
   IO_ERROR: 'IO_ERROR',
   NET_UNREACHABLE: 'NET_UNREACHABLE',
   FORBIDDEN: 'FORBIDDEN',
+  /**
+   * 步骤**主动跳过**（不是失败）：runner 见到它会把该步记为 `skip`，任务整体不受影响。
+   * 典型用法：「一键更新」里重下索引只是附加收益，失败不该让整个任务变红；逐项升级遇到
+   * 未指定通道的项也走这里。★ 2026-09-25 之前这个码只是 brew.js 里到处硬写的字面量
+   * 'SKIP'，runner 也按字面量判 —— 三处靠字符串隐式耦合，这里收编为正式错误码。
+   */
+  SKIP: 'SKIP',
 });
 
 /**
@@ -137,20 +144,22 @@ const PY_BASENAME_RE = /^python3(\.12)?$/;
 // 存活子进程登记（进程退出前的强制回收）
 // ---------------------------------------------------------------------------
 /**
- * 当前存活的子进程 → 所属 lane 的映射（spawn 成功即登记，关闭即注销）。
+ * 当前存活的子进程集合（spawn 成功即登记，关闭即注销）。
  *
  * 为什么要登记：正常取消走 AbortSignal → SIGTERM →（3s）→ SIGKILL，靠 exec 内部的
  * 兜底定时器完成。但**进程准备退出时**（server.js 的 gracefulShutdown）不能只依赖它：
  * `process.exit` 会直接丢掉尚未触发的定时器，把忽略 SIGTERM 的子进程留成孤儿。
  * 登记句柄后，退出路径可以显式补一刀，见 {@link killAllNow}。
  *
- * 为什么带 lane（设计 §5.1）：音乐模块的下载走独立并行通道（lane），其**搜索子进程**
- * 用的是 `music-search` lane。取消音乐下载时必须只杀 `music` lane 的子进程，绝不能
- * 误伤正在跑的搜索子进程（见 {@link killLaneNow}）。
+ * ★ 「取消只影响自己那一路」由 AbortSignal 天然保证，不需要按通道分桶：runner 会给每个
+ *   子进程绑定**本步**的 signal，且 spawn 时 detached:true 让每个子进程自成进程组，
+ *   killTree 只对负 pid（= 自己那一组）发信号。所以取消音乐下载不会波及并行的搜索子进程。
+ *   （设计 §5.1 曾预留「按 lane 分桶强杀」（killLaneNow），但该函数全项目零调用，
+ *   2026-09-25 随本次清理删除 —— 分桶语义已由上面的 signal + 进程组覆盖。）
  *
- * @type {Map<import('node:child_process').ChildProcess, string>}
+ * @type {Set<import('node:child_process').ChildProcess>}
  */
-const LIVE_CHILDREN = new Map();
+const LIVE_CHILDREN = new Set();
 
 /**
  * 立即对全部存活子进程**整组**发信号（默认 SIGKILL），用于进程退出前的强制回收。
@@ -161,20 +170,9 @@ const LIVE_CHILDREN = new Map();
  * @param {NodeJS.Signals} [signal='SIGKILL']
  * @returns {number} 实际尝试发信号的子进程数（0 表示当前无存活子进程）
  */
-export function killAllNow(signal = 'SIGKILL') { return killNow(signal, null); }
-
-/**
- * 对存活子进程发信号（`laneFilter` 为 null 表示所有 lane）。
- * killAllNow / killLaneNow 此前是两份逐行同构的实现（只差 lane 过滤），
- * 2026-09-21 收敛到这里以避免漂移。
- * @param {NodeJS.Signals} signal
- * @param {string|null} laneFilter
- * @returns {number}
- */
-function killNow(signal, laneFilter) {
+export function killAllNow(signal = 'SIGKILL') {
   let n = 0;
-  for (const [child, childLane] of Array.from(LIVE_CHILDREN.entries())) {
-    if (laneFilter !== null && childLane !== laneFilter) continue;
+  for (const child of Array.from(LIVE_CHILDREN)) {
     const pid = child.pid;
     try {
       // 优先对进程组发信号（spawn 时 detached:true → 子进程自成进程组），
@@ -190,24 +188,12 @@ function killNow(signal, laneFilter) {
 }
 
 /**
- * 只对指定 lane 的存活子进程**整组**发信号（默认 SIGKILL）。
+ * 是否存在存活子进程。
  *
- * 用途：取消「音乐下载通道」的全部下载子进程时，**不得**连带杀掉 `music-search`
- * lane 上正在运行的搜索子进程（设计 §5.1 明确点名的隐患）。
- *
- * @param {string} lane 目标 lane 名（'default' | 'music' | 'music-search' | …）
- * @param {NodeJS.Signals} [signal='SIGKILL']
- * @returns {number} 实际尝试发信号的子进程数
- */
-export function killLaneNow(lane, signal = 'SIGKILL') { return killNow(signal, lane); }
-
-/**
- * 是否存在存活子进程（任意 lane）。
- *
- * 供 server.js 的优雅退出兜底判断：音乐**搜索会话**用 exec.run 直接起 bridge.py
- * （lane 'music-search'），**不经过 runner**，因此 `runner.isBusy()` / `activeTaskIds()`
- * 看不见它。若只凭 runner 状态决定是否补杀，会在「只有搜索在跑、没有任何任务」时
- * 整段回收被跳过 → Python 子进程变孤儿（见 server.js gracefulShutdown）。
+ * 供 server.js 的优雅退出兜底判断：音乐**搜索会话**用 exec.run 直接起 bridge.py，
+ * **不经过 runner**，因此 `runner.isBusy()` / `activeTaskIds()` 看不见它。若只凭 runner
+ * 状态决定是否补杀，会在「只有搜索在跑、没有任何任务」时整段回收被跳过 → Python 子进程
+ * 变孤儿（见 server.js gracefulShutdown）。
  *
  * @returns {boolean}
  */
@@ -241,8 +227,8 @@ function realPathOr(p) {
  * 这些目录来自固定表与宿主 PATH 扫描，**不由用户输入决定**，是「解释器只可能来自哪里」的边界。
  *
  * ★ 按当前 `process.env.PATH` 记忆化：PATH 未变时复用，变了就重算。
- *   （不能只缓存一次——测试 / 运行期可能改写 PATH；paths.findPython312 每次都读实时 PATH，
- *    这里必须与它保持一致，否则会与「探测到的候选」失配。）
+ *   （不能只缓存一次——宿主 PATH 在进程运行期可能被改写；paths.findPython312 每次都读实时
+ *    PATH，这里必须与它保持一致，否则会与「探测到的候选」失配。）
  * @type {string[]|null}
  */
 let interpreterDirs = null;
@@ -275,7 +261,8 @@ function trustedInterpreterPath(p) {
  *        （指向 /opt/homebrew/bin/python3.12 这类基础解释器）；收紧成「与」会把正常 venv 一并拒掉。
  *        ⟹ 本层**不防御「PY_DIR 内被植入软链」这一威胁**：该威胁的前提是攻击者已取得用户级
  *        写权限，早已越过本应用的安全边界。真正兜底的是「`bin` 参数永不由 HTTP 入参 /
- *        配置 / 任务 params 决定」（见 app/test/resolvebin.test.js 的绊线断言）。
+ *        配置 / 任务 params 决定」—— 全项目所有 `run()` / `spawnStream()` 的 bin 都是本文件
+ *        BIN_MAP 的键或 paths.js 里的常量，没有任何一条来自外部输入。
  *        realpath 仅在路径存在时参与判断，不存在时回落到归一化结果、不抛。
  *   3) 解释器文件名 `python3` / `python3.12` —— **仅当**其归一化（或 realpath）路径落在
  *      「受信任解释器目录」内（`~/.mackit/py`、`PY312_CANDIDATES` 各自目录、宿主 PATH 目录）。
@@ -480,6 +467,24 @@ function buildEnv(opts) {
 // ---------------------------------------------------------------------------
 // 子进程执行
 // ---------------------------------------------------------------------------
+/**
+ * exec 层统一的调用选项（run / spawnStream / runWithChannel / openInFinder 共用）。
+ *
+ * 此前这个类型名被 git.js / env.js 等处的 `import('./exec.js').RunOpts` 引用，却从未
+ * 真正定义过——现在补上，顺带成为「这些选项各自什么语义」的唯一说明处。
+ *
+ * @typedef {object} RunOpts
+ * @property {string} [cwd] 子进程工作目录（缺省 = 用户家目录；仓库类命令必须显式传）
+ * @property {Record<string,string|undefined>} [env] 追加 / 覆盖的环境变量，优先级高于本层默认注入
+ * @property {boolean} [envReplace] 完全替换环境（不继承宿主、不注入镜像与代理），供刻意构造最小环境的调用方
+ * @property {string} [mirror] Homebrew 镜像源 id（缺省取 ~/.brewgo_config 的 MIRROR）
+ * @property {boolean} [noMirror] 不注入镜像源变量（读命令与授权命令用）
+ * @property {'direct'|'proxy'} [channel] 代理通道；缺省按直连处理，并**大小写不敏感地**清掉宿主代理变量
+ * @property {number} [timeoutMs] 超时（缺省 DEFAULT_TIMEOUT_MS）；超时走 SIGTERM → 3s → SIGKILL
+ * @property {AbortSignal} [signal] 取消信号（同上，对整组发信号）
+ * @property {string} [stdin] 一次性写入子进程 stdin 后关闭（凭据只走这里，不进日志）
+ * @property {(line:string, which:'stdout'|'stderr')=>void} [onLine] 逐行回调（超长无换行输出会被截断）
+ */
 
 /**
  * 创建一个受控子进程并等待结束。
@@ -493,9 +498,6 @@ export function run(bin, args, opts = {}) {
   const binPath = resolveBin(bin);
   const argsArr = Array.isArray(args) ? args.slice() : [];
   const env = buildEnv(opts);
-  // lane 标记（设计 §5.1）：缺省一律落 'default'，使未传 lane 的调用（现有 7 个模块）
-  // 与改动前完全等价；killLaneNow 只按本字段精确匹配目标通道。
-  const laneName = (typeof opts.lane === 'string' && opts.lane) || 'default';
   const timeoutMs = typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0
     ? opts.timeoutMs
     : DEFAULT_TIMEOUT_MS;
@@ -520,7 +522,7 @@ export function run(bin, args, opts = {}) {
         detached: true,
         stdio: [opts.stdin !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       });
-      LIVE_CHILDREN.set(child, laneName);
+      LIVE_CHILDREN.add(child);
     } catch (err) {
       reject(new AppError(ERR.CMD_FAILED, `无法启动命令 ${bin}`, String(err && err.message)));
       return;
@@ -638,7 +640,7 @@ export function run(bin, args, opts = {}) {
       //   会被留成孤儿 —— 与本文件「整组回收」的承诺相悖（2026-09-21 修）。
       //   它是 unref 的；对已退出的 pid 发信号只会被 catch 忽略。
       if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
-      LIVE_CHILDREN.delete(child); // 结束即注销（Map.delete 与旧 Set.delete 语义一致），killAllNow / killLaneNow 不会误伤已退出的进程
+      LIVE_CHILDREN.delete(child); // 结束即注销，killAllNow 不会误伤已退出的进程
     };
 
     const finish = (code, signal) => {
@@ -695,7 +697,6 @@ export function spawnStream(bin, args, opts = {}) {
   const binPath = resolveBin(bin);
   const argsArr = Array.isArray(args) ? args.slice() : [];
   const env = buildEnv(opts);
-  const laneName = (typeof opts.lane === 'string' && opts.lane) || 'default';
   const timeoutMs = typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0
     ? opts.timeoutMs
     : DEFAULT_TIMEOUT_MS;
@@ -712,7 +713,7 @@ export function spawnStream(bin, args, opts = {}) {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    LIVE_CHILDREN.set(child, laneName);
+    LIVE_CHILDREN.add(child);
   } catch (err) {
     throw new AppError(ERR.CMD_FAILED, `无法启动命令 ${bin}`, String(err && err.message));
   }
@@ -956,7 +957,7 @@ export async function osascriptAdmin(shellCmd, opts = {}) {
  *   `-backup`）都会被 `open` 当普通路径而非选项（macOS 的 `open` 基于 getopt，支持 `--`）。
  *
  * @param {string} dir 目标目录（调用方需确保其存在）
- * @param {{timeoutMs?:number, signal?:AbortSignal, lane?:string}} [opts]
+ * @param {{timeoutMs?:number, signal?:AbortSignal}} [opts]
  * @returns {Promise<import('./exec.js').RunResult>}
  */
 export function openInFinder(dir, opts = {}) {

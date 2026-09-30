@@ -127,7 +127,11 @@ function applyRimeFiles(ctx, files) {
       ctx.log('warn', `跳过非法文件名：${f && f.name}`);
       continue;
     }
-    if (typeof f.text !== 'string') continue;
+    if (typeof f.text !== 'string') {
+      // 不静默跳过：否则恢复后「少了一个配置文件」这件事在日志里完全看不出来
+      ctx.log('warn', `跳过内容缺失的 Rime 配置：${f && f.name}`);
+      continue;
+    }
     paths.writeText(`${paths.RIME_DIR}/${f.name}`, f.text);
     ctx.log('ok', `已写入 Rime 配置：${f.name}`);
   }
@@ -138,10 +142,9 @@ function applyRimeFiles(ctx, files) {
  * git / github / rime / deploy）。只被 `webdav_restore` 使用，是这条链路的唯一实现。
  *
  * @param {() => object} getPayload 惰性取信封（restore 场景下信封在「下载」步才就绪）
- * @param {{deploy?:boolean}} params 动作参数（deploy!==false 时重新部署输入法）
  * @returns {Array<{id:string,title:string,run:(ctx:object)=>Promise<void>}>}
  */
-function applyPayloadSteps(getPayload, params) {
+function applyPayloadSteps(getPayload) {
   return [
     {
       id: 'validate', title: '校验备份文件',
@@ -265,7 +268,11 @@ const actions = {
           id: 'collect', title: '收集本机设置',
           run: async (ctx) => {
             payloadRef = { app: 'MacKit', version: 1, createdAt: Date.now(), data: await collectData() };
-            ctx.log('ok', '已收集本机设置（含钥匙串凭据，绝不写日志）');
+            // ★ readCredential 返回 null 有三种原因：钥匙串里没有（正常）、读取超时、用户拒绝了
+            //   授权弹窗。它们无法区分，所以不能无条件宣称「含凭据」——否则用户换机恢复后
+            //   发现 Token 缺失，却一直以为备份是完整的（2026-09-25 修）。
+            if (payloadRef.data.github) ctx.log('ok', '已收集本机设置（含钥匙串 GitHub 凭据，绝不写日志）');
+            else ctx.log('warn', '未读到钥匙串 GitHub 凭据（可能未配置，或读取被拒绝 / 超时）——本次备份不含 Token');
           },
         },
         {
@@ -332,7 +339,7 @@ const actions = {
             ctx.log('ok', `已下载：${name}`);
           },
         },
-        ...applyPayloadSteps(() => payloadRef, params),
+        ...applyPayloadSteps(() => payloadRef),
       ];
     },
   },

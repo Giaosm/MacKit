@@ -241,7 +241,8 @@ export default {
       /**
        * 「重查可更新项」：若元数据已过期，**先同步一次**（`brew update`，≈2s）再重算 ——
        * 用户对「重查」的直觉就是「拿到新的」；元数据没过期时它就是纯重算（<1s，不联网）。
-       * ★ 必须定义在 panelUpgrade 内：它要用本面板的 load()（mock 在 mount 作用域会 ReferenceError）。
+       * ★ 必须定义在 panelUpgrade 内：它要用本面板的 load()；挪到 mount 作用域就拿不到那个
+       *   load，直接 ReferenceError。
        */
       async function recheck(btn) {
         const bm = ctx.state.brewMeta || {};
@@ -666,7 +667,10 @@ export default {
       panels[active](panelBox);
     }
 
-    ctx.on('env', () => { if (env) renderEnv(); });
+    // ★ 必须取事件载荷（2026-09-25 修）：只拿 mount 时的局部 env 重绘，会让「元数据自动同步后
+    //   app.js 强制 refreshEnv」这条链在本页失效 —— 总览的数字更新了，Homebrew 页却还是旧值，
+    //   直到用户手动点「重新体检」。
+    ctx.on('env', (e) => { env = e; if (e) renderEnv(); });
     ctx.on('brewmeta', () => renderMetaSync());
     renderTabs(); renderMetaSync(); loadEnv(false);
     // 无条件首屏渲染（active 默认 'upgrade'）——不可依赖 active 判断，否则会整片空白。

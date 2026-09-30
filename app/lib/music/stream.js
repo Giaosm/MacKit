@@ -21,8 +21,25 @@ import * as paths from '../paths.js';
 import * as exec from '../exec.js';
 import { AppError, ERR } from '../exec.js';
 
-/** 上游抓取默认超时（连接/整体各 30s 级） */
+/**
+ * 上游抓取的默认**空闲**超时（30s）。
+ * 直连分支把它交给 `req.setTimeout`（连接 / 停顿超过 30s 即判不可达）。
+ * 代理分支的 `--max-time` 语义是**整体时长**，不能用这个值 —— 见 {@link AUDIO_MAX_DURATION_MS}。
+ */
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
+
+/**
+ * 整段音频在代理通道下的**整体**时长上限（30 分钟）。
+ *
+ * ★ 为什么需要单独一个值（2026-09-25 修）：直连分支的 `req.setTimeout` 是**空闲**超时，
+ *   而代理分支的 curl `--max-time` 是**从 spawn 起算的整体**上限。此前两者共用 30s，
+ *   后果是「代理档下大于 30s 的曲目必然被砍断」：一首 100MB+ 的 flac（本机缓存里就有
+ *   94MB / 145MB / 182MB 的成品，全部来自直连）在代理下绝无可能 30s 传完，
+ *   播放会中途断流、边听边存会留下永远无法提升为成品的 `.part`。
+ *   现在代理分支用这个整体上限，并用 curl 的 `--speed-limit/--speed-time` 补回停滞检测
+ *   （低于 1KB/s 持续 60s 即中止），语义与直连的空闲超时对齐。
+ */
+export const AUDIO_MAX_DURATION_MS = 30 * 60 * 1000;
 
 /** 跟随重定向的最大跳数（防重定向环）。 */
 const MAX_REDIRECTS = 5;
@@ -168,7 +185,7 @@ export function contentTypeForExt(ext) {
  * ★ 契约说明（2026-09-21）：`start`/`end` **只在整段判定上有意义**，不是可直接套用的
  *   字节区间 —— 后缀范围 `bytes=-N`（最后 N 字节）在本函数里强制表达为 `{start:0, end:N}`，
  *   它**不等于**真实偏移。上游 Range 是原样透传的（不经本函数改写），所以这不影响播放；
- *   但任何新调用方都不许拿这两个字段去算 Content-Range / 做切片。该形状已被单测锁定。
+ *   但任何新调用方都不许拿这两个字段去算 Content-Range / 做切片。
  * @param {string} value
  * @returns {{start:number, end:number|null, isFull:boolean}|null}
  */
@@ -317,12 +334,17 @@ function findHeaderBodyBoundary(buf) {
 }
 
 /** 代理抓取：经 exec.spawnStream 启动白名单内 curl（`-L` 跟随重定向），解析最终响应头块后再把 body 交给调用方。 */
-function openUpstreamProxy({ url, headers, range, proxies, timeoutMs }) {
+function openUpstreamProxy({ url, headers, range, proxies, overallTimeoutMs }) {
   return new Promise((resolve, reject) => {
     const args = [
       '-sS', '--no-buffer', '-D', '-',
       '-L', '--max-redirs', String(MAX_REDIRECTS),
-      '--connect-timeout', '10', '--max-time', String(Math.max(1, Math.round(timeoutMs / 1000))),
+      '--connect-timeout', '10',
+      // 整体时长上限（不是空闲超时，见 AUDIO_MAX_DURATION_MS 注释）
+      '--max-time', String(Math.max(1, Math.round(overallTimeoutMs / 1000))),
+      // 停滞检测：低于 1KB/s 持续 60s 即中止 —— 补上「整体上限」缺失的空闲语义，
+      // 否则一个卡住的上游会白占满整个 30 分钟窗口。
+      '--speed-limit', '1024', '--speed-time', '60',
     ];
     for (const [k, v] of Object.entries(headers || {})) {
       if (v !== undefined && v !== null) args.push('-H', `${k}: ${v}`);
@@ -336,11 +358,11 @@ function openUpstreamProxy({ url, headers, range, proxies, timeoutMs }) {
        · 只有经它启动才会登记进 LIVE_CHILDREN → 进程退出时能被整组回收，
          此前播放用的 curl 从不登记，服务退出后就是孤儿进程；
        · bin 也才经过白名单解析（paths.CURL_BIN 是绝对路径，直接 spawn 等于绕过校验）。
-       envReplace 让本文件刻意构造的最小环境生效（见 buildCurlEnv 注释），
-       lane 用独立的 'music-stream'：它不参与「取消全部下载」的 lane 强杀，
-       只随进程退出时的 killAllNow 一起回收。 */
+       envReplace 让本文件刻意构造的最小环境生效（见 buildCurlEnv 注释）；
+       本子进程只随进程退出时的 killAllNow 一起回收，不参与任何定向取消。 */
     const spawned = exec.spawnStream('curl', args, {
-      env, envReplace: true, lane: 'music-stream', timeoutMs,
+      // JS 侧兜底定时器与 curl --max-time 同口径（整体上限），否则它会在 30s 处先把 curl 杀掉。
+      env, envReplace: true, timeoutMs: overallTimeoutMs,
     });
     const child = spawned.child;
 
@@ -427,19 +449,25 @@ function buildCurlEnv(proxies) {
  * 打开上游（自动按通道选择直连 / curl）。
  *
  * @param {{url:string, headers?:Record<string,string>, range?:string,
- *          channel?:'direct'|'proxy', proxies?:object|null, timeoutMs?:number}} opts
+ *          channel?:'direct'|'proxy', proxies?:object|null, timeoutMs?:number,
+ *          overallTimeoutMs?:number}} opts
+ *   `timeoutMs`      —— 直连分支的**空闲**超时（缺省 30s）
+ *   `overallTimeoutMs` —— 代理分支的**整体**时长上限（缺省 = timeoutMs；整段音频应传 {@link AUDIO_MAX_DURATION_MS}）
  * @returns {Promise<{status:number, headers:Record<string,string>,
  *                    stream:import('node:stream').Readable, abort:() => void}>}
  */
 export function openUpstream(opts) {
   const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
     ? opts.timeoutMs : DEFAULT_UPSTREAM_TIMEOUT_MS;
+  const overallTimeoutMs = Number.isFinite(opts.overallTimeoutMs) && opts.overallTimeoutMs > 0
+    ? opts.overallTimeoutMs : timeoutMs;
   const req = {
     url: String(opts.url || ''),
     headers: opts.headers && typeof opts.headers === 'object' ? opts.headers : {},
     range: opts.range,
     proxies: opts.proxies && typeof opts.proxies === 'object' ? opts.proxies : null,
     timeoutMs,
+    overallTimeoutMs,
   };
   // ★ 协议白名单在**这里**统一把关，不能只放在直连分支：直连分支自己会校验 protocol，
   //   而代理分支把 url 直接交给 curl（curl 支持 file:// / dict:// / gopher:// 等），

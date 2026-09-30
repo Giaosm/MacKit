@@ -23,11 +23,8 @@
 
 import * as store from './store.js';
 
-/** 档位值域（唯一事实源在 store.js，这里转发，避免两处各写一份）。 */
-export const CHANNEL_VALUES = store.CHANNEL_VALUES;
-
-/** 有通道档位的模块（只有真联网的模块才给开关，避免出现「设置了却不生效」的死设置）。 */
-export const CHANNEL_MODULES = Object.freeze(['brew', 'music', 'rime', 'selfupdate']);
+/** 档位值域（唯一事实源在 store.js 的 CHANNEL_VALUES，这里只取本地别名）。 */
+const CHANNEL_VALUES = store.CHANNEL_VALUES;
 
 /**
  * GitHub 生态主机：github.com、*.githubusercontent.com、github.io、ghcr.io（Homebrew bottle 镜像）。
@@ -70,7 +67,7 @@ export function policyForUrl(url) {
  * @param {string} moduleId
  * @returns {'auto'|'proxy_first'|'direct_first'}
  */
-export function channelFromConfig(modCfg, moduleId) {
+function channelFromConfig(modCfg, moduleId) {
   const v = modCfg && modCfg[`${moduleId}Channel`];
   return CHANNEL_VALUES.includes(v) ? v : 'auto';
 }

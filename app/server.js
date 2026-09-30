@@ -25,7 +25,7 @@ import * as store from './lib/store.js';
 import * as runner from './lib/runner.js';
 import * as env from './lib/env.js';
 import { AppError, ERR, toErrObj, hasLiveChildren, spawnDetached } from './lib/exec.js';
-import { DAV_ERR, urlHasCredentials } from './lib/webdav.js';
+import { DAV_ERR, urlHasCredentials, validateDavUrl } from './lib/webdav.js';
 import { parseReqUrl } from './lib/requrl.js';
 import {
   openUpstream,
@@ -33,6 +33,7 @@ import {
   buildCoverResponseHeaders,
   contentTypeForExt,
   parseRangeHeader,
+  AUDIO_MAX_DURATION_MS,
 } from './lib/music/stream.js';
 
 /** 版本号（读取 package.json，失败回落）。 */
@@ -83,6 +84,8 @@ function statusForCode(code) {
     case ERR.ENV_MISSING: return 409;
     case ERR.CANCELLED: return 409;
     case ERR.AUTH_CANCELLED: return 409;
+    // 步骤主动跳过：不是失败，但若它意外冒到 HTTP 层，语义上属于「请求无法完成」。
+    case ERR.SKIP: return 409;
     case ERR.TIMEOUT: return 504;
     case ERR.NET_UNREACHABLE: return 503;
     case ERR.CMD_FAILED: return 502;
@@ -276,15 +279,23 @@ function audioCachePathIfPresent(cacheKey) {
   } catch { return null; }
 }
 
-/** 原子替换：先删目标再 rename；被 macOS 拒（EPERM，脱离终端的常驻进程常见）则降级为复制。 */
+/**
+ * 原子替换：直接 `rename` 覆盖（POSIX 语义即原子替换），失败才降级为复制。
+ *
+ * ★ 2026-09-25 修（并发安全）：此前是「先 `rm` 目标再 `rename`」，而 `.part` 名按缓存键固定 ——
+ *   两个同曲并发整段请求会写同一个 `.part`，两次 finish 抢 rename：先成功者的成品会被后者
+ *   的 `rmSync` 删掉，随后后者的 rename 又因源文件已被处理而失败，结果是**有效缓存反而没了**。
+ *   现在：① `.part` 带 pid + 随机段（见 createAudioCacheWriter），互不覆盖；
+ *   ② 这里不再预删目标 —— rename 本身就能原子覆盖，失败时也绝不破坏已有的好缓存。
+ */
 function promoteFile(tmp, target) {
   try {
-    fs.rmSync(target, { force: true });
     fs.renameSync(tmp, target);
     return true;
   } catch (err) {
     if (err && (err.code === 'EPERM' || err.code === 'EXDEV')) {
       // 与 store.js writeJsonSafe / rime.js 同款降级：这台 macOS 上常驻进程 rename 会被拒。
+      // 复制失败时保持目标不动（宁可这次没缓存，也不要毁掉上一份好的）。
       try { fs.copyFileSync(tmp, target); fs.rmSync(tmp, { force: true }); return true; }
       catch { return false; }
     }
@@ -293,7 +304,7 @@ function promoteFile(tmp, target) {
 }
 
 /**
- * 边听边存：整段播放时把上游字节同时写进 `MUSIC_AUDIO_CACHE_DIR/<key>.part`。
+ * 边听边存：整段播放时把上游字节同时写进 `MUSIC_AUDIO_CACHE_DIR/<key>.<uniq>.part`。
  *
  * ★ 2026-09-21 重写，修掉三个真实缺陷（此前实测 15 个 `.part` = 401MB 却没有一个成品文件）：
  *   1) **没有背压**：`cacheStream.write()` 的返回值被忽略，磁盘慢时 Node 会在内存里
@@ -317,7 +328,11 @@ function createAudioCacheWriter(cacheKey) {
   try {
     fs.mkdirSync(paths.MUSIC_AUDIO_CACHE_DIR, { recursive: true });
     finalPath = path.join(paths.MUSIC_AUDIO_CACHE_DIR, cacheKey);
-    partPath = `${finalPath}.part`;
+    // ★ `.part` 必须唯一：同曲并发（两个标签页 / 播放器预取 + 手动点播）会各自创建写入流，
+    //   固定名字会让后者 O_TRUNC 掉前者的数据，并在 finish 时抢 rename（见 promoteFile 的注释）。
+    //   pid 防跨进程、时间戳+随机段防同进程内的并发。
+    const uniq = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    partPath = `${finalPath}.${uniq}.part`;
     stream = fs.createWriteStream(partPath);
     stream.on('error', () => { try { stream.destroy(); } catch { /* ignore */ } stream = null; });
   } catch { stream = null; }
@@ -387,7 +402,7 @@ function serveAudioCache(res, hit, ext) {
  *
  * ★ 成功 = **裸二进制流**（不走 `{ok,data}` 包络）；失败 = JSON 包络。
  * ★ SSRF 口径：url 只来自「快照内 uid 解析结果」（`streamMeta` 查询），路由**绝不接受任何外部 url 入参**。
- * ★ 边听边存：仅整段播放（无 Range 或 Range 从 0 起）才 tee 到 `MUSIC_AUDIO_CACHE_DIR/<key>.part`，
+ * ★ 边听边存：仅整段播放（无 Range 或 Range 从 0 起）才 tee 到 `MUSIC_AUDIO_CACHE_DIR/<key>.<uniq>.part`，
  *   结束 rename；整段播放**优先命中已有缓存**（不再回源）。
  */
 async function handleMusicStream(req, res, id, uid) {
@@ -409,6 +424,9 @@ async function handleMusicStream(req, res, id, uid) {
     range,
     channel: meta.channel,
     proxies: meta.proxies,
+    // ★ 整段音频在**代理通道**下的整体时长上限（直连分支只用它作空闲超时）。
+    //   不传的话代理分支会按默认 30s 整体砍断 —— 一百多 MB 的 flac 永远传不完（见 stream.js 常量注释）。
+    overallTimeoutMs: AUDIO_MAX_DURATION_MS,
   });
   if (up.status >= 400) {
     try { up.abort(); } catch { /* ignore */ }
@@ -767,8 +785,14 @@ async function handleApi(req, res, url) {
 
   // 解隔离预检
   if (method === 'GET' && pathname === '/api/unseal/precheck') {
-    const raw = url.searchParams.get('paths') || '';
-    ok(res, await queryModule('unseal', 'precheck', { paths: raw ? raw.split('|').filter((s) => s.length > 0) : [] }));
+    // ★ 每条路径一个 `path=` 参数（2026-09-25 修）：此前是 `paths=a|b|c`，而路径名本身可能含
+    //   `|`，拼接后会被拆成两项，items 与用户输入错位。旧的 `paths=` 形式仍兼容（命令行用法）。
+    const many = url.searchParams.getAll('path');
+    const legacy = url.searchParams.get('paths');
+    const paths = many.length > 0
+      ? many
+      : (legacy ? legacy.split('|').filter((s) => s.length > 0) : []);
+    ok(res, await queryModule('unseal', 'precheck', { paths }));
     return;
   }
 
@@ -794,6 +818,9 @@ async function handleApi(req, res, url) {
       throw new AppError(ERR.PARSE_FAILED, 'WebDAV 地址里不要写账号密码',
         '请把用户名 / 密码填到下面的对应输入框（URL 里的 userinfo 不参与认证）');
     }
+    // ★ 地址形状在**写入口**就校验（协议 / userinfo / 查询串与片段）：
+    //   坏地址一旦落盘，要等到用户点「上传备份」时才报错，而且症状（打错资源）很难联想回 URL。
+    if (body.url) validateDavUrl(body.url);
     // password 缺省（未传）→ 保持原密码；显式传 '' → 清空（见 store.writeWebdav）
     store.writeWebdav({
       url: body.url,
@@ -1027,7 +1054,7 @@ function scanBackendCode(dir, out = []) {
   let entries = [];
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
   for (const e of entries) {
-    if (e.name === 'node_modules' || e.name === 'test' || e.name.startsWith('.')) continue;
+    if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
     const full = path.join(dir, e.name);
     if (e.isDirectory()) { scanBackendCode(full, out); continue; }
     if (!e.name.endsWith('.js')) continue;
