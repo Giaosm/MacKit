@@ -652,54 +652,73 @@ async function pollHealth() {
 // ============================== 「代码已换新」横幅 ==============================
 /**
  * 「更新 MacKit」只改磁盘上的文件，于是有两种「看起来更新了、其实没生效」：
- *   ① 后端：常驻服务的内存模块不会重新加载 → 需要重启服务（带「立即重启」）；
- *   ② 前端：已打开的页面里跑的还是加载那一刻的 JS → 需要刷新页面（带「刷新页面」）。
+ *   ① 后端：常驻服务的内存模块不会重新加载 → 需要重启服务；
+ *   ② 前端：已打开的页面里跑的还是加载那一刻的 JS → 需要刷新页面。
  * 界面自己看不出这两点，所以我们用 /api/health 的两个时间戳判断后挂横幅。
+ *
+ * ★ 两条提示**合并为一条、只给一个按钮**（2026-09-30 改）：
+ *   一次 `git pull` 几乎总是同时改前后端，原先会并排挂出「立即重启」与「刷新页面」两个按钮，
+ *   用户得自己判断先点哪个（点错了还不一定有用）。而事实是：**重启这条路径本来就会自动刷新
+ *   页面** —— restartService → showVeil → 遮罩期间 pollHealth 每 2s 探测，服务一回来就
+ *   `location.reload()`。所以后端过期时只需「立即重启」一个按钮，前端过期顺带在副标题里说明；
+ *   只有前端过期（后端没变，例如刚更新完、页面还没刷）时才单独给「刷新页面」。
  */
 const PAGE_LOADED_AT = Date.now(); // 本页面加载时刻（与后端 mtime 同一台机器的时钟）
 /** 判定前端过期的容差：更新与刷新几乎同时发生时，避免误报（同机时钟，3s 足够）。 */
 const FRONTEND_STALE_SKEW_MS = 3000;
-/** kind → 横幅节点（route() 会清空 main，故需要登记以便重申 / 移除）。 */
-const healthBanners = new Map();
+/** 当前横幅节点（route() 会清空 main，故需要留引用以便重申 / 移除）。 */
+let healthBannerNode = null;
 
-/** 挂 / 撤某类横幅；spec 为 null 表示撤下。 */
-function setHealthBanner(kind, spec) {
-  const cur = healthBanners.get(kind);
-  if (cur && cur.parentNode) cur.parentNode.removeChild(cur);
-  healthBanners.delete(kind);
+/** 挂 / 撤顶部横幅；spec 为 null 表示撤下。 */
+function setHealthBanner(spec) {
+  if (healthBannerNode && healthBannerNode.parentNode) healthBannerNode.parentNode.removeChild(healthBannerNode);
+  healthBannerNode = null;
   if (!spec) return;
-  const node = el('div', { class: 'warn-box restart-banner' }, [
+  healthBannerNode = el('div', { class: 'warn-box restart-banner' }, [
     el('div', { class: 'restart-banner__text' }, [
       el('div', { text: spec.text }),
       spec.sub ? el('div', { class: 'muted', text: spec.sub }) : null,
     ]),
     el('button', { class: 'btn btn--primary btn--sm', type: 'button', text: spec.action, on: { click: spec.onClick } }),
   ]);
-  healthBanners.set(kind, node);
-  dom.main.insertBefore(node, dom.main.firstChild);
+  dom.main.insertBefore(healthBannerNode, dom.main.firstChild);
 }
 
-/** 依据最近一次 /api/health 结果同步两类横幅。 */
+/** 依据最近一次 /api/health 结果同步顶部横幅（后端优先：一条就够，见上方说明）。 */
 function syncHealthBanners() {
   if (!dom.main) return;
   const h = lastHealth || {};
-  // 前端过期（刷新即可）：web/ 最近改动晚于本页面加载时刻
+  // 前端过期：web/ 最近改动晚于本页面加载时刻
   const webAt = Number(h.webChangedAt) || 0;
-  setHealthBanner('frontend', webAt > PAGE_LOADED_AT + FRONTEND_STALE_SKEW_MS ? {
-    text: '前端文件已更新，当前页面仍在运行旧版本 —— 刷新页面即可加载新界面。',
-    sub: `前端改动于 ${fmtTime(webAt)}，本页面加载于 ${fmtTime(PAGE_LOADED_AT)}`,
-    action: '刷新页面',
-    onClick: () => location.reload(),
-  } : null);
-  // 后端过期（必须重启）：先插前端那条、再插这条 → 重启提示排在更靠上的位置
+  const frontStale = webAt > PAGE_LOADED_AT + FRONTEND_STALE_SKEW_MS;
+  const backStale = h.needsRestart === true;
   const files = Array.isArray(h.changedFiles) ? h.changedFiles : [];
   const list = files.length ? files.slice(0, 3).join('、') + (files.length > 3 ? ` 等 ${files.length} 个文件` : '') : '后端代码';
-  setHealthBanner('backend', h.needsRestart ? {
-    text: '后端代码已更新，当前服务仍在运行旧版本 —— 需要重启 MacKit 才会生效。',
-    sub: `变更：${list}`,
-    action: '立即重启',
-    onClick: restartService,
-  } : null);
+
+  // 后端过期 → 只给「立即重启」：它会先拉起新服务再退出旧进程，页面随后自动刷新，
+  // 前端的新界面也在同一步里生效，不需要用户再点一次「刷新页面」。
+  if (backStale) {
+    setHealthBanner({
+      text: frontStale
+        ? 'MacKit 已更新，当前服务仍在运行旧版本 —— 重启后前后端一起生效。'
+        : '后端代码已更新，当前服务仍在运行旧版本 —— 需要重启 MacKit 才会生效。',
+      sub: `变更：${list}${frontStale ? ' · 重启后页面会自动刷新，无需再手动刷新' : ''}`,
+      action: '立即重启',
+      onClick: restartService,
+    });
+    return;
+  }
+  // 只有前端过期（后端没变）→ 刷新页面即可，不需要重启服务
+  if (frontStale) {
+    setHealthBanner({
+      text: '前端文件已更新，当前页面仍在运行旧版本 —— 刷新页面即可加载新界面。',
+      sub: `前端改动于 ${fmtTime(webAt)}，本页面加载于 ${fmtTime(PAGE_LOADED_AT)}`,
+      action: '刷新页面',
+      onClick: () => location.reload(),
+    });
+    return;
+  }
+  setHealthBanner(null);
 }
 
 /** 显示服务遮罩（关闭 / 重启共用），文案由调用方给。 */
@@ -800,9 +819,8 @@ async function route() {
   dom.main.innerHTML = '';
   const root = el('div');
   dom.main.append(root);
-  // 上面那句 innerHTML='' 连横幅节点一起摘掉了（节点仍在 Map 里但已脱离 DOM），
-  // 这里清掉登记并按最新体检结果重申。
-  healthBanners.clear();
+  // 上面那句 innerHTML='' 把横幅节点从 DOM 里摘掉了（引用还在），这里清掉引用并按最新体检结果重申。
+  healthBannerNode = null;
   syncHealthBanners();
   const subs = [];
   const viewCtx = makeCtx(subs);
