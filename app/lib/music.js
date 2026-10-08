@@ -1329,7 +1329,7 @@ export default {
   },
   /**
    * 优雅退出钩子（server.js gracefulShutdown 经 registry 可选调用）：
-   * 取消所有只读会话（搜索 / 歌单）子进程 —— 它们 lane='music-search'、**不经 runner**，
+   * 取消所有只读会话（搜索 / 歌单）子进程 —— 它们**不经 runner**（各自绑自己的 AbortSignal），
    * 只有搜索在跑时 runner.isBusy() 为 false，必须由此主动回收，避免孤儿进程。
    * @returns {number} 被请求取消的会话数
    */

@@ -483,7 +483,11 @@ function attach(taskId, opts = {}) {
     //   所有 runTask 都被「有任务正在运行」挡死（只能刷新页面），而调用方还会把仍在运行
     //   的任务误报成失败（如备份面板弹「备份失败」）。music.js 的 startFallback 早就是
     //   「持续轮询」这套正确写法，这里对齐；in-flight 守卫避免超限后重复兜底。
+    // ★ 再加**次数上限**（2026-10-08）：后端进程已死这类情形下任务永远是 running，2s 一轮会一直打下去。
+    //   到上限就按「无法确认」收尾并复位运行态（不复位的话后续所有操作都会被「有任务正在运行」挡死）。
     let fallbackRunning = false;
+    let fallbackTries = 0;
+    const FALLBACK_MAX_TRIES = 450;   // 450 × 2s = 15 分钟
     const fallback = async () => {
       if (settled || fallbackRunning) return;
       fallbackRunning = true;
@@ -506,7 +510,15 @@ function attach(taskId, opts = {}) {
           finish(t);
           return;
         }
-        setService('warn', '日志流已断开，任务仍在后台运行（正在轮询）');
+        fallbackTries += 1;
+        if (fallbackTries >= FALLBACK_MAX_TRIES) {
+          setService('err', '无法确认任务状态（轮询已超时），请刷新页面查看');
+          state.running = false;
+          state.currentTaskId = null;
+          finish(null);
+          return;
+        }
+        setService('warn', `日志流已断开，任务仍在后台运行（正在轮询 ${fallbackTries}）`);
         fallbackTimer = setTimeout(fallback, 2000);
         return;
       }

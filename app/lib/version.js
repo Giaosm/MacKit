@@ -60,6 +60,30 @@ export function samePrefix(a, b) {
 }
 
 /**
+ * 两个版本串是否**就是同一版**（忽略尾部补零段：`1.2` == `1.2.0`）。
+ *
+ * 用途：判定「已装的 .app 是否就是 cask 记录的那一版」。与 {@link samePrefix} 的区别很关键：
+ *   · `samePrefix('1.2', '1.2.5')` → **true**（前缀判定），于是应用 1.2 / cask 1.2.5 会被误判成
+ *     「已是最新」→ brew 升级被吞掉，用户永远停在旧版（2026-10-08 复审发现的漏报）；
+ *   · `sameVersion('1.2', '1.2.5')` → **false**（段数不等），照常列出升级 ✅。
+ * 尾部补零要容忍，是因为各家 cask 对同一版常写成 `1.2` 或 `1.2.0`。
+ * @param {unknown} a
+ * @param {unknown} b
+ * @returns {boolean}
+ */
+export function sameVersion(a, b) {
+  const trim = (arr) => {
+    const out = arr.slice();
+    while (out.length > 1 && out[out.length - 1] === '0') out.pop();
+    return out;
+  };
+  const A = trim(segments(a));
+  const B = trim(segments(b));
+  if (A.length === 0 || B.length === 0 || A.length !== B.length) return false;
+  return A.every((seg, i) => seg === B[i]);
+}
+
+/**
  * 严格解析 `MAJOR.MINOR.PATCH`（只取前三段，允许后面还有段）。
  * @param {unknown} v
  * @returns {[number,number,number]|null} 失败 → null

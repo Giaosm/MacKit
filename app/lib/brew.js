@@ -34,7 +34,7 @@ import * as store from './store.js';
 import * as exec from './exec.js';
 import * as env from './env.js';
 import { bareChannel, policyForHost, policyForUrl, resolvePolicy } from './netpolicy.js';
-import { compare, samePrefix } from './version.js';
+import { compare, parseStrict, samePrefix, sameVersion } from './version.js';
 import { countSteps, isBusy as runnerIsBusy } from './runner.js';
 
 const { ERR, AppError } = exec;
@@ -398,7 +398,7 @@ async function queryOutdated() {
     formulae,
     casks,
     upstreamCasks: upstream,
-    counts: { formula: formulae.length, cask: casks.length, upstream: upstream.length },
+    counts: { formula: formulae.length, cask: casks.length },
     checkedAt,
   };
 }
@@ -418,6 +418,9 @@ async function queryOutdated() {
  *   · 应用版本 < cask 版本 → 真落后 → **参与 brew 升级**（用户要求：自带更新的也要能升级）；
  *   · 应用版本 > cask 版本 → brew 升级只会**降级**，不列出；
  *   · 上游版本 > 本机版本且 cask 没跟上 → 单列「上游已有新版本」，提示用应用内更新。
+ *     上游来源两选一（见 queryCaskOutdated）：cask url 是 GitHub → releases/latest；
+ *     否则读应用自带的 Sparkle 更新源（SUFeedURL）—— 后者覆盖了 input-source-pro 这类
+ *     url/homepage 都不是 GitHub 的 cask，只认前者会整类漏掉（2026-10-08 补）。
  * 非 auto_updates 的 cask 不自己更新，brew 记账即真值 → 口径原样。
  */
 const UPSTREAM_TTL_MS = 6 * 60 * 60 * 1000;
@@ -463,6 +466,24 @@ async function readAppVersion(appTarget) {
 }
 
 /**
+ * 带**单次查询缓存**的 {@link readAppVersion}。
+ * 同一次 queryOutdated 里，同一个 cask 会在 ①「纠偏 brew 假阳性」与 ②「上游探测」两处各问一次；
+ * 不缓存就要多跑一倍 plutil（本机 17 个 auto_updates 应用 ≈ 多 34 个子进程），
+ * 而 `/api/brew/outdated` 是「重查可更新项」与元数据自动同步后都会走的热路径。
+ * @param {string|null} appTarget 形如 /Applications/Input Source Pro.app
+ * @param {Map<string,Promise<{short:string,build:string|null}|null>>} cache 本次查询内复用
+ * @returns {Promise<{short:string,build:string|null}|null>}
+ */
+function readAppVersionCached(appTarget, cache) {
+  if (!appTarget) return Promise.resolve(null);
+  const hit = cache.get(appTarget);
+  if (hit) return hit;
+  const p = readAppVersion(appTarget);
+  cache.set(appTarget, p);
+  return p;
+}
+
+/**
  * 应用是否**已经就是** cask 记录的那一版 —— 据此剔除 brew 的假阳性（「应用早自更新到位、
  * 只是 brew 记账没跟上」）。
  *
@@ -496,9 +517,22 @@ function sameAsCask(appShort, appBuild, caskVer) {
   //   这里要求「短版本是逗号前那截的前缀」+「build 与逗号后那截完全相等」双条件，
   //   对 wechat 成立、对被判定为真落后的旧版本（build 270100 ≠ 270102）不成立 → 不漏报。
   if (buildSeg && build && build === buildSeg && samePrefix(short, ver)) return true;
-  // 约定 C：应用没有可用的 build 号（或与短版本相同）→ 只能按短版本前缀判定。
+  // 约定 C：应用没有可用的 build 号（或与短版本相同）→ 只能按短版本判定。
+  // ★ 2026-10-08 修（复审发现的漏报）：此前这里是 `samePrefix(short, ver)` —— 前缀判定，
+  //   于是「应用 1.2 / cask 1.2.5」也被当成「已经就是这一版」→ 真升级被吞掉，用户永远停在旧版。
+  //   改成两步判，兼顾**不误吞**与**不误报**：
+  //     ① **前三段相同**即同一版：cask 常把发布号拼在补丁号之后（codebuddy-cn 是
+  //        `4.12.1.39217423,757a5b2f`，而应用只有 4.12.1）→ 差异只是 build 元数据。
+  //        这条同时覆盖「应用段数更多」（应用其实更新）→ 隐藏即避免降级，方向是安全的。
+  //     ② 前三段判不出来（应用如 `1.2` 只有两段、没有补丁号）时，退回 {@link sameVersion}
+  //        的**完整相等**判定（容忍尾部补零）→ `1.2` vs `1.2.5` 不相等 → 照常列出升级 ✅
   // 有独立 build 但逗号后为空的情况下刻意**不**判定相等（宁可多提，不可漏报）。
-  if ((!build || build === short) && samePrefix(short, ver)) return true;
+  if (!build || build === short) {
+    const a = parseStrict(short);
+    const b = parseStrict(ver);
+    if (a && b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2]) return true;
+    if (sameVersion(short, ver)) return true;
+  }
   return false;
 }
 
@@ -563,41 +597,150 @@ async function probeUpstreamTag(repo) {
 }
 
 /**
+ * 读 .app 自带的更新源地址（Sparkle 的 `SUFeedURL`）。读不到 = 该应用不用 Sparkle 自更新。
+ *
+ * ★ 为什么必须支持它（2026-10-08，用户报的 input-source-pro）：很多 cask 的 `url` / `homepage`
+ *   都**不是 GitHub**（input-source-pro 走 `inputsource.pro`），而 {@link githubRepoFromCaskUrl}
+ *   只认 cask url 里的 github.com —— 于是「cask 自己没跟上上游」这条提示对**整类应用**失效。
+ *   而这类应用基本都带 SUFeedURL（homebrew-cask 写 livecheck 用的就是同一个源，可互证）。
+ * @param {string|null} appTarget 形如 /Applications/Input Source Pro.app
+ * @returns {Promise<string|null>} 形如 https://inputsource.pro/stable/appcast.xml
+ */
+async function readAppFeedUrl(appTarget) {
+  if (!appTarget) return null;
+  const plist = path.join(appTarget, 'Contents', 'Info.plist');
+  try {
+    const r = await exec.run('plutil', ['-extract', 'SUFeedURL', 'raw', '-o', '-', plist],
+      { noMirror: true, timeoutMs: 10_000 });
+    const v = String(r.stdout || '').trim();
+    return r.code === 0 && /^https?:\/\//i.test(v) ? v : null;
+  } catch { return null; }
+}
+
+/**
+ * 从 Sparkle appcast（XML）里取**最新稳定版**短版本号。
+ *
+ * 解析口径：
+ *   · 只看 `<item>` 块内的 `sparkle:shortVersionString`（属性写法与子元素写法都认）；
+ *   · 跳过带 `sparkle:channel` 的 item —— 那是 beta / alpha 等具名通道，Sparkle 默认通道
+ *     不会装它们，拿 beta 当「有新版本」会造成误报。
+ * 纯函数（只看文本、无副作用），便于桩件验证。
+ * @param {string} xml
+ * @returns {string|null}
+ */
+function appcastLatestVersion(xml) {
+  let best = null;
+  for (const raw of String(xml == null ? '' : xml).split(/<item[\s>]/i).slice(1)) {
+    const item = raw.split(/<\/item>/i)[0];
+    if (/<sparkle:channel[\s>]/i.test(item)) continue;
+    const m = /sparkle:shortVersionString\s*=\s*"([^"]+)"/i.exec(item)
+      || /<sparkle:shortVersionString[^>]*>([^<]+)</i.exec(item);
+    const v = m ? m[1].trim() : '';
+    if (!v) continue;
+    if (!best || compare(v, best) > 0) best = v;
+  }
+  return best;
+}
+
+/**
+ * 探应用更新源（appcast）里的最新稳定版。
+ * 缓存与 {@link probeUpstreamTag} 共用（成功 6h / 失败 10min），key 加 `appcast:` 前缀避免撞车。
+ *
+ * ★ 通道不能只看 feed 的主机（2026-10-08 实测）：`inputsource.pro/stable/appcast.xml` 直连返回的
+ *   307 指向 **GitHub release 资产**，而那条腿在国内直连不通 —— 按主机判会走「直连优先」，
+ *   于是先白等满 `--max-time` 才换通道（实测让整次「重查可更新项」从 3s 涨到 23s）。
+ *   所以先用一次很轻的 HEAD 解析跳转目标，按**最终主机**选通道；HEAD 失败或无 location 时
+ *   退回按原主机判。
+ * @param {string|null} feedUrl
+ * @returns {Promise<string|null>} 形如 '2.13.1'
+ */
+async function probeAppcastLatest(feedUrl) {
+  if (!feedUrl) return null;
+  const key = `appcast:${feedUrl}`;
+  const hit = upstreamCache.get(key);
+  if (hit) {
+    const ttl = hit.tag ? UPSTREAM_TTL_MS : UPSTREAM_FAIL_TTL_MS;
+    if (Date.now() - hit.at < ttl) return hit.tag;
+  }
+  let tag = null;
+  try {
+    // ① 先看跳到哪（HEAD 很轻；不 -L，只读 location 头）
+    let policy = brewPolicy(feedUrl);
+    try {
+      const head = await exec.run('curl', ['-s', '-I', '--max-time', '8', feedUrl],
+        { noMirror: true, timeoutMs: 12_000, channel: bareChannel(policy) });
+      const loc = /^location:\s*(\S+)/im.exec(head.stdout || '');
+      if (loc) policy = brewPolicy(loc[1].trim());
+    } catch { /* HEAD 失败 → 就用按原主机判的策略 */ }
+    // ② 按最终目标选通道取正文（仍留「走不通自动换另一条」的兜底）
+    const res = await exec.runWithChannel(policy, '探测应用更新源', 'curl',
+      ['-fsSL', '--compressed', '--max-time', '20', feedUrl],
+      { noMirror: true, timeoutMs: 45_000 });
+    if (res.code === 0) tag = appcastLatestVersion(res.stdout);
+  } catch { /* 探测失败不影响主列表 */ }
+  upstreamCache.set(key, { at: Date.now(), tag });
+  return tag;
+}
+
+/**
  * cask 的「可更新」判定（返回可交给 brew 升级的项 + 上游已有新版本的提示项）。
+ *
+ * 上游版本有**两个来源**，按此优先级取：
+ *   1. {@link probeUpstreamTag} —— cask 的 url 是 github.com 时用 releases/latest 的 302；
+ *   2. {@link probeAppcastLatest} —— 否则看应用自带的 Sparkle 更新源（SUFeedURL）。
+ * 第 2 条是 2026-10-08 补的：很多 cask 的 url / homepage 都不是 GitHub（input-source-pro 即如此），
+ * 只认第 1 条会让「cask 没跟上上游」这条提示对整类应用失效。
+ *
  * @returns {Promise<{items:object[], upstream:object[]}>}
  */
 async function queryCaskOutdated() {
   const flagged = await rawOutdated('casks', ['outdated', '--json=v2', '--cask', '--greedy']);
   const installed = lineList((await safeRun('brew', ['list', '--cask'])).stdout);
   const meta = await caskMetaMap(installed);
+  const verCache = new Map();   // ①与②共用：同一 cask 只读一次应用版本（见 readAppVersionCached）
 
   // ① brew 报「可更新」的：auto_updates 用应用真实版本纠偏
   const items = [];
   for (const it of flagged) {
     const m = meta.get(it.name);
     if (!m || !m.autoUpdates) { items.push({ ...it }); continue; }   // 非自带更新：brew 口径即真值
-    const app = await readAppVersion(m.appTarget);
-    if (!app) { items.push({ ...it, autoUpdates: true }); continue; }  // 读不到版本 → 保守按 brew 口径列出
+    const app = await readAppVersionCached(m.appTarget, verCache);
+    if (!app) {
+      // 读不到真实版本 —— 用「有没有 .app 产物」区分两种截然不同的情形：
+      //   · 没有 .app（装的是二进制 / 字体等）：不存在「brew 把应用降级」的风险 → 按 brew 口径列出；
+      //   · 有 .app 却读不到版本（plutil 被拒 / 路径缺失）：升级方向无法判断，**仍然列出**（不静默漏报，
+      //     这是用户明确要的），但打上 `unverified` —— 界面照实提示「版本未知，升级前确认」，
+      //     不再像以前那样假装核对过（2026-09-22 反向降级事故正是这种「以为核对过」的后果）。
+      items.push({ ...it, autoUpdates: true, unverified: !!m.appTarget });
+      continue;
+    }
     if (sameAsCask(app.short, app.build, m.version)) continue;  // 假阳性：应用已是 cask 版本（记账滞后）
     if (compare(app.short, m.version) > 0) continue;            // 应用反而更新 → brew 装下去是降级，不列
     items.push({ ...it, autoUpdates: true });                   // 真落后 → 参与 brew 升级
   }
 
   // ② 上游探测：抓「cask 自己没跟上」的假阴性（brew 完全不报的那种）
-  const cands = [...meta.values()].filter((m) => m.autoUpdates && m.repo);
+  //    候选口径是「auto_updates 且有 .app」—— 不再要求 cask url 是 GitHub（见函数头注释）。
+  const cands = [...meta.values()].filter((m) => m.autoUpdates && m.appTarget);
   const upstream = [];
   await Promise.all(cands.map(async (m) => {
-    const tag = await probeUpstreamTag(m.repo);
-    if (!tag || compare(tag, m.version) <= 0) return;   // 上游没超过 cask → 无话可说
-    const app = await readAppVersion(m.appTarget);
+    let latest = m.repo ? await probeUpstreamTag(m.repo) : null;
+    let source = latest ? 'github' : null;
+    if (!latest) {
+      const tag = await probeAppcastLatest(await readAppFeedUrl(m.appTarget));
+      if (tag) { latest = tag; source = 'appcast'; }
+    }
+    if (!latest || compare(latest, m.version) <= 0) return;   // 上游没超过 cask → 无话可说
+    const app = await readAppVersionCached(m.appTarget, verCache);
     // ★ 这里用**短版本**比较：上游 tag 的拼法与 cask 的 build 后缀未必对齐，带上 build 容易误判成
     //   「本机更新」而把提示吞掉（宁可多提示，不可漏报）。
-    if (app && compare(tag, app.short) <= 0) return;    // 本机已经不比上游旧 → 不提示
+    if (app && compare(latest, app.short) <= 0) return;    // 本机已经不比上游旧 → 不提示
     upstream.push({
       name: m.token,
       current: (app && app.short) || m.installed || null,
       cask: m.version || null,
-      latest: tag,
+      latest,
+      source,
     });
   }));
   upstream.sort((a, b) => a.name.localeCompare(b.name));

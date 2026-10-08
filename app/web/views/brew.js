@@ -288,7 +288,11 @@ export default {
             // 自带更新（auto_updates）的应用照常参与 brew 升级（2026-09-22 用户要求），
             // 只是打个标让用户知道它平时是自己升级的。
             it.autoUpdates ? ui.badge('自带更新', 'muted') : null, it.autoUpdates ? ' ' : null,
+            // 读不到应用真实版本（plutil 被拒 / 路径缺失）→ 升级方向**未经验证**：照实标注，
+            // 别让用户以为已经核对过（2026-09-22 的反向降级事故正是这种「以为核对过」）。
+            it.unverified ? ui.badge('版本未知', 'warn') : null, it.unverified ? ' ' : null,
             el('span', { class: 'muted', text: `当前 ${it.current || '—'} → 可用 ${it.latest || '—'}` }),
+            it.unverified ? el('span', { class: 'muted', text: '（读不到应用真实版本，升级前请确认，以免回退）' }) : null,
           ]),
           el('span', {}, [mutualBtn(key, cur, 'proxy', '代理'), ' ', mutualBtn(key, cur, 'direct', '直连')]),
         ]);
@@ -309,6 +313,8 @@ export default {
           el('span', {}, [
             el('span', { class: 'mono', text: it.name }), ' ', ui.badge('上游有新版本', 'muted'), ' ',
             el('span', { class: 'muted', text: `本机 ${it.current || '—'} → 上游 ${it.latest || '—'}（homebrew-cask 仍是 ${it.cask || '—'}）` }),
+            // 说清这个「上游版本」是哪来的：GitHub Release 还是应用自带的 Sparkle 更新源
+            el('span', { class: 'muted', text: it.source === 'appcast' ? ' · 来源：应用自己的更新源' : ' · 来源：GitHub Release' }),
           ]),
           el('span', { class: 'muted', text: '请在应用内更新' }),
         ]));
