@@ -363,7 +363,9 @@ async function handleApi(req, res, url) {
   const method = req.method || 'GET';
 
   if (method === 'GET' && pathname === '/api/health') {
-    const code = checkBackendCode();
+    // force=1 绕过下面那个 3s 检测缓存：前端在任务刚跑完时会立刻体检一次（那时最需要真实结果），
+    // 命中旧缓存会让「代码已换新」横幅晚上几秒才出现。
+    const code = checkBackendCode(url.searchParams.get('force') === '1');
     ok(res, {
       ok: true, port: currentPort, pid: process.pid, version: VERSION,
       startedAt: BOOT_AT,
@@ -733,11 +735,12 @@ function captureCodeBaseline() {
 }
 /**
  * 与基线比对。结果缓存 3s（/api/health 被多个标签页按 15s 轮询，没必要每次都 stat 一遍）。
- * @returns {{changed:boolean, files:string[]}}
+ * @param {boolean} [force] 跳过缓存（任务刚结束时前端会带 force=1，见 /api/health 处的说明）
+ * @returns {{changed:boolean, files:string[], webChangedAt:number}}
  */
 let codeCheckCache = { at: 0, value: { changed: false, files: [], webChangedAt: 0 } };
-function checkBackendCode() {
-  if (Date.now() - codeCheckCache.at < 3000) return codeCheckCache.value;
+function checkBackendCode(force = false) {
+  if (!force && Date.now() - codeCheckCache.at < 3000) return codeCheckCache.value;
   const changed = [];
   const now = new Map(scanBackendCode(paths.APP_DIR).map(([f, m, sz]) => [f, `${m}:${sz}`]));
   if (codeBaseline) {

@@ -455,6 +455,9 @@ function attach(taskId, opts = {}) {
         state.task = msg.task; state.running = false; state.currentTaskId = null;
         emit('task', msg.task); emit('done', msg.task); setLogTaskLabel(taskLabel(msg.task));
         refreshHistory();
+        // 任务一结束立刻体检（force）：后端代码若已换新，「重启」横幅要马上出现 ——
+        // SSE 正常路径此前漏了这手（只有断流兜底路径有），于是横幅要拖到下一个 15s 轮询。
+        pollHealth({ force: true });
         if (opts.onDone) { try { opts.onDone(msg.task); } catch (e) { console.error(e); } }
         finish(msg.task);
       }
@@ -493,9 +496,9 @@ function attach(taskId, opts = {}) {
         emit('task', t); setLogTaskLabel(taskLabel(t));
         if (isTerminal(t.status)) {
           state.currentTaskId = null; emit('done', t); refreshHistory();
-          // 「更新 MacKit」跑完 → 立刻体检一次：后端代码若已换新，横幅要马上出现，
-          // 不必等下一个 15s 轮询（用户刚点完更新，正是最需要看到「需要重启」的时刻）。
-          if (t.action === 'update') pollHealth();
+          // 同上：任务结束立刻体检（force），不必等下一个 15s 轮询。不限动作 ——
+          // 一次体检只是一遍轻量 stat，而「顺手改了代码再跑个任务」同样常见。
+          pollHealth({ force: true });
           if (opts.onDone) { try { opts.onDone(t); } catch (e) { console.error(e); } }
           finish(t);
           return;
@@ -618,11 +621,27 @@ function setService(level, text) {
 }
 /** 最近一次 /api/health 结果（needsRestart 等由它驱动横幅）。 */
 let lastHealth = null;
+/** 上一次体检时服务是否可达（用于识别「服务刚被重启过」→ 页面该重载了）。 */
+let serviceReachable = true;
 
-async function pollHealth() {
+/**
+ * 体检一次：刷新顶栏服务状态 + 「代码已换新」横幅。
+ * @param {{force?: boolean}} [opts] force=1 绕过后端的 3s 检测缓存 —— **任务刚结束时必须带**，
+ *   否则可能读到更新前的旧结果，横幅要拖到下一个 15s 轮询才出现（刚点完更新正是最该看见它的时刻）。
+ */
+async function pollHealth(opts = {}) {
+  const force = opts && opts.force === true;
   try {
-    const d = await api('GET', '/api/health');
+    const d = await api('GET', force ? '/api/health?force=1' : '/api/health');
+    // 上轮不可达、这轮可达 = 服务刚被重启过。**自动重启**（代码换新后空闲时自动发生）不会显示
+    // 「重启中」遮罩，所以这里补一手：前端资源比本页面新就重载，否则页面会一直跑旧 JS。
+    const recovered = !serviceReachable;
+    serviceReachable = true;
     lastHealth = d;
+    if (recovered) {
+      const webAt = Number(d.webChangedAt) || 0;
+      if (webAt > PAGE_LOADED_AT + FRONTEND_STALE_SKEW_MS) { location.reload(); return; }
+    }
     syncHealthBanners();
     // Homebrew 元数据自动同步（启动后服务端会跑一次 `brew update`，实测 1.7~3.2s）：
     //   ① 状态广播给视图（显示「元数据同步于 X」/「正在同步」/「上次同步失败」）；
@@ -647,6 +666,7 @@ async function pollHealth() {
     if (d.port && d.port !== DEFAULT_PORT) setService('warn', `服务运行中 · 127.0.0.1:${d.port}（${DEFAULT_PORT} 被占用，已顺延）`);
     else setService('ok', `服务运行中 · 127.0.0.1:${d.port || DEFAULT_PORT}`);
   } catch (err) {
+    serviceReachable = false;
     setService('err', '服务不可用');
   }
 }
@@ -700,10 +720,14 @@ function syncHealthBanners() {
   // 后端过期 → 只给「立即重启」：它会先拉起新服务再退出旧进程，页面随后自动刷新，
   // 前端的新界面也在同一步里生效，不需要用户再点一次「刷新页面」。
   if (backStale) {
+    // ★ 文案跟着「自动重启」走（2026-10-09）：后端检测到代码换新、且空闲时会自己重启，
+    //   所以这个按钮是「提前一点」，不是唯一出路；有任务在跑时如实说明它在等。
     setHealthBanner({
-      text: frontStale
-        ? 'MacKit 已更新，当前服务仍在运行旧版本 —— 重启后前后端一起生效。'
-        : '后端代码已更新，当前服务仍在运行旧版本 —— 需要重启 MacKit 才会生效。',
+      text: state.running
+        ? '后端代码已更新 —— 当前有任务在运行，任务结束后服务会自动重启。'
+        : (frontStale
+          ? 'MacKit 已更新 —— 服务会自动重启，前后端一起生效（也可点右侧立即重启）。'
+          : '后端代码已更新 —— 服务会在空闲时自动重启（也可点右侧立即重启）。'),
       sub: `变更：${list}${frontStale ? ' · 重启后页面会自动刷新，无需再手动刷新' : ''}`,
       action: '立即重启',
       onClick: restartService,
