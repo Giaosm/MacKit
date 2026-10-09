@@ -130,15 +130,9 @@ const ABSOLUTE_ALLOWED = Object.freeze([
   paths.SQUIRREL_BIN,
   `${paths.PLUM_DIR}/rime-install`,
   paths.BASH_BIN,
-  // 音乐模块 venv 内的解释器（创建 venv / 执行 bridge.py 都用它）；同一 venv 的 pip
-  // 走 resolveBin 的 PY_DIR 前缀放行，无需在此重复登记。
-  paths.MUSIC_VENV_PY,
-  // 音乐模块「在 Finder 打开下载目录」：只调用 `open <目录>`（参数数组，不拼 shell）。
+  // 在 Finder 打开目录：只调用 `open <目录>`（参数数组，不拼 shell）。
   paths.OPEN_BIN,
 ]);
-
-/** 允许的裸 python 解释器文件名（音乐模块用；只认 python3 / python3.12，不含 python）。 */
-const PY_BASENAME_RE = /^python3(\.12)?$/;
 
 // ---------------------------------------------------------------------------
 // 存活子进程登记（进程退出前的强制回收）
@@ -206,68 +200,15 @@ export function hasLiveChildren() {
 // ---------------------------------------------------------------------------
 
 /**
- * p 是否位于 dir 内（含 dir 自身）；参数非法一律 false。
- * @param {string} p
- * @param {string} dir
- * @returns {boolean}
- */
-function withinDir(p, dir) {
-  if (typeof p !== 'string' || !p || typeof dir !== 'string' || !dir) return false;
-  const d = dir.endsWith(path.sep) ? dir.slice(0, -1) : dir;
-  return p === d || p.startsWith(d + path.sep);
-}
-
-/** realpath（解析符号链接）；路径不存在时回落原值，绝不抛。 */
-function realPathOr(p) {
-  try { return fs.realpathSync(p); } catch { return p; }
-}
-
-/**
- * 解释器目录白名单：`~/.mackit/py` + `PY312_CANDIDATES` 各自目录 + 宿主 PATH 目录。
- * 这些目录来自固定表与宿主 PATH 扫描，**不由用户输入决定**，是「解释器只可能来自哪里」的边界。
- *
- * ★ 按当前 `process.env.PATH` 记忆化：PATH 未变时复用，变了就重算。
- *   （不能只缓存一次——宿主 PATH 在进程运行期可能被改写；paths.findPython312 每次都读实时
- *    PATH，这里必须与它保持一致，否则会与「探测到的候选」失配。）
- * @type {string[]|null}
- */
-let interpreterDirs = null;
-let interpreterDirsPath = null;
-function trustedInterpreterPath(p) {
-  if (!p) return false;
-  const pathEnv = String(process.env.PATH || '');
-  if (interpreterDirs === null || interpreterDirsPath !== pathEnv) {
-    const set = new Set([paths.PY_DIR]);
-    for (const c of paths.PY312_CANDIDATES) set.add(path.dirname(c));
-    for (const d of pathEnv.split(path.delimiter)) {
-      if (d) set.add(path.resolve(d));
-    }
-    interpreterDirs = [...set];
-    interpreterDirsPath = pathEnv;
-  }
-  return interpreterDirs.some((d) => withinDir(p, d));
-}
-
-/**
  * 判断并解析可执行文件路径；不在白名单则抛 CMD_NOT_ALLOWED。
  *
- * 绝对路径放行分三层（设计 §5.1；2026-09-19 按 QA 反馈收紧）：
- *   1) ABSOLUTE_ALLOWED 精确匹配（含音乐 venv 的解释器 / Squirrel / rime-install / bash）；
- *   2) `~/.mackit/py/**` 前缀放行（覆盖 venv 内 `bin/python`、`bin/pip`）——
- *      ★ 先 `path.resolve` 归一化（消解 `..` / `.` / 相对段）**再**比较，避免
- *        `~/.mackit/py/../../evil.sh` 这类「字符串前缀命中、实际落在目录外」的绕过；
- *      ★ 判定用 `withinDir(resolved) || withinDir(real)` 的**「或」语义，这是有意为之**：
- *        必须放行「PY_DIR 内的软链指向外部」，因为真实 venv 的 `bin/python` 就是这种形态
- *        （指向 /opt/homebrew/bin/python3.12 这类基础解释器）；收紧成「与」会把正常 venv 一并拒掉。
- *        ⟹ 本层**不防御「PY_DIR 内被植入软链」这一威胁**：该威胁的前提是攻击者已取得用户级
- *        写权限，早已越过本应用的安全边界。真正兜底的是「`bin` 参数永不由 HTTP 入参 /
- *        配置 / 任务 params 决定」—— 全项目所有 `run()` / `spawnStream()` 的 bin 都是本文件
- *        BIN_MAP 的键或 paths.js 里的常量，没有任何一条来自外部输入。
- *        realpath 仅在路径存在时参与判断，不存在时回落到归一化结果、不抛。
- *   3) 解释器文件名 `python3` / `python3.12` —— **仅当**其归一化（或 realpath）路径落在
- *      「受信任解释器目录」内（`~/.mackit/py`、`PY312_CANDIDATES` 各自目录、宿主 PATH 目录）。
- *      即解释器只可能来自 PY312 固定候选或宿主 PATH，**不再是「任意目录下名叫 python3 即放行」**。
- *      第 3 层依旧不引入「任意命令」口子：受信任目录来自固定表 + 宿主 PATH，不由用户输入决定。
+ * 绝对路径放行 = **仅** ABSOLUTE_ALLOWED 精确匹配（Squirrel / rime-install / bash / open）。
+ *
+ * ★ 2026-10-09 随「音乐下载」模块整体移除，收紧了原先两个只为它服务的放宽层：
+ *   ① `~/.mackit/py/**` 前缀放行（覆盖 venv 内的 `bin/python`、`bin/pip`）；
+ *   ② 解释器文件名放行（`python3` / `python3.12` 只要落在受信任目录内即可）。
+ *   现在全项目的可执行只可能是 BIN_MAP 的键或 ABSOLUTE_ALLOWED 里的绝对路径，
+ *   没有任何一条来自 HTTP 入参 / 配置 / 任务 params —— 攻击面比之前更小。
  *
  * @param {string} name 逻辑名（brew/git/...）或允许的绝对路径
  * @returns {string} 实际可执行文件路径
@@ -279,20 +220,6 @@ function resolveBin(name) {
   // 绝对路径：仅允许白名单内的绝对可执行
   if (name.includes('/')) {
     if (ABSOLUTE_ALLOWED.includes(name)) return name;
-
-    // 归一化 + realpath（存在时）：后续所有前缀/目录判断都基于归一化结果，杜绝 `..` 绕过
-    const resolved = path.resolve(name);
-    const real = realPathOr(resolved);
-
-    // 层 2：~/.mackit/py/** 前缀放行（venv 内的 python / pip）
-    if (withinDir(resolved, paths.PY_DIR) || withinDir(real, paths.PY_DIR)) return name;
-
-    // 层 3：解释器文件名，但必须落在受信任解释器目录内
-    const base = path.basename(name);
-    if (PY_BASENAME_RE.test(base)
-      && (trustedInterpreterPath(resolved) || trustedInterpreterPath(real))) {
-      return name;
-    }
     throw new AppError(ERR.CMD_NOT_ALLOWED, `不允许的命令路径：${name}`);
   }
   const fixed = BIN_MAP[name];
@@ -330,7 +257,7 @@ function safeConfig() {
  *       no_proxy/NO_PROXY），再写入小写三键 —— 让配置的通道成为唯一权威，
  *       且 NO_PROXY 不能悄悄把某些主机排除在代理之外。
  *   注意：`opts.env` 的显式覆盖发生在本函数之后（buildEnv 里 applyProxyEnv → env 合并），
- *   所以 music/stream.js 里**有意**给 curl 注入大写 HTTP_PROXY/HTTPS_PROXY 的路径不受影响。
+ *   所以调用方**有意**注入大写 HTTP_PROXY/HTTPS_PROXY 时，其注入不受本函数影响。
  * @param {Record<string,string|undefined>} env
  * @param {'direct'|'proxy'} channel
  * @param {{httpPort:number,socksPort:number}} cfg

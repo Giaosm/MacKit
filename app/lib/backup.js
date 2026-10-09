@@ -83,7 +83,7 @@ async function collectData() {
   return {
     // 每模块网络通道档位一并备份（2026-09-22）：换电脑/重装后不用重新一个个设。
     mackit: {
-      brewChannel: mackit.brewChannel, musicChannel: mackit.musicChannel,
+      brewChannel: mackit.brewChannel,
       rimeChannel: mackit.rimeChannel, selfupdateChannel: mackit.selfupdateChannel,
       autoFallback: mackit.autoFallback, autoCleanup: mackit.autoCleanup,
     },

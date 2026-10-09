@@ -224,9 +224,14 @@ export default {
       ];
       const keyOf = (it) => `${it.kind}:${it.name}`;
 
-      async function load() {
+      /**
+       * 拉取「可更新」列表。
+       * @param {boolean} [force] 绕过后端 60s 短缓存 —— **用户主动重查**与**任何 brew 任务结束后**
+       *   都必须带上，否则会出现「刚升级完还显示可更新」（缓存最长 60s）。
+       */
+      async function load(force) {
         host.innerHTML = ''; host.append(el('div', { class: 'view-loading', text: '正在检查可更新项…' }));
-        try { data = await api('GET', '/api/brew/outdated'); } catch (err) { host.innerHTML = ''; host.append(el('div', { class: 'err-box', text: `检查失败：${err.message || err}` })); return; }
+        try { data = await api('GET', force ? '/api/brew/outdated?force=1' : '/api/brew/outdated'); } catch (err) { host.innerHTML = ''; host.append(el('div', { class: 'err-box', text: `检查失败：${err.message || err}` })); return; }
         // 形状兜底：后端契约是 { formulae, casks, counts, checkedAt }，缺字段时按空处理，
         // 避免后端演进 / 代理层返回异形 JSON 时把整个面板炸成白屏（2026-09-19）。
         data = {
@@ -254,7 +259,7 @@ export default {
           catch (err) { ui.toast('warn', `元数据同步失败（仍按现有数据重算）：${err.message || err}`); }
           finally { btn.disabled = false; btn.textContent = idle; }
         }
-        load();
+        load(true);   // 用户主动重查：绕过短缓存
         // 同步过就顺带刷一次体检，避免顶部「可更新 N 项」与下面的列表数字打架
         if (refreshed) loadEnv(false);
       }
@@ -374,7 +379,7 @@ export default {
       }
 
       box.append(host);
-      onPanel('done', (t) => { if (t.module === 'brew') { load(); loadEnv(false); } });
+      onPanel('done', (t) => { if (t.module === 'brew') { load(true); loadEnv(false); } });
       load();
     }
 
@@ -437,7 +442,7 @@ export default {
         ct = ui.dataTable({ columns: [{ key: 'name', label: '名称' }], rows: names.map((n) => ({ name: n })), selectable: true, searchable: true, rowKey: (r) => r.name, emptyText: '无' });
         host.append(ui.card(label, el('div', {}, [ct.el, el('div', { class: 'row section' }, [el('button', { class: 'btn btn--danger', type: 'button', text: '卸载选中', on: { click: uninstallPackages } })])])));
       }
-      onPanel('done', (t) => { if (t.module === 'brew') { load(); loadEnv(false); } });
+      onPanel('done', (t) => { if (t.module === 'brew') { load(true); loadEnv(false); } });
       box.append(tabs, host); drawTabs(); load();
     }
 

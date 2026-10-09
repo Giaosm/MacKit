@@ -17,8 +17,8 @@
  * ★ 任何档位都保留「走不通自动换另一条通道」的兜底（见 exec.runWithChannel 与
  *   brew.downloadIndex 的两段尝试）；只有用户主动取消才立即停，不换通道。
  *
- * ★ 多目标的模块（音乐：musicdl 一个子进程会打多个音源）无法按主机逐次判，其 auto 落在
- *   直连优先 —— 它的目标基本都是国内音源，这也是它一直以来的行为。
+ * ★ 无法按主机逐次判的调用方（例如一个子进程内部要打多个不同目标）可以显式传
+ *   proxy_first / direct_first —— 模块档位始终优先于自动判定。
  */
 
 import * as store from './store.js';
@@ -75,7 +75,7 @@ function channelFromConfig(modCfg, moduleId) {
 /**
  * 最终通道策略：模块档位优先，档位为 auto 时用调用方给出的「按目标自动」策略。
  * @param {object|undefined} modCfg 已读到的配置（避免为一个档位再读一次磁盘）
- * @param {string} moduleId brew|music|rime|selfupdate
+ * @param {string} moduleId brew|rime|selfupdate
  * @param {'auto'|'proxy_first'|'direct_first'} autoPolicy 该模块在 auto 档下应采用的策略
  * @returns {'proxy_first'|'direct_first'}
  */

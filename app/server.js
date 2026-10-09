@@ -27,14 +27,8 @@ import * as env from './lib/env.js';
 import { AppError, ERR, toErrObj, hasLiveChildren, spawnDetached } from './lib/exec.js';
 import { DAV_ERR, urlHasCredentials, validateDavUrl } from './lib/webdav.js';
 import { parseReqUrl } from './lib/requrl.js';
-import {
-  openUpstream,
-  buildStreamResponseHeaders,
-  buildCoverResponseHeaders,
-  contentTypeForExt,
-  parseRangeHeader,
-  AUDIO_MAX_DURATION_MS,
-} from './lib/music/stream.js';
+// 模块清单（web/ 下，前后端共用）：决定加载哪些模块、侧边栏有哪些入口。
+import { BACKEND_MODULES } from './web/modules.js';
 
 /** 版本号（读取 package.json，失败回落）。 */
 function readVersion() {
@@ -48,7 +42,12 @@ const VERSION = readVersion();
 function log(...args) { console.log('[MacKit]', ...args); } // 被启动器重定向到 ~/.mackit/server.out
 
 // ------------------------------ 功能模块注册表（动态接入） ------------------------------
-const MODULE_FILES = Object.freeze({ brew: 'brew.js', sysinit: 'sysinit.js', rime: 'rime.js', unseal: 'unseal.js', backup: 'backup.js', selfupdate: 'selfupdate.js', music: 'music.js' });
+/**
+ * 要加载哪些模块、各自对应哪个文件 —— **由模块清单派生**（web/modules.js 是唯一事实源）。
+ * 此前这里是手写的一份、前端 NAV 又一份、store 的 CHANNEL_KEYS 再一份：三处漏一处就出问题
+ * （要么模块不加载、要么界面有入口而服务端不认、要么配置键收不到值）。
+ */
+const MODULE_FILES = Object.freeze(Object.fromEntries(BACKEND_MODULES.map((m) => [m.id, m.backend])));
 const registry = new Map();
 
 async function loadModules() {
@@ -230,255 +229,6 @@ function handleSse(req, res, taskId, url) {
   req.on('close', cleanup);
 }
 
-// ------------------------------ 音乐：在线播放 / 封面 / 歌词 ------------------------------
-/**
- * 把上游响应流式透传给客户端：统一的 `writeHead` + 错误/关闭收尾 + `pipe`。
- *
- * 抽出 handleMusicStream / handleMusicCover 共享的骨架，保证 status / header / abort 语义一致：
- * 任何一路（上游 error / 客户端 close）触发即 `abort()` 上游、跑一次 `onCleanup`、`res.end()` 收尾。
- * @param {{abort:()=>void, stream:NodeJS.ReadableStream}} upstream openUpstream 的返回值
- * @param {import('node:http').ServerResponse} res
- * @param {{status:number, headers:Record<string,string>, onData?:(chunk:Buffer)=>void, onEnd?:()=>void, onCleanup?:()=>void}} opts
- */
-function pipeUpstream(upstream, res, opts) {
-  let closed = false;
-  const cleanup = () => {
-    if (closed) return;
-    closed = true;
-    try { upstream.abort(); } catch { /* ignore */ }
-    if (opts.onCleanup) { try { opts.onCleanup(); } catch { /* ignore */ } }
-    try { res.end(); } catch { /* ignore */ } // 上游中断（error）时收尾响应
-  };
-  res.writeHead(opts.status, opts.headers);
-  if (opts.onData) upstream.stream.on('data', opts.onData);
-  if (opts.onEnd) upstream.stream.on('end', opts.onEnd);
-  upstream.stream.on('error', cleanup);
-  res.on('close', cleanup);
-  upstream.stream.pipe(res);
-}
-
-/**
- * 音频缓存文件名的白名单（纵深防御）。
- *
- * key 由 `music.js:audioCacheKey()` 生成，形状 `snd-<32hex>.<ext>`。这里再校验一次的原因：
- * 这个值最终会被 `path.join` 拼成路径、被 `fs.rmSync` / `renameSync` 操作 —— 任何
- * 上游（bridge.py 的 ext）没洗干净的情况都不该升级成「任意路径删除 / 写入」。
- * @type {RegExp}
- */
-const AUDIO_CACHE_KEY_RE = /^snd-[0-9a-f]{32}\.[A-Za-z0-9]{1,8}$/;
-
-/** 解析缓存文件路径；key 非法 / 文件不存在 / 长度为 0 → null。 */
-function audioCachePathIfPresent(cacheKey) {
-  const key = String(cacheKey || '');
-  if (!AUDIO_CACHE_KEY_RE.test(key)) return null;
-  try {
-    const p = path.join(paths.MUSIC_AUDIO_CACHE_DIR, key);
-    const st = fs.statSync(p);
-    if (!st.isFile() || st.size <= 0) return null;
-    return { path: p, size: st.size };
-  } catch { return null; }
-}
-
-/**
- * 原子替换：直接 `rename` 覆盖（POSIX 语义即原子替换），失败才降级为复制。
- *
- * ★ 2026-09-25 修（并发安全）：此前是「先 `rm` 目标再 `rename`」，而 `.part` 名按缓存键固定 ——
- *   两个同曲并发整段请求会写同一个 `.part`，两次 finish 抢 rename：先成功者的成品会被后者
- *   的 `rmSync` 删掉，随后后者的 rename 又因源文件已被处理而失败，结果是**有效缓存反而没了**。
- *   现在：① `.part` 带 pid + 随机段（见 createAudioCacheWriter），互不覆盖；
- *   ② 这里不再预删目标 —— rename 本身就能原子覆盖，失败时也绝不破坏已有的好缓存。
- */
-function promoteFile(tmp, target) {
-  try {
-    fs.renameSync(tmp, target);
-    return true;
-  } catch (err) {
-    if (err && (err.code === 'EPERM' || err.code === 'EXDEV')) {
-      // 与 store.js writeJsonSafe / rime.js 同款降级：这台 macOS 上常驻进程 rename 会被拒。
-      // 复制失败时保持目标不动（宁可这次没缓存，也不要毁掉上一份好的）。
-      try { fs.copyFileSync(tmp, target); fs.rmSync(tmp, { force: true }); return true; }
-      catch { return false; }
-    }
-    return false;
-  }
-}
-
-/**
- * 边听边存：整段播放时把上游字节同时写进 `MUSIC_AUDIO_CACHE_DIR/<key>.<uniq>.part`。
- *
- * ★ 2026-09-21 重写，修掉三个真实缺陷（此前实测 15 个 `.part` = 401MB 却没有一个成品文件）：
- *   1) **没有背压**：`cacheStream.write()` 的返回值被忽略，磁盘慢时 Node 会在内存里
- *      无限堆积上游数据。现在 write 返回 false 时调用方暂停上游，drain 后恢复。
- *   2) **finish / cleanup 赛跑**：`res.on('close')` 触发的 onCleanup 可能早于
- *      `end()` 的回调执行，`.part` 刚改名就被删（或反之），成品永远落不下来。
- *      现在用 `ended` 标记：只要正文收完就不再删 `.part`。
- *   3) **残片被当成成品**：断流时也会走到 onEnd；现在拿上游声明的 Content-Length 自证，
- *      长度不符就不提升为缓存（避免播放器拿到截断文件）。
- *   4) rename EPERM 无降级 → 走 promoteFile 的复制兜底。
- * @param {string} cacheKey
- */
-function createAudioCacheWriter(cacheKey) {
-  let stream = null;
-  let partPath = null;
-  let finalPath = '';
-  let written = 0;
-  let ended = false;
-  let finalized = false;
-  const dropPart = () => { if (partPath) { try { fs.rmSync(partPath, { force: true }); } catch { /* ignore */ } } };
-  try {
-    fs.mkdirSync(paths.MUSIC_AUDIO_CACHE_DIR, { recursive: true });
-    finalPath = path.join(paths.MUSIC_AUDIO_CACHE_DIR, cacheKey);
-    // ★ `.part` 必须唯一：同曲并发（两个标签页 / 播放器预取 + 手动点播）会各自创建写入流，
-    //   固定名字会让后者 O_TRUNC 掉前者的数据，并在 finish 时抢 rename（见 promoteFile 的注释）。
-    //   pid 防跨进程、时间戳+随机段防同进程内的并发。
-    const uniq = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    partPath = `${finalPath}.${uniq}.part`;
-    stream = fs.createWriteStream(partPath);
-    stream.on('error', () => { try { stream.destroy(); } catch { /* ignore */ } stream = null; });
-  } catch { stream = null; }
-
-  return {
-    /** 是否真的在写（创建流失败 / 出错后为 false）。 */
-    get active() { return !!stream; },
-    /** 写一块数据；返回 false = 缓存侧需背压（调用方应暂停上游，并在 onDrain 后恢复）。 */
-    write(chunk, onDrain) {
-      if (!stream) return true;
-      written += chunk.length;
-      let ok = true;
-      try { ok = stream.write(chunk); } catch { ok = false; }
-      if (ok === false && typeof onDrain === 'function') stream.once('drain', onDrain);
-      return ok;
-    },
-    /** 正文收完 → 校验长度后把 `.part` 提升为正式缓存文件。 */
-    finish(contentLength, onDone) {
-      if (!stream) { if (onDone) onDone(false); return; }
-      ended = true;
-      const s = stream;
-      stream = null;
-      s.end(() => {
-        const declared = Number.parseInt(contentLength, 10);
-        if (Number.isFinite(declared) && declared > 0 && written !== declared) {
-          dropPart(); // 断流残片
-          if (onDone) onDone(false);
-          return;
-        }
-        const ok = promoteFile(partPath, finalPath);
-        finalized = ok;
-        if (!ok) dropPart();
-        if (onDone) onDone(ok);
-      });
-    },
-    /** 结束 / 失败清理：正文没收完才删 `.part`（见上方「赛跑」注释）。 */
-    cleanup() {
-      if (finalized || ended) return;
-      dropPart();
-    },
-  };
-}
-
-/**
- * 从完整缓存文件直接回放（不打网络）。
- * @param {import('node:http').ServerResponse} res
- * @param {{path:string, size:number}} hit
- * @param {string} ext
- */
-function serveAudioCache(res, hit, ext) {
-  // 触摸 mtime：pruneAudioCache 是按 mtime 做 LRU 的，命中即说明「最近在用」。
-  try { const now = new Date(); fs.utimesSync(hit.path, now, now); } catch { /* ignore */ }
-  res.writeHead(200, {
-    'Content-Type': contentTypeForExt(ext),
-    'Content-Length': String(hit.size),
-    'Accept-Ranges': 'bytes',
-    'Cache-Control': 'no-store',
-  });
-  const rs = fs.createReadStream(hit.path);
-  rs.on('error', () => { try { res.destroy(); } catch { /* ignore */ } });
-  res.on('close', () => { try { rs.destroy(); } catch { /* ignore */ } });
-  rs.pipe(res);
-}
-
-/**
- * 处理 `GET /api/music/stream/:id/:uid`。
- *
- * ★ 成功 = **裸二进制流**（不走 `{ok,data}` 包络）；失败 = JSON 包络。
- * ★ SSRF 口径：url 只来自「快照内 uid 解析结果」（`streamMeta` 查询），路由**绝不接受任何外部 url 入参**。
- * ★ 边听边存：仅整段播放（无 Range 或 Range 从 0 起）才 tee 到 `MUSIC_AUDIO_CACHE_DIR/<key>.<uniq>.part`，
- *   结束 rename；整段播放**优先命中已有缓存**（不再回源）。
- */
-async function handleMusicStream(req, res, id, uid) {
-  const meta = await queryModule('music', 'streamMeta', { id, uid });
-  const range = req.headers.range;
-  const parsedRange = parseRangeHeader(range);
-  const isFull = !range || !!(parsedRange && parsedRange.isFull);
-
-  // 边听边存的下半场（2026-09-21 修）：此前只写不读 —— 缓存白占磁盘，二次播放仍回源。
-  // 只在「整段播放」时命中：带 Range 的拖动需要重算 Content-Range，交给上游更稳。
-  if (isFull && meta.cacheKey) {
-    const hit = audioCachePathIfPresent(meta.cacheKey);
-    if (hit) { serveAudioCache(res, hit, meta.ext); return; }
-  }
-
-  const up = await openUpstream({
-    url: meta.url,
-    headers: meta.headers,
-    range,
-    channel: meta.channel,
-    proxies: meta.proxies,
-    // ★ 整段音频在**代理通道**下的整体时长上限（直连分支只用它作空闲超时）。
-    //   不传的话代理分支会按默认 30s 整体砍断 —— 一百多 MB 的 flac 永远传不完（见 stream.js 常量注释）。
-    overallTimeoutMs: AUDIO_MAX_DURATION_MS,
-  });
-  if (up.status >= 400) {
-    try { up.abort(); } catch { /* ignore */ }
-    throw new AppError(ERR.CMD_FAILED, `上游返回错误状态（${up.status}）`);
-  }
-  if (up.status !== 200 && up.status !== 206) {
-    // 仅承认 200（整段）与 206（Range）为成功；重定向 / 1xx 等一律按上游异常处理。
-    try { up.abort(); } catch { /* ignore */ }
-    throw new AppError(ERR.CMD_FAILED, `上游返回非预期状态（${up.status}）`);
-  }
-
-  const built = buildStreamResponseHeaders({ status: up.status, upstreamHeaders: up.headers, ext: meta.ext });
-
-  // 边听边存：仅整段播放才缓存（Range 分片不落缓存）。
-  const cache = isFull && meta.cacheKey ? createAudioCacheWriter(meta.cacheKey) : null;
-
-  pipeUpstream(up, res, {
-    status: built.status,
-    headers: built.headers,
-    onData: (chunk) => {
-      if (!cache) return;
-      // 缓存写不动了 → 暂停上游（playback 一起慢下来），drain 后恢复；不这样做
-      // 磁盘慢的时候上游字节会在 Node 堆里无限堆积。
-      const ok = cache.write(chunk, () => { try { up.stream.resume(); } catch { /* ignore */ } });
-      if (!ok) { try { up.stream.pause(); } catch { /* ignore */ } }
-    },
-    onEnd: () => {
-      if (cache) cache.finish(up.headers && up.headers['content-length'], () => { /* 缓存失败不影响播放 */ });
-    },
-    onCleanup: () => {
-      // 只在「正文没收完」时清 .part：收完后 finish 正在改名，抢着删会把成品删掉。
-      if (cache) cache.cleanup();
-    },
-  });
-}
-
-/**
- * 处理 `GET /api/music/cover/:id/:uid`：成功 = 图片字节（透传 Content-Type）+ 长缓存；无封面 / uid 不存在 = 404。
- * 同样遵守 SSRF 口径（封面 url 只来自快照解析结果）。
- */
-async function handleMusicCover(req, res, id, uid) {
-  const meta = await queryModule('music', 'streamMeta', { id, uid });
-  if (!meta.hasCover || !meta.coverUrl) throw new AppError(ERR.NOT_FOUND, '该曲目没有可用封面');
-  const up = await openUpstream({ url: meta.coverUrl, headers: {}, channel: meta.channel, proxies: meta.proxies });
-  if (up.status < 200 || up.status >= 300) {
-    try { up.abort(); } catch { /* ignore */ }
-    throw new AppError(ERR.CMD_FAILED, `封面拉取失败（${up.status}）`);
-  }
-  const headers = buildCoverResponseHeaders(up.headers);
-  pipeUpstream(up, res, { status: 200, headers });
-}
-
 // ------------------------------ 路由 ------------------------------
 
 /**
@@ -512,10 +262,9 @@ function requireTaskId(raw) {
 }
 
 /**
- * 解析并提交一个「模块动作」任务（POST /api/tasks 与音乐专用路由 /api/music/openFolder 共用）。
+ * 解析并提交一个「模块动作」任务（POST /api/tasks 的唯一实现）。
  *
- * 校验链：模块存在 → 动作存在且有 steps → destructive 需 confirm → 透传模块 lane（音乐 lane='music'）。
- * 抽成函数是为了让「音乐专用路由」复用同一套语义（尤其 destructive / confirm 判定不重复实现）。
+ * 校验链：模块存在 → 动作存在且有 steps → destructive 需 confirm → 透传模块声明的 lane。
  *
  * @param {{module?:string, action?:string, params?:object, confirm?:boolean}} body 请求体
  * @returns {{taskId:string, task:object}}
@@ -530,7 +279,7 @@ function submitModuleAction(body) {
   if (actionDef.destructive === true && body.confirm !== true) {
     throw new AppError(ERR.CONFIRM_REQUIRED, '该操作为危险操作，缺少二次确认（confirm:true）');
   }
-  // 透传模块声明的 lane：音乐模块 lane='music'，其余模块无 lane → runner 落 default lane。
+  // 透传模块声明的 lane（当前 6 个模块都不声明 → 一律落 default lane；保留该能力供将来并行模块使用）。
   const task = runner.submit({
     module: moduleId, action,
     params: body.params && typeof body.params === 'object' ? body.params : {},
@@ -539,6 +288,75 @@ function submitModuleAction(body) {
   });
   return { taskId: task.id, task };
 }
+
+/**
+ * 只读查询路由表：HTTP 路径 → 模块 query（一行一条）。
+ *
+ * 为什么用表：此前 15 条路由各写一段 `if (method === 'GET' && pathname === '…')`，每段都要
+ * `ok(res, await queryModule(…))` 加手抄参数 —— 加一条路由复制 4 行，还容易抄错参数名。
+ * 现在白名单一眼看完，改参数只改一处。
+ * ★ 仍然是**显式白名单**：表里没有的路径不会转发到任何模块，模块也拿不到任意 query 名
+ *   （模块内部的 queries 只按名字取，不接受外部传入的名字）。
+ *
+ * 字段：method（默认 GET）/ path / module / query /
+ *       params(url, body) → 参数对象（默认空表）/ body:true 表示要先解析 JSON 请求体 /
+ *       guard → 有可见副作用的接口用的"必须由界面发起"那道闸（避免跨站子请求反复触发）
+ */
+const QUERY_ROUTES = Object.freeze([
+  // Homebrew
+  { path: '/api/brew/meta', module: 'brew', query: 'metaStatus' },
+  {
+    path: '/api/brew/outdated', module: 'brew', query: 'outdated',
+    // force=1 绕过 60s 短缓存：用户点「重查可更新项」时、以及任何 brew 任务结束后前端都会带上
+    params: (url) => ({ force: url.searchParams.get('force') === '1' }),
+  },
+  { path: '/api/brew/installed', module: 'brew', query: 'installed' },
+  {
+    path: '/api/brew/info', module: 'brew', query: 'info',
+    params: (url) => ({ kind: url.searchParams.get('kind') || 'cask', name: url.searchParams.get('name') || '' }),
+  },
+  {
+    path: '/api/brew/package-search', module: 'brew', query: 'packageSearch',
+    params: (url) => ({ kind: url.searchParams.get('kind') || 'cask', q: url.searchParams.get('q') || '' }),
+  },
+  {
+    method: 'POST', path: '/api/brew/meta/refresh', module: 'brew', query: 'refreshMeta',
+    params: () => ({ force: true }), guard: '同步 Homebrew 元数据',
+  },
+  // Rime
+  { path: '/api/rime/skins', module: 'rime', query: 'skins' },
+  { path: '/api/rime/appearance', module: 'rime', query: 'appearance' },
+  { path: '/api/rime/upstream', module: 'rime', query: 'upstream' },
+  // 系统初始化
+  { path: '/api/sysinit/state', module: 'sysinit', query: 'state' },
+  {
+    method: 'POST', path: '/api/sysinit/alias/preview', module: 'sysinit', query: 'aliasPreview',
+    body: true, params: (url, body) => ({ mode: (body && body.mode) || 'keep' }),
+  },
+  // MacKit 自更新（force=1 绕过缓存）
+  {
+    path: '/api/selfupdate/status', module: 'selfupdate', query: 'status',
+    params: (url) => ({ force: url.searchParams.get('force') === '1' }),
+  },
+  // 解隔离
+  {
+    path: '/api/unseal/precheck', module: 'unseal', query: 'precheck',
+    // 每条路径一个 `path=` 参数：路径名本身可能含 `|`，旧的 `paths=a|b|c` 拼接会让 items 与输入错位
+    // （旧形式仍兼容，供命令行用法）。
+    params: (url) => {
+      const many = url.searchParams.getAll('path');
+      const legacy = url.searchParams.get('paths');
+      return { paths: many.length > 0 ? many : (legacy ? legacy.split('|').filter((s) => s.length > 0) : []) };
+    },
+  },
+  // 扫描 /Applications：有可见副作用的 GET（一轮几十个子进程、数秒），必须由界面发起 ——
+  // 跨站 `<img src>` 这类不带 Origin 的子资源请求不得触发它（否则任意网页可反复打满 syspolicyd）。
+  { path: '/api/unseal/scan', module: 'unseal', query: 'scan', guard: '扫描应用' },
+  // 备份中心
+  { path: '/api/webdav/backups', module: 'backup', query: 'webdavList' },
+]);
+/** `${method} ${path}` → 路由定义（启动时构建一次，分发时一次 Map 查找）。 */
+const QUERY_ROUTES_BY_KEY = new Map(QUERY_ROUTES.map((r) => [`${r.method || 'GET'} ${r.path}`, r]));
 
 async function handleApi(req, res, url) {
   const { pathname } = url;
@@ -601,28 +419,14 @@ async function handleApi(req, res, url) {
     return;
   }
 
-  // Homebrew 元数据同步状态 / 手动同步（同步是有可见副作用的操作，带同源闸）
-  if (method === 'GET' && pathname === '/api/brew/meta') { ok(res, await queryModule('brew', 'metaStatus', {})); return; }
-  if (method === 'POST' && pathname === '/api/brew/meta/refresh') {
-    requireUiTriggered(req, '同步 Homebrew 元数据');
-    ok(res, await queryModule('brew', 'refreshMeta', { force: true }));
-    return;
-  }
-
-  // Homebrew 只读查询
-  if (method === 'GET' && pathname === '/api/brew/outdated') { ok(res, await queryModule('brew', 'outdated', {})); return; }
-  if (method === 'GET' && pathname === '/api/brew/installed') { ok(res, await queryModule('brew', 'installed', {})); return; }
-  if (method === 'GET' && pathname === '/api/brew/info') {
-    ok(res, await queryModule('brew', 'info', { kind: url.searchParams.get('kind') || 'cask', name: url.searchParams.get('name') || '' }));
-    return;
-  }
-
-  // 软件包搜索：kind=cask|formula（缺省 cask），q 为关键词
-  if (method === 'GET' && pathname === '/api/brew/package-search') {
-    ok(res, await queryModule('brew', 'packageSearch', {
-      kind: url.searchParams.get('kind') || 'cask',
-      q: url.searchParams.get('q') || '',
-    }));
+  // ------------------------------ 只读查询：查表分发 ------------------------------
+  // 表在上面（QUERY_ROUTES）。命中即：可选同源闸 → 可选解析请求体 → 组参数 → 调模块 query。
+  const route = QUERY_ROUTES_BY_KEY.get(`${method} ${pathname}`);
+  if (route) {
+    if (route.guard) requireUiTriggered(req, route.guard);
+    const body = route.body ? await readBody(req) : undefined;
+    const params = route.params ? route.params(url, body) : {};
+    ok(res, await queryModule(route.module, route.query, params));
     return;
   }
 
@@ -646,165 +450,6 @@ async function handleApi(req, res, url) {
     });
     return;
   }
-  if (method === 'GET' && pathname === '/api/rime/skins') { ok(res, await queryModule('rime', 'skins', {})); return; }
-  if (method === 'GET' && pathname === '/api/rime/appearance') { ok(res, await queryModule('rime', 'appearance', {})); return; }
-  if (method === 'GET' && pathname === '/api/rime/upstream') { ok(res, await queryModule('rime', 'upstream', {})); return; }
-
-  // 系统初始化
-  if (method === 'GET' && pathname === '/api/sysinit/state') { ok(res, await queryModule('sysinit', 'state', {})); return; }
-  if (method === 'POST' && pathname === '/api/sysinit/alias/preview') {
-    const body = await readBody(req);
-    ok(res, await queryModule('sysinit', 'aliasPreview', { mode: body.mode || 'keep' }));
-    return;
-  }
-
-  // 音乐模块（只读查询 + 搜索/歌单会话；下载/安装走任务流 POST /api/tasks）
-  // deployStatus：四态（not_deployed/broken/deployed/outdated）；/api/music/env 作为旧路径别名保留。
-  if (method === 'GET' && (pathname === '/api/music/deployStatus' || pathname === '/api/music/env')) {
-    ok(res, await queryModule('music', 'deployStatus', { force: url.searchParams.get('force') === '1' }));
-    return;
-  }
-  if (method === 'GET' && pathname === '/api/music/sources') { ok(res, await queryModule('music', 'sources', {})); return; }
-  // musicdl 上游版本（PyPI，24h 缓存；force=1 绕过。纯提示功能：查询内部绝不抛网络错误）
-  if (method === 'GET' && pathname === '/api/music/musicdlUpstream') {
-    ok(res, await queryModule('music', 'musicdlUpstream', { force: url.searchParams.get('force') === '1' }));
-    return;
-  }
-  if (method === 'GET' && pathname === '/api/music/config') { ok(res, await queryModule('music', 'config', {})); return; }
-  if (method === 'PUT' && pathname === '/api/music/config') {
-    const body = await readBody(req);
-    store.writeMackit({
-      musicDownloadDir: body.downloadDir,
-      musicNameTemplate: body.nameTemplate,
-      musicChannel: body.channel,
-      musicSources: body.sources,
-      musicSaveLyrics: body.saveLyrics,
-      // 增强搜索（实验）：true = 搜索走第三方代理 API（更快、组合词更宽容，但依赖外部服务）
-      musicEnhancedSearch: body.enhancedSearch,
-      // R0 · 代理配置（v2）：透传三个新增字段；非法地址由 writeMackit 抛 PARSE_FAILED → 422 且不写盘
-      musicProxySource: body.proxySource,
-      musicProxyHttp: body.proxyHttp,
-      musicProxySocks5: body.proxySocks5,
-      // 在线播放缓存上限（MB）与下载并发度：非法值由 writeMackit 回落当前值（不抛错）
-      musicCacheMaxMb: body.cacheMaxMb,
-      musicDownloadConcurrency: body.downloadConcurrency,
-    });
-    // 缓存上限可能被调小 → 立即按新上限裁剪音频缓存（best-effort，失败不影响响应）。
-    try { await queryModule('music', 'pruneAudio', {}); } catch { /* 模块缺失 / 失败忽略 */ }
-    ok(res, await queryModule('music', 'config', {}));
-    return;
-  }
-  // 选择下载目录：osascript 弹系统目录框（只读，不写配置；失败前端回落手输）
-  // ★ 这是**有可见副作用的 GET**，额外要求请求来自 MacKit 界面本身（防跨站弹窗轰炸）。
-  if (method === 'GET' && pathname === '/api/music/chooseFolder') {
-    requireUiTriggered(req, '选择下载目录');
-    ok(res, await queryModule('music', 'chooseFolder', {}));
-    return;
-  }
-  // 在 Finder 打开下载目录（P0-6）：音乐专用路由，复用 submitModuleAction 的动作语义
-  // （open_folder 为普通动作、非 destructive，故无需 confirm）。目录不存在由步骤内自动创建。
-  if (method === 'POST' && pathname === '/api/music/openFolder') {
-    const body = await readBody(req);
-    ok(res, submitModuleAction({
-      module: 'music',
-      action: 'open_folder',
-      params: body && typeof body === 'object' ? body : {},
-    }));
-    return;
-  }
-  if (method === 'POST' && pathname === '/api/music/search') {
-    const body = await readBody(req);
-    ok(res, await queryModule('music', 'search', body));
-    return;
-  }
-  if (method === 'POST' && pathname === '/api/music/playlist') {
-    const body = await readBody(req);
-    ok(res, await queryModule('music', 'playlist', body));
-    return;
-  }
-  // 取消搜索 / 歌单：id 由 map 校验（非 task id 格式），必须先于下面的轮询路由匹配
-  const musicCancelMatch = /^\/api\/music\/search\/([^/]+)\/cancel$/.exec(pathname);
-  if (method === 'POST' && musicCancelMatch) {
-    ok(res, await queryModule('music', 'searchCancel', { id: safeDecode(musicCancelMatch[1], '未找到该会话') }));
-    return;
-  }
-  const playlistCancelMatch = /^\/api\/music\/playlist\/([^/]+)\/cancel$/.exec(pathname);
-  if (method === 'POST' && playlistCancelMatch) {
-    ok(res, await queryModule('music', 'searchCancel', { id: safeDecode(playlistCancelMatch[1], '未找到该会话') }));
-    return;
-  }
-  const musicPollMatch = /^\/api\/music\/search\/([^/]+)$/.exec(pathname);
-  if (method === 'GET' && musicPollMatch) {
-    ok(res, await queryModule('music', 'searchPoll', {
-      id: safeDecode(musicPollMatch[1], '未找到该会话'),
-      since: Number.parseInt(url.searchParams.get('since') || '0', 10) || 0,
-    }));
-    return;
-  }
-  // 歌单解析与搜索同构：轮询同一个会话注册表（同一 searchId）
-  const playlistPollMatch = /^\/api\/music\/playlist\/([^/]+)$/.exec(pathname);
-  if (method === 'GET' && playlistPollMatch) {
-    ok(res, await queryModule('music', 'searchPoll', {
-      id: safeDecode(playlistPollMatch[1], '未找到该会话'),
-      since: Number.parseInt(url.searchParams.get('since') || '0', 10) || 0,
-    }));
-    return;
-  }
-
-  // 在线播放 / 封面 / 歌词（音乐）：id、uid 由 safeDecode 解码（沿用既有方式），
-  // 模块内再校验 id 规则；url 一律由快照 uid 解析，**绝不接受任何外部 url 入参**（SSRF 口径）。
-  const musicStreamMatch = /^\/api\/music\/stream\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (method === 'GET' && musicStreamMatch) {
-    await handleMusicStream(req, res,
-      safeDecode(musicStreamMatch[1], '未找到该歌曲'),
-      safeDecode(musicStreamMatch[2], '未找到该歌曲'));
-    return;
-  }
-  const musicCoverMatch = /^\/api\/music\/cover\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (method === 'GET' && musicCoverMatch) {
-    await handleMusicCover(req, res,
-      safeDecode(musicCoverMatch[1], '未找到该歌曲'),
-      safeDecode(musicCoverMatch[2], '未找到该歌曲'));
-    return;
-  }
-  const musicLyricMatch = /^\/api\/music\/lyric\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (method === 'GET' && musicLyricMatch) {
-    // 歌词**全程 JSON 包络**：{ok:true, data:{has, synced, lrc}}；uid 不存在 → 404。
-    ok(res, await queryModule('music', 'lyric', {
-      id: safeDecode(musicLyricMatch[1], '未找到该歌曲'),
-      uid: safeDecode(musicLyricMatch[2], '未找到该歌曲'),
-    }));
-    return;
-  }
-
-  // MacKit 自身更新状态（force=1 绕过 10 分钟缓存，强制 fetch 一次）
-  if (method === 'GET' && pathname === '/api/selfupdate/status') {
-    ok(res, await queryModule('selfupdate', 'status', { force: url.searchParams.get('force') === '1' }));
-    return;
-  }
-
-  // 解隔离预检
-  if (method === 'GET' && pathname === '/api/unseal/precheck') {
-    // ★ 每条路径一个 `path=` 参数（2026-09-25 修）：此前是 `paths=a|b|c`，而路径名本身可能含
-    //   `|`，拼接后会被拆成两项，items 与用户输入错位。旧的 `paths=` 形式仍兼容（命令行用法）。
-    const many = url.searchParams.getAll('path');
-    const legacy = url.searchParams.get('paths');
-    const paths = many.length > 0
-      ? many
-      : (legacy ? legacy.split('|').filter((s) => s.length > 0) : []);
-    ok(res, await queryModule('unseal', 'precheck', { paths }));
-    return;
-  }
-
-  // 扫描 /Applications：被隔离且无法打开的应用
-  // ★ 这是**有可见副作用**的 GET（一轮约几十个子进程、数秒），与 chooseFolder 同一道闸：
-  //   跨站 `<img src>` 之类不带 Origin 的子资源请求不得触发它（否则任意网页可反复打满 syspolicyd）。
-  if (method === 'GET' && pathname === '/api/unseal/scan') {
-    requireUiTriggered(req, '扫描应用');
-    ok(res, await queryModule('unseal', 'scan', {}));
-    return;
-  }
-
   // WebDAV 备份（配置 / 列表走同步接口；上传 / 恢复 / 删除走任务流 POST /api/tasks）
   if (method === 'GET' && pathname === '/api/webdav/config') {
     const c = store.publicWebdav();
@@ -832,7 +477,7 @@ async function handleApi(req, res, url) {
     ok(res, { ...c, configured: !!c.url });
     return;
   }
-  if (method === 'GET' && pathname === '/api/webdav/backups') { ok(res, await queryModule('backup', 'webdavList', {})); return; }
+
 
   // 历史
   if (method === 'GET' && pathname === '/api/history') { ok(res, store.listHistory()); return; }
@@ -876,7 +521,7 @@ async function handleApi(req, res, url) {
   }
 
   if (method === 'POST' && pathname === '/api/shutdown') {
-    // 与 chooseFolder 同一道闸：这两个动作会「终止正在跑的任务」，不能由任意网页通过
+    // 走「必须由界面发起」那道闸：这两个动作会「终止正在跑的任务」，不能由任意网页通过
     // 跨站子请求触发（POST 的 Origin 规则已挡住表单，这里再加 Sec-Fetch-Site 一层）。
     requireUiTriggered(req, '关闭服务');
     ok(res, { ok: true });
@@ -893,7 +538,7 @@ async function handleApi(req, res, url) {
     restarting = true;
     ok(res, { ok: true, willRestart: true });
     log('收到重启请求：将拉起新服务进程后退出当前进程…');
-    setTimeout(() => { restartService(); }, 100);
+    setTimeout(() => { restartService('界面请求'); }, 100);
     return;
   }
 
@@ -935,7 +580,7 @@ function checkApiOrigin(req) {
  *
  * ★ 为什么单独要一道闸（2026-09-21 修）：`checkApiOrigin` 刻意「缺 Origin 一律放行」，
  *   但跨站 `<img src="http://127.0.0.1:18080/api/...">` 这类子资源请求**根本不带 Origin**，
- *   于是任意网页都能反复触发 `/api/music/chooseFolder`（弹系统目录框）—— 弹窗轰炸 / DoS。
+ *   于是任意网页都能反复触发带可见副作用的接口（如扫描 /Applications、重启服务）—— DoS。
  *   浏览器会为这类请求带上 `Sec-Fetch-Site`，用它区分：
  *     · same-origin / none（界面内 fetch、用户在地址栏直接打开）→ 放行；
  *     · 其它（cross-site / same-site）→ 拒绝。
@@ -1108,6 +753,47 @@ function checkBackendCode() {
   return codeCheckCache.value;
 }
 
+// ------------------------------ 代码换新后自动重启 ------------------------------
+/**
+ * 后端代码换新后**自动重启**（2026-10-09）。
+ *
+ * 为什么：MacKit 的后端是常驻进程，磁盘上的代码改了必须重启才生效。此前每次都得手动
+ * 「关闭服务 → 双击 MacKit.command」，界面上还要靠「代码已换新」横幅提醒用户去点一下 ——
+ * 这是日常最高频的一步摩擦。
+ *
+ * 触发条件（**缺一不可**，任一条不满足就等下一个周期）：
+ *   · 磁盘代码确实变了（复用 {@link checkBackendCode}，与横幅同一判据）；
+ *   · 没有任务在跑、也没有存活子进程（否则会中途掐断升级 / 备份 / 解隔离）；
+ *   · 本进程启动已超过 20s（避免刚起来就判自己过期）；
+ *   · 距上次自动重启 ≥ 60s（冷却；正常也不会触发 —— 新进程的基线就是重启后的代码）。
+ * 全程 try/catch：自动重启失败只是继续跑旧代码（横幅仍在），绝不影响服务本身。
+ */
+const AUTO_RESTART_CHECK_MS = 10_000;
+const AUTO_RESTART_MIN_UPTIME_MS = 20_000;
+const AUTO_RESTART_COOLDOWN_MS = 60_000;
+let lastAutoRestartAt = 0;
+
+function scheduleAutoRestart() {
+  const timer = setInterval(() => {
+    try {
+      if (restarting || shuttingDown) return;
+      if (Date.now() - BOOT_AT < AUTO_RESTART_MIN_UPTIME_MS) return;
+      if (Date.now() - lastAutoRestartAt < AUTO_RESTART_COOLDOWN_MS) return;
+      if (runner.isBusy() || hasLiveChildren()) return;   // 有活儿在跑：让用户的任务先跑完
+      const code = checkBackendCode();
+      if (!code.changed) return;
+      lastAutoRestartAt = Date.now();
+      const files = code.files.length ? code.files.join('、') : '新增 / 删除的文件';
+      log(`检测到后端代码已更新（${files}），当前无任务在跑 → 自动重启服务`);
+      restartService('自动');   // 内部会置 restarting 并退出本进程
+    } catch (err) {
+      log('自动重启检查失败（忽略，继续用当前代码跑）：', err && err.message);
+    }
+  }, AUTO_RESTART_CHECK_MS);
+  if (timer.unref) timer.unref();   // 不拖住进程退出
+  return timer;
+}
+
 function waitForIdle(timeoutMs) {
   return new Promise((resolve) => {
     const start = Date.now();
@@ -1146,14 +832,13 @@ async function quiesce() {
       for (const id of ids) { try { runner.cancel(id); } catch { /* ignore */ } }
     }
 
-    // ★ 音乐**搜索 / 歌单会话**不经 runner（session.js 直接用 exec.run 起 bridge.py，lane
-    //   'music-search'），所以 activeTaskIds() / isBusy() 都看不见它。只凭 runner 状态决定
-    //   是否补杀，会在「只有搜索在跑」时 ids.length === 0、整段回收被跳过 → Python 变孤儿。
-    //   这里经 registry 动态取模块、用 ?. 调用：模块缺失 / 未加载时完全不影响退出。
-    try {
-      const music = registry.get('music');
-      if (music && typeof music.shutdown === 'function') music.shutdown();
-    } catch (err) { log('取消音乐搜索会话失败（继续退出）：', err && err.message); }
+    // 模块可选声明的优雅退出钩子（经 registry 动态取，用 ?. 调用）：
+    //   runner 之外自己起子进程、且不被 activeTaskIds() 看见的模块，靠它主动回收。
+    //   当前 6 个模块都不需要（它们的行为都经 runner），保留该能力供将来使用。
+    for (const [id, def] of registry) {
+      if (!def || typeof def.shutdown !== 'function') continue;
+      try { def.shutdown(); } catch (err) { log(`模块 ${id} 优雅退出钩子失败（继续退出）：`, err && err.message); }
+    }
 
     if (ids.length) await waitForIdle(GRACEFUL_WAIT_MS);
 
@@ -1199,8 +884,9 @@ function finishExit(exitCode) {
  *   2) 新进程经 exec.spawnDetached（不登记 LIVE_CHILDREN，否则会被我们随后的整组强杀带走）；
  *   3) 起不来时不静默退出：日志写清「请手动双击 app/MacKit.command」，并以非 0 码退出。
  */
-async function restartService() {
-  log('开始重启服务…');
+async function restartService(reason = '手动') {
+  restarting = true;
+  log(`开始重启服务（${reason}）…`);
   try { await quiesce(); } catch (err) { log('重启前静默失败（继续）：', err && err.message); }
   // 等监听套接字真正关闭（最多 3s；quiesce 已结束 SSE，正常情况几十毫秒内返回）
   await new Promise((resolve) => {
@@ -1244,8 +930,6 @@ async function main() {
   removeRuntime(); // 清理上一次可能残留的运行态
   captureCodeBaseline(); // 必须在 loadModules 之前：基线 = 即将被加载的那份磁盘代码
   await loadModules();
-  // 音乐音频缓存：启动时按配置上限裁剪一次（best-effort，绝不影响服务启动）。
-  try { await queryModule('music', 'pruneAudio', {}); } catch { /* 模块缺失 / 失败忽略 */ }
   server = http.createServer(handler);
 
   let port = paths.DEFAULT_PORT;
@@ -1285,6 +969,10 @@ async function main() {
   //   实际触发时机见 scheduleMetaAutoSync()：等首屏体检出过一次再跑 —— 两边都要跑 brew 命令，
   //   同时开会抢 Homebrew 的锁互相拖慢（本机实测 /api/env 从 21s 变成 36s）。
   scheduleMetaAutoSync();
+
+  // ★ 后端代码换新后自动重启（空闲时）：用户改完代码 / 更新完 MacKit 不必再手动重启，
+  //   详见 scheduleAutoRestart 的注释。有任务在跑时会一直等到空闲。
+  scheduleAutoRestart();
 }
 
 process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });

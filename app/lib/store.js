@@ -15,6 +15,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as paths from './paths.js';
+// 模块清单在 web/ 下（浏览器也要读它，详见该文件头部说明）：这里只取"哪些模块有通道档位"。
+import { CHANNEL_MODULES } from '../web/modules.js';
 
 
 // ★ 本对象是**唯一**默认值事实源：readMackit 的每一处回落都必须引用它，不得写字面量。
@@ -29,26 +31,6 @@ const MACKIT_DEFAULTS = Object.freeze({
   brewAutoRefreshMeta: true,
   // 上次**成功**同步 brew 元数据的时间戳（节流依据；null = 从未成功过）
   brewMetaRefreshedAt: null,
-  // 音乐模块（第 7 模块）配置：默认下载目录 / 命名模板 / 网络通道 / 已选音源
-  musicDownloadDir: paths.MUSIC_DEFAULT_DIR,
-  musicNameTemplate: '{歌手} - {歌名}.{ext}',
-  musicChannel: 'auto',
-  // ★ null = 从未配置（前端回落默认勾选）；[] = 用户明确清空（必须尊重，不得回落默认）
-  musicSources: null,
-  // 是否随音频同时保存歌词 .lrc（musicdl 自动旁写；false = 下载后删除旁车歌词）
-  musicSaveLyrics: true,
-  // 增强搜索（实验）：走 musicsquare 式第三方代理 API（更快、对「歌手 - 歌名」组合更宽容），
-  // 但强依赖外部社区代理，默认关闭，保持「离线 / 零依赖」红线。
-  musicEnhancedSearch: false,
-  // R0 · 代理配置（v2 增量）：代理地址来源 + 自定义 HTTP / SOCKS5 地址（均 `host:port`，不带 scheme）
-  // ★ 与上面 4 个键同口径：**默认值 / 读取 / 写入三处缺一不可**，否则「保存了但没生效」。
-  musicProxySource: 'homebrew',
-  musicProxyHttp: '',
-  musicProxySocks5: '',
-  // 在线播放 / 边听边存：音频缓存容量上限（MB，默认 1024，可调 128–5120）
-  musicCacheMaxMb: 1024,
-  // 下载并发度（默认 3，可调 1–5）；=1 时与「每曲一步」的历史行为一致
-  musicDownloadConcurrency: 3,
 });
 /**
  * 每模块网络通道档位（**唯一值域事实源**，lib/netpolicy.js 从这里取）：
@@ -57,41 +39,21 @@ const MACKIT_DEFAULTS = Object.freeze({
  * 避免出现「设置了却不生效」的死设置）。
  */
 export const CHANNEL_VALUES = Object.freeze(['auto', 'proxy_first', 'direct_first']);
-/** 有通道档位的配置键（界面为 brew / music / rime / selfupdate 各给一个下拉）。 */
-export const CHANNEL_KEYS = Object.freeze(['brewChannel', 'musicChannel', 'rimeChannel', 'selfupdateChannel']);
 /**
- * 音乐模块的**旧值域**（auto / direct / proxy）→ 统一档位。2026-09-22 迁移：
- * 读到旧值即按新值用，下次写回自然升级 —— 老配置文件不用手工改，也不用写迁移脚本。
+ * 有通道档位的配置键（界面为 brew / rime / selfupdate 各给一个下拉）。
+ * ★ 由模块清单（web/modules.js）派生：只有 `channel: true` 的模块才生成配置键 ——
+ *   既不会"加了模块忘了加键"，也不会反过来多出一个没人读的死设置。
  */
-const LEGACY_MUSIC_CHANNEL = Object.freeze({ auto: 'auto', direct: 'direct_first', proxy: 'proxy_first' });
+export const CHANNEL_KEYS = Object.freeze(CHANNEL_MODULES.map((m) => `${m.id}Channel`));
 
 /**
  * 归一化一个通道档位值。
  * @param {unknown} value
- * @param {boolean} [legacyMusic] 是否允许音乐模块的旧值域
  * @returns {string|null} 合法档位，或 null（调用方回落默认值 / 忽略本次写入）
  */
-function normChannel(value, legacyMusic = false) {
-  if (CHANNEL_VALUES.includes(value)) return value;
-  if (legacyMusic && LEGACY_MUSIC_CHANNEL[value]) return LEGACY_MUSIC_CHANNEL[value];
-  return null;
+function normChannel(value) {
+  return CHANNEL_VALUES.includes(value) ? value : null;
 }
-/** 音乐模块代理地址来源（v2）：跟随 Homebrew 或自定义 */
-const MUSIC_PROXY_SOURCES = Object.freeze(['homebrew', 'custom']);
-/** 音频缓存容量（MB）可调区间 */
-export const MUSIC_CACHE_MB_MIN = 128;
-export const MUSIC_CACHE_MB_MAX = 5120;
-/** 下载并发度可调区间 */
-export const MUSIC_CONCURRENCY_MIN = 1;
-export const MUSIC_CONCURRENCY_MAX = 5;
-/**
- * 代理地址校验正则：`host:port`。
- * host 允许 IPv4 / 主机名（`[A-Za-z0-9.\-]+`），port 为 1–5 位数字（范围另判 1–65535）。
- * 该形状天然拒绝 `://`、空格、路径、查询串、中文、回车等非法输入（design v2 §A.1 / Q1）。
- */
-const PROXY_ADDR_RE = /^([A-Za-z0-9.\-]+):(\d{1,5})$/;
-/** 非法代理地址时的统一可读提示（前端直接 toast 这句）。 */
-const PROXY_ADDR_HINT = '请填写 主机:端口，例如 127.0.0.1:7897，不要带 http://';
 const MIRROR_IDS = Object.freeze(['official', 'tuna', 'ustc', 'aliyun', 'tencent']);
 /**
  * 自定义 MIRROR 值（枚举外，如自建镜像 / 带路径的 URL）的合法字符集。
@@ -165,19 +127,6 @@ function listFiles(dir, ext) {
 }
 
 /**
- * 把任意输入夹取为 [min,max] 内的整数。
- * 非数 / NaN / Infinity → 回落 fallback（用于读取容错：**绝不用非法值覆盖默认**）。
- * @param {unknown} value
- * @param {number} min
- * @param {number} max
- * @param {number} fallback
- * @returns {number}
- */
-function clampInt(value, min, max, fallback) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, Math.trunc(n)));
-}
 
 // ---------------------- ~/.brewgo_config（事实源，格式不变） ----------------------
 
@@ -303,42 +252,12 @@ export function writeBrewgo(v) {
 
 // ---------------------------- ~/.mackit/config.json ----------------------------
 
-/**
- * `host:port` 是否为合法代理地址（Q1）：形状匹配 **且** 端口在 1–65535。
- * @param {string} s
- * @returns {boolean}
- */
-export function isValidProxyAddr(s) {
-  const m = PROXY_ADDR_RE.exec(String(s == null ? '' : s));
-  if (!m) return false;
-  const port = Number.parseInt(m[2], 10);
-  return port >= 1 && port <= 65535;
-}
-
-/**
- * 归一化代理地址（**唯一校验出口**，design v2 §A.1）：
- *   · 空 / 全空白       → `''`（表示该协议不启用）；
- *   · 合法 `host:port`  → 原样（已 trim）返回；
- *   · 非空但非法        → `''`（调用方按「不启用」处理；**写入口**另有抛错校验见 writeMackit）。
- *
- * 所有代理派生（resolveProxy / resolveInstallProxyEnv / 前端回显）都从这里取值，
- * 杜绝各处自拼代理字符串。
- * @param {unknown} raw
- * @returns {string} 归一化后的 `host:port`，或 `''`
- */
-export function normalizeProxyAddr(raw) {
-  const s = String(raw == null ? '' : raw).trim();
-  if (s === '') return '';
-  return isValidProxyAddr(s) ? s : '';
-}
-
 /** 读取 MacKit 专属配置（缺失/损坏时回落默认值）。 */
 export function readMackit() {
   const raw = readJsonSafe(paths.CONFIG_JSON, {}) || {};
   return {
-    // 每模块网络通道档位（缺失/非法 → 默认 auto）。music 额外兼容旧值域（proxy/direct）。
+    // 每模块网络通道档位（缺失/非法 → 默认 auto）。
     brewChannel: normChannel(raw.brewChannel) || MACKIT_DEFAULTS.brewChannel,
-    musicChannel: normChannel(raw.musicChannel, true) || MACKIT_DEFAULTS.musicChannel,
     rimeChannel: normChannel(raw.rimeChannel) || MACKIT_DEFAULTS.rimeChannel,
     selfupdateChannel: normChannel(raw.selfupdateChannel) || MACKIT_DEFAULTS.selfupdateChannel,
     autoFallback: typeof raw.autoFallback === 'boolean' ? raw.autoFallback : MACKIT_DEFAULTS.autoFallback,
@@ -347,25 +266,6 @@ export function readMackit() {
     lastCheckedAt: typeof raw.lastCheckedAt === 'number' ? raw.lastCheckedAt : MACKIT_DEFAULTS.lastCheckedAt,
     brewAutoRefreshMeta: typeof raw.brewAutoRefreshMeta === 'boolean' ? raw.brewAutoRefreshMeta : MACKIT_DEFAULTS.brewAutoRefreshMeta,
     brewMetaRefreshedAt: typeof raw.brewMetaRefreshedAt === 'number' ? raw.brewMetaRefreshedAt : MACKIT_DEFAULTS.brewMetaRefreshedAt,
-    // 音乐模块。缺失/类型不符一律回落默认值（缺省下载目录、命名模板、通道、音源）。
-    musicDownloadDir: typeof raw.musicDownloadDir === 'string' && raw.musicDownloadDir.trim()
-      ? raw.musicDownloadDir : MACKIT_DEFAULTS.musicDownloadDir,
-    musicNameTemplate: typeof raw.musicNameTemplate === 'string' && raw.musicNameTemplate.trim()
-      ? raw.musicNameTemplate : MACKIT_DEFAULTS.musicNameTemplate,
-
-    musicSources: Array.isArray(raw.musicSources)
-      ? raw.musicSources.filter((s) => typeof s === 'string' && s.length > 0) : MACKIT_DEFAULTS.musicSources,
-    musicSaveLyrics: typeof raw.musicSaveLyrics === 'boolean' ? raw.musicSaveLyrics : MACKIT_DEFAULTS.musicSaveLyrics,
-    // 增强搜索（实验）：默认 false；true = 搜索走第三方代理 API（更快、组合词更宽容，但依赖外部服务）
-    musicEnhancedSearch: raw.musicEnhancedSearch === true ? true : MACKIT_DEFAULTS.musicEnhancedSearch,
-    // R0 · 代理三键（容错读出）：枚举外回落 homebrew；地址经 normalizeProxyAddr 归一（非法即视为空）。
-    musicProxySource: MUSIC_PROXY_SOURCES.includes(raw.musicProxySource)
-      ? raw.musicProxySource : MACKIT_DEFAULTS.musicProxySource,
-    musicProxyHttp: normalizeProxyAddr(raw.musicProxyHttp) || MACKIT_DEFAULTS.musicProxyHttp,
-    musicProxySocks5: normalizeProxyAddr(raw.musicProxySocks5) || MACKIT_DEFAULTS.musicProxySocks5,
-    // 音频缓存容量上限（MB）与下载并发度：读取时夹取到合法区间，非法/缺失一律回落默认值。
-    musicCacheMaxMb: clampInt(raw.musicCacheMaxMb, MUSIC_CACHE_MB_MIN, MUSIC_CACHE_MB_MAX, MACKIT_DEFAULTS.musicCacheMaxMb),
-    musicDownloadConcurrency: clampInt(raw.musicDownloadConcurrency, MUSIC_CONCURRENCY_MIN, MUSIC_CONCURRENCY_MAX, MACKIT_DEFAULTS.musicDownloadConcurrency),
     // ★ 2026-09-21：这里原本硬编码字面量（null / 1 / ''），与 MACKIT_DEFAULTS 里的声明各写一份 ——
     //   改了 DEFAULTS 却不生效的经典漂移。全部改回读 DEFAULTS，保持「默认值只有一处」的口径。
     version: MACKIT_DEFAULTS.version,
@@ -389,66 +289,11 @@ export function writeMackit(patch = {}) {
   if (patch.lastCheckedAt !== undefined) next.lastCheckedAt = typeof patch.lastCheckedAt === 'number' ? patch.lastCheckedAt : null;
   if (patch.brewAutoRefreshMeta !== undefined) next.brewAutoRefreshMeta = !!patch.brewAutoRefreshMeta;
   if (patch.brewMetaRefreshedAt !== undefined) next.brewMetaRefreshedAt = typeof patch.brewMetaRefreshedAt === 'number' ? patch.brewMetaRefreshedAt : null;
-  // 音乐模块配置（缺失字段 = 不改写；空串回落默认值）
-  if (patch.musicDownloadDir !== undefined) {
-    const v = String(patch.musicDownloadDir || '').trim();
-    next.musicDownloadDir = v || MACKIT_DEFAULTS.musicDownloadDir;
-  }
-  if (patch.musicNameTemplate !== undefined) {
-    const v = String(patch.musicNameTemplate || '').trim();
-    next.musicNameTemplate = v || MACKIT_DEFAULTS.musicNameTemplate;
-  }
-  // 每模块网络通道：非法值一律忽略（保持原值），与其它枚举字段同口径；music 兼容旧值域。
+  // 每模块网络通道：非法值一律忽略（保持原值），与其它枚举字段同口径。
   for (const key of CHANNEL_KEYS) {
     if (patch[key] === undefined) continue;
-    const v = normChannel(patch[key], key === 'musicChannel');
+    const v = normChannel(patch[key]);
     if (v) next[key] = v;
-  }
-  if (patch.musicSources !== undefined && Array.isArray(patch.musicSources)) {
-    next.musicSources = patch.musicSources.filter((s) => typeof s === 'string' && s.length > 0);
-  }
-  if (patch.musicSaveLyrics !== undefined && typeof patch.musicSaveLyrics === 'boolean') {
-    next.musicSaveLyrics = patch.musicSaveLyrics;
-  }
-  if (patch.musicEnhancedSearch !== undefined && typeof patch.musicEnhancedSearch === 'boolean') {
-    next.musicEnhancedSearch = patch.musicEnhancedSearch;
-  }
-  // R0 · 代理三键（v2）：写入 + 校验。**仅当本次 patch 含任一代理字段时才校验**，
-  // 避免「保存下载目录」这类无关 patch 因存量非法值被误拦。
-  if (patch.musicProxySource !== undefined || patch.musicProxyHttp !== undefined || patch.musicProxySocks5 !== undefined) {
-    // 代理来源：枚举内才改，枚举外保持原值（与 musicChannel 同口径）
-    const source = (patch.musicProxySource !== undefined && MUSIC_PROXY_SOURCES.includes(patch.musicProxySource))
-      ? patch.musicProxySource : cur.musicProxySource;
-    // 地址：本次给了就用本次的（trim），否则沿用原值
-    const http = patch.musicProxyHttp !== undefined ? String(patch.musicProxyHttp == null ? '' : patch.musicProxyHttp).trim() : cur.musicProxyHttp;
-    const socks = patch.musicProxySocks5 !== undefined ? String(patch.musicProxySocks5 == null ? '' : patch.musicProxySocks5).trim() : cur.musicProxySocks5;
-    // 逐字段校验：非空但非法 → 抛 PARSE_FAILED（→ HTTP 422），**不写盘**
-    if (http !== '' && !isValidProxyAddr(http)) {
-      throw paths.mkCodedError('PARSE_FAILED', PROXY_ADDR_HINT, `musicProxyHttp=${http}`);
-    }
-    if (socks !== '' && !isValidProxyAddr(socks)) {
-      throw paths.mkCodedError('PARSE_FAILED', PROXY_ADDR_HINT, `musicProxySocks5=${socks}`);
-    }
-    // 跨字段：选「自定义」时两址皆空 → 拦截（A8）
-    if (source === 'custom' && http === '' && socks === '') {
-      throw paths.mkCodedError('PARSE_FAILED', '选择「自定义」代理时，请至少填写一个协议地址（HTTP 或 SOCKS5）', '');
-    }
-    next.musicProxySource = source;
-    next.musicProxyHttp = http;
-    next.musicProxySocks5 = socks;
-  }
-  // 在线播放缓存上限（MB）与下载并发度：非法值回落**当前值**（不抛错，也不写坏），合法值夹取到区间。
-  if (patch.musicCacheMaxMb !== undefined) {
-    const n = Number(patch.musicCacheMaxMb);
-    next.musicCacheMaxMb = Number.isFinite(n)
-      ? clampInt(n, MUSIC_CACHE_MB_MIN, MUSIC_CACHE_MB_MAX, cur.musicCacheMaxMb)
-      : cur.musicCacheMaxMb;
-  }
-  if (patch.musicDownloadConcurrency !== undefined) {
-    const n = Number(patch.musicDownloadConcurrency);
-    next.musicDownloadConcurrency = Number.isFinite(n)
-      ? clampInt(n, MUSIC_CONCURRENCY_MIN, MUSIC_CONCURRENCY_MAX, cur.musicDownloadConcurrency)
-      : cur.musicDownloadConcurrency;
   }
   next.version = 1;
 

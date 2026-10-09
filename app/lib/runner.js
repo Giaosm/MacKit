@@ -2,8 +2,8 @@
  * MacKit · 任务调度层
  *
  *   - 按 lane 分区的串行队列（设计 §5.2）：同一 lane 内串行、不同 lane 间并行。
- *     default lane = 现有 6 个模块（行为不变）；music lane = 音乐下载/安装；music-search lane = 搜索会话。
- *     这样既保住 brew 串行（不抢 index.lock），又让音乐下载可与其它任务并行。
+ *     default lane = 现有 6 个模块（行为不变）；将来某个模块若需要与其它任务并行，可声明自己的 lane。
+ *     这样既保住 brew 串行（不抢 index.lock），又让独立通道的任务互不阻塞。
  *   - Step 状态机：pending → running → ok/fail/skip/cancelled
  *   - SSE 广播：单一来源在后端（内存环形缓冲 + 落盘）
  *   - 取消：AbortSignal → exec.js 侧 SIGTERM→等 3s→SIGKILL；未开始步骤置 skip；不回滚
@@ -31,10 +31,10 @@ const records = new Map();
 // ------------------------------ lane 分区队列（设计 §5.2） ------------------------------
 // 每个 lane 有各自独立的 queue / running / currentId：**同一 lane 内串行、不同 lane 间并行**。
 //   · default lane = 现有 6 个模块（不传 lane 即落这里，行为 100% 不变）；
-//   · music lane  = 音乐模块的下载 / 安装等写任务；
-//   · music-search lane = 音乐搜索会话的子进程（独立于 music lane，取消下载时不误杀）。
+//   · 其它 lane：预留给「需要与 default 并行的模块」（当前无模块使用）。取消只影响自己那一路
+//     —— 由每步的 AbortSignal 保证，见 exec.js 的 LIVE_CHILDREN 说明。
 // brew 抢锁安全：只有 default lane 会跑 brew，且 default lane 内部仍严格串行 ⇒ 任意时刻
-// 至多 1 个 brew 进程，index.lock 不会争用；music lane 不调用 brew，两者无共享资源。
+// 至多 1 个 brew 进程，index.lock 不会争用。
 const DEFAULT_LANE = 'default';
 /** @type {Map<string, {queue:string[], running:boolean, currentId:string|null}>} */
 const LANES = new Map();

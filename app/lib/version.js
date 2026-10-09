@@ -1,13 +1,13 @@
 /**
  * MacKit · 版本号工具（唯一事实源，2026-09-25）
  *
- * 为什么单独成文件：版本比较在 Homebrew 管家（cask 版本 / 上游 release tag）与音乐模块
- * （musicdl 目标版本 / PyPI 上游版本）都要用，此前散落多份实现。这里保留**两种语义**并写明区别，
- * 调用方按需取，避免「统一的时候悄悄改了行为」：
+ * 为什么单独成文件：版本比较在 Homebrew 管家（cask 版本 / 上游 release tag / 应用真实版本）
+ * 多处都要用，此前散落多份实现。这里保留**两种语义**并写明区别，调用方按需取，
+ * 避免「统一的时候悄悄改了行为」：
  *   · {@link compare}     —— 通用比较：去 `v` 前缀，`,` `-` `_` `+` 都当分隔符，缺段视为更小，
  *                            非数字段按字典序。**解析不出来也不会返回「相等」**。
- *   · {@link parseStrict} —— 严格 `MAJOR.MINOR.PATCH`，失败返回 null。音乐模块的历史语义依赖它
- *                            （解析失败时调用方按「相等」处理，避免把不认识的版本串误报成「有更新」）。
+ *   · {@link parseStrict} —— 严格 `MAJOR.MINOR.PATCH`，失败返回 null。
+ *   · {@link sameVersion} / {@link samePrefix} —— 「是不是同一版」的两种判定（见各自注释）。
  *
  * ★ 不接管 `brew.js` 的 `stripBrewRevision`：它处理的是 Homebrew 特有的 revision 后缀（`1.5.7_1`），
  *   属 brew 领域知识，留在 brew.js。

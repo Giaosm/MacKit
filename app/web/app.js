@@ -1,7 +1,7 @@
 /**
  * MacKit · 前端外壳（无框架）
  *
- *   - 单页 + 哈希路由（#/dashboard|#/brew|#/music|#/sysinit|#/rime|#/unseal|#/backups）
+ *   - 单页 + 哈希路由（#/dashboard|#/brew|#/sysinit|#/rime|#/unseal|#/backups）
  *   - 视图注册表：每个 web/views/*.js 默认导出 { id, title, mount(root, ctx), unmount?() }
  *     （侧边栏图标由本文件 NAV 提供，视图不自带 icon）
  *   - 状态单一来源在后端：本文件只做订阅/渲染，不推断任务状态
@@ -17,6 +17,8 @@
 
 import { fmtRel } from './reltime.js';
 import { diffMetaState } from './meta-state.js';
+// 模块清单（前后端共用一份；后端也 import 它决定加载哪些模块）
+import { MODULES, NAV_MODULES } from './modules.js';
 
 // ============================== 常量 ==============================
 const DEFAULT_PORT = 18080;
@@ -31,34 +33,23 @@ const ICON = {
   ime: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h1M11 9h1M15 9h2"/><path d="M7 13h10"/></svg>',
   lock: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>',
   backups: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
-  // 音乐下载：双音符
-  music: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
 };
-
-/** 侧边栏导航（外壳自身定义；视图可自带 title 覆盖）。 */
-const NAV = [
-  { id: 'dashboard', title: '总览', icon: ICON.home },
-  { id: 'brew', title: 'Homebrew 管家', icon: ICON.beer },
-  { id: 'music', title: '音乐下载', icon: ICON.music },
-  { id: 'sysinit', title: '系统初始化', icon: ICON.gear },
-  { id: 'rime', title: 'Rime 输入法', icon: ICON.ime },
-  { id: 'unseal', title: '应用解隔离', icon: ICON.lock },
-  { id: 'backups', title: '备份中心', icon: ICON.backups },
-];
 
 /**
- * ★ 视图注册表：加一行即可挂载一个新视图。
- * 7 个视图（dashboard / brew / music / sysinit / rime / unseal / backups）均已实现；对应文件缺失时会安全降级为"开发中"提示。
+ * 侧边栏导航 / 视图注册表 —— **都由模块清单派生**（`web/modules.js`，前后端共用）。
+ *
+ * 为什么不再手写两份：此前「加一个模块」要在 `NAV`、`VIEW_MODULES`、后端 `MODULE_FILES`、
+ * `store.CHANNEL_KEYS` 四处各改一次，漏一处就出现「有入口但服务端不认」或「设置了不生效」。
+ * 现在清单里加一条即可（视图文件仍要自己写）。
  */
-const VIEW_MODULES = {
-  dashboard: () => import('./views/dashboard.js'),
-  brew: () => import('./views/brew.js'),
-  music: () => import('./views/music.js'),
-  sysinit: () => import('./views/sysinit.js'),
-  rime: () => import('./views/rime.js'),
-  unseal: () => import('./views/unseal.js'),
-  backups: () => import('./views/backups.js'),
-};
+/** 前端侧的路由 id：缺省 = 后端 id，只有备份中心不同（见清单注释）。 */
+const viewIdOf = (m) => m.viewId || m.id;
+const NAV = NAV_MODULES.map((m) => ({ id: viewIdOf(m), title: m.title, icon: m.icon ? ICON[m.icon] : null }));
+
+/** 动态导入的路径来自清单（`./views/xxx.js`，相对于本文件解析）；没有独立页面的模块不在此表。 */
+const VIEW_MODULES = Object.fromEntries(
+  MODULES.filter((m) => m.view).map((m) => [viewIdOf(m), () => import(m.view)]),
+);
 
 // ============================== DOM 引用 ==============================
 const $ = (id) => document.getElementById(id);
@@ -269,7 +260,7 @@ const kv = (k, v) => el('div', { class: 'kv' }, [el('span', { class: 'kv__k', te
  *   proxy_first  → 优先代理（走不通自动降级直连）
  *   direct_first → 优先直连（走不通自动降级代理）
  *
- * ★ 只挂在**真联网**的模块上（brew / music / rime / selfupdate）；应用隔离、系统初始化不联网，
+ * ★ 只挂在**真联网**的模块上（brew / rime / selfupdate）；应用隔离、系统初始化不联网，
  *   不给开关 —— 避免又造出一个「设置了却不生效」的死设置。
  * ★ Homebrew 的**逐项升级 / 安装**仍严格按用户在每一项上点的「代理 / 直连」按钮执行，不受本开关影响。
  */
@@ -280,7 +271,7 @@ const CHANNEL_OPTIONS = Object.freeze([
 ]);
 
 /**
- * @param {'brew'|'music'|'rime'|'selfupdate'} moduleId 模块 id（存储键 = `<id>Channel`）
+ * @param {'brew'|'rime'|'selfupdate'} moduleId 模块 id（存储键 = `<id>Channel`）
  * @param {string} [label] 前缀文案（默认「通道」；总览页用「自更新通道」避免与体检探测混淆）
  * @param {string} [hint] 悬浮说明
  * @returns {HTMLElement}
@@ -481,8 +472,7 @@ function attach(taskId, opts = {}) {
     // ★ 兜底：SSE 断了就改为**轮询到终态**（2026-09-25 修）。
     //   此前只查一次，拿到非终态任务就 finish —— state.running 会永久停在 true，之后
     //   所有 runTask 都被「有任务正在运行」挡死（只能刷新页面），而调用方还会把仍在运行
-    //   的任务误报成失败（如备份面板弹「备份失败」）。music.js 的 startFallback 早就是
-    //   「持续轮询」这套正确写法，这里对齐；in-flight 守卫避免超限后重复兜底。
+    //   的任务误报成失败（如备份面板弹「备份失败」）；in-flight 守卫避免超限后重复兜底。
     // ★ 再加**次数上限**（2026-10-08）：后端进程已死这类情形下任务永远是 running，2s 一轮会一直打下去。
     //   到上限就按「无法确认」收尾并复位运行态（不复位的话后续所有操作都会被「有任务正在运行」挡死）。
     let fallbackRunning = false;
@@ -877,11 +867,11 @@ async function refreshEnv(force) {
 async function recoverTasks() {
   try {
     const tasks = await api('GET', '/api/tasks');
-    // ★ 只看 default lane 的任务（2026-09-25 修）：音乐下载跑在自己的 lane 上，由音乐页
-    //   自己跟随（它刻意不用 runTask，以免占用全局 state.running）。这里若把它 attach 进来，
-    //   整个界面会以为「有任务正在运行」，brew / rime / 解隔离 / 备份全部点不动，
-    //   而音乐日志还会灌进全局日志抽屉。
-    const running = tasks.find((t) => (t.status === 'running' || t.status === 'pending') && t.module !== 'music');
+    // ★ 只跟随 default lane 的任务（2026-09-25 修）：模块若声明了自己的 lane（并行任务），
+    //   应由它的模块页自己跟随；把它 attach 进全局，会让整个界面以为「有任务正在运行」，
+    //   brew / rime / 解隔离 / 备份全部点不动，它的日志还会灌进全局日志抽屉。
+    //   当前 6 个模块都不声明 lane，因此这里的判据就是「有没有 running/pending 任务」。
+    const running = tasks.find((t) => t.status === 'running' || t.status === 'pending');
     if (running) {
       state.task = running; setLogTaskLabel(taskLabel(running)); openLogDrawer();
       appendLogLine({ seq: 0, ts: Date.now(), level: 'info', text: `检测到正在运行的任务「${running.title}」，已重新订阅日志…` });
