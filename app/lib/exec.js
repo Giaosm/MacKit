@@ -184,10 +184,14 @@ export function killAllNow(signal = 'SIGKILL') {
 /**
  * 是否存在存活子进程。
  *
- * 供 server.js 的优雅退出兜底判断：音乐**搜索会话**用 exec.run 直接起 bridge.py，
- * **不经过 runner**，因此 `runner.isBusy()` / `activeTaskIds()` 看不见它。若只凭 runner
- * 状态决定是否补杀，会在「只有搜索在跑、没有任何任务」时整段回收被跳过 → Python 子进程
- * 变孤儿（见 server.js gracefulShutdown）。
+ * `LIVE_CHILDREN` 是 exec 层的登记表：经本文件启动的**每一个**子进程都在里面，因此它比
+ * runner 的任务状态更全 —— 只读查询由路由直接调用、**不经过 runner 的队列**，它们起出来的
+ * 子进程 `runner.isBusy()` / `activeTaskIds()` 看不见。典型例子：`brew` 的
+ * `queries.packageSearch` 会经 `ensureIndex()` → `downloadIndex()` 落一次 `exec.run` 下载索引
+ * （内层预算最长 600s），整个过程中 runner 都认为「没有任务在跑」。
+ *
+ * 所以「能不能重启、能不能退出」必须两边一起看：只看 runner，会在这类查询跑到一半时重启，
+ * 把 curl 一起带走；优雅退出时还会漏掉回收，留下孤儿。
  *
  * @returns {boolean}
  */
