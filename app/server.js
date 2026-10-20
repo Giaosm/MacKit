@@ -651,8 +651,14 @@ async function handler(req, res) {
     // 逃出 catch → 连接永不返回（挂死）+ stderr 打印未处理的 Promise 拒绝。
     // parseReqUrl 会先把开头的连续斜杠折叠为单个 '/' 再解析，兜住这类畸形输入。
     const url = parseReqUrl(req.url, `http://${paths.LOOPBACK}`);
-    if (url.pathname.startsWith('/api/')) { checkApiOrigin(req); await handleApi(req, res, url); }
-    else serveStatic(res, url.pathname);
+    if (url.pathname.startsWith('/api/')) {
+      checkApiOrigin(req);
+      // 计数给自动重启用（见 inflightApi / lastApiAt 的注释）。SSE 只登记连接就返回，
+      // 不算「处理中」—— 它跟着任务走，任务在跑时 runner.isBusy() 已经拦住了重启。
+      inflightApi += 1;
+      lastApiAt = Date.now();
+      try { await handleApi(req, res, url); } finally { inflightApi -= 1; }
+    } else serveStatic(res, url.pathname);
   } catch (err) {
     if (!res.headersSent) sendError(res, err);
     else { try { res.end(); } catch { /* ignore */ } }
@@ -666,6 +672,15 @@ let server = null;
 const BOOT_AT = Date.now();
 /** 重启流程互斥标记（见 restartService）。 */
 let restarting = false;
+/**
+ * 正在处理中的 `/api/` 请求数，以及最近一个请求的到达时刻。
+ *
+ * 为什么需要：只读查询（/api/env、/api/list…）不经过 runner，`runner.isBusy()` 看不见它们，
+ * 但重启会在 `server.close()` 时把这些请求的连接掐掉（前端表现为「请求失败」）。
+ * 见 scheduleAutoRestart：有请求在处理 / 刚进来（安静窗口内）就不重启。
+ */
+let inflightApi = 0;
+let lastApiAt = 0;
 
 function writeRuntime(port) {
   try {
@@ -695,7 +710,9 @@ function removeRuntime() {
  * （Node 会一直用启动时那份）。而前端 HTML/JS 是每次请求现读磁盘的（见 serveStatic），于是会出现
  * 「按钮文案是新的、行为却是旧的」这种最难排查的状态（2026-09-20 实测踩到：用户点了新版按钮，
  * 实际跑的还是旧版单步动作，索引刷新那两步根本没执行）。
- * 只扫后端：`server.js` + `lib/**` 下的 .js —— 前端 / Python 都是按需读取，改它们不需要重启。
+ * **只扫后端**：`server.js` + `lib/**` 下的 .js，外加 `web/modules.js`（它被后端 import，见下方说明）。
+ * 前端其余文件与 `test/` 都是按需读取 / 不参与运行，改它们**不需要**重启 —— 之前这里递归扫整个
+ * `app/`，于是改一个视图文件也会被判成「后端代码已更新」（加自动重启后还会白白重启一次）。
  */
 function scanBackendCode(dir, out = []) {
   let entries = [];
@@ -703,11 +720,28 @@ function scanBackendCode(dir, out = []) {
   for (const e of entries) {
     if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
     const full = path.join(dir, e.name);
-    if (e.isDirectory()) { scanBackendCode(full, out); continue; }
+    if (e.isDirectory()) {
+      // 只跟 lib/（后端全部在这）与 web/（仅为了 modules.js；其余前端文件会被下面的过滤器排除）
+      const top = path.relative(paths.APP_DIR, full).split(path.sep)[0];
+      if (top === 'lib' || top === 'web') scanBackendCode(full, out);
+      continue;   // test/ 等目录整体跳过
+    }
     if (!e.name.endsWith('.js')) continue;
+    if (!isBackendCodeFile(full)) continue;
     try { const st = fs.statSync(full); out.push([full, st.mtimeMs, st.size]); } catch { /* ignore */ }
   }
   return out;
+}
+/**
+ * 某个文件是否属于「后端代码」（改了必须重启）。
+ * ★ `web/modules.js` 是唯一的前端目录里的后端文件：它被 store.js / server.js import，
+ *   同时又发给浏览器 —— 所以它变了既要重启后端，也要让页面刷新（webChangedAt 会覆盖到它）。
+ */
+function isBackendCodeFile(full) {
+  const rel = path.relative(paths.APP_DIR, full);
+  if (rel === 'server.js') return true;
+  if (rel === path.join('web', 'modules.js')) return true;
+  return rel.startsWith(`lib${path.sep}`);
 }
 /**
  * `web/` 下前端资源的**最近改动时刻**（毫秒）。
@@ -774,7 +808,21 @@ function checkBackendCode(force = false) {
 const AUTO_RESTART_CHECK_MS = 10_000;
 const AUTO_RESTART_MIN_UPTIME_MS = 20_000;
 const AUTO_RESTART_COOLDOWN_MS = 60_000;
+/** 「最近有请求进来」的安静窗口：刚进来的请求要给它跑完，别在重启瞬间拦腰截断。 */
+const API_QUIET_MS = 2_000;
 let lastAutoRestartAt = 0;
+/**
+ * 上一次自动重启所针对的**代码指纹**（见 {@link codeSignature}）。
+ * 记下来是为了「同一份代码只自动拉起一次」：正常情况下本进程会 exit、新进程重新计数，
+ * 但万一重启没走完（异常路径、新进程立刻又判自己过期），冷却期一过就会再拉一次 ——
+ * 对同一份起不来的代码那就是每 60s 白起一个进程。代码再变（你修好了 / 换了版本）指纹不同 → 自动恢复重试。
+ */
+let autoRestartFailedSig = null;
+
+/** 当前后端代码的指纹（路径 + mtime + size），用于识别「还是那份起不来的代码」。 */
+function codeSignature() {
+  return scanBackendCode(paths.APP_DIR).map(([f, m, sz]) => `${f}:${m}:${sz}`).join('|');
+}
 
 function scheduleAutoRestart() {
   const timer = setInterval(() => {
@@ -783,12 +831,19 @@ function scheduleAutoRestart() {
       if (Date.now() - BOOT_AT < AUTO_RESTART_MIN_UPTIME_MS) return;
       if (Date.now() - lastAutoRestartAt < AUTO_RESTART_COOLDOWN_MS) return;
       if (runner.isBusy() || hasLiveChildren()) return;   // 有活儿在跑：让用户的任务先跑完
+      // 只读查询不经过 runner，所以还要看「有没有 API 请求正在处理 / 刚刚进来」
+      if (inflightApi > 0) return;
+      if (Date.now() - lastApiAt < API_QUIET_MS) return;
       const code = checkBackendCode();
       if (!code.changed) return;
+      // 同一份代码已经自动拉起过一次 → 别再反复拉进程（等你改代码后自动恢复）
+      const sig = codeSignature();
+      if (autoRestartFailedSig !== null && autoRestartFailedSig === sig) return;
       lastAutoRestartAt = Date.now();
+      autoRestartFailedSig = sig;
       const files = code.files.length ? code.files.join('、') : '新增 / 删除的文件';
       log(`检测到后端代码已更新（${files}），当前无任务在跑 → 自动重启服务`);
-      restartService('自动');   // 内部会置 restarting 并退出本进程
+      restartService('自动');   // 内部会置 restarting，校验新进程就绪后才退出本进程
     } catch (err) {
       log('自动重启检查失败（忽略，继续用当前代码跑）：', err && err.message);
     }
