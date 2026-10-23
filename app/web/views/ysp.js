@@ -95,7 +95,11 @@ export default {
     // ======================= ② 订阅地址卡 =======================
     /** 当前订阅地址（paint 里更新）——复制 / 打开都读它，不从 DOM 文本反读（那里可能是占位的 '—'） */
     let playlistUrl = '';
+    /** 局域网订阅地址（手机 / 电视用），与服务是否运行无关 */
+    let lanUrl = '';
     const playlistText = el('code', { class: 'mono', text: '—' });
+    const lanText = el('code', { class: 'mono', text: '—' });
+    const btnCopyLan = el('button', { class: 'btn btn--sm', type: 'button', text: '复制', on: { click: () => ui.copy(lanUrl, '已复制局域网订阅地址') } });
     const btnCopy = el('button', { class: 'btn btn--sm btn--primary', type: 'button', text: '复制', on: { click: () => ui.copy(playlistUrl, '已复制订阅地址') } });
     const btnOpenPlaylist = el('button', { class: 'btn btn--sm', type: 'button', text: '在浏览器打开', on: { click: () => openUrl(playlistUrl) } });
     // 健康检查 / 诊断页是**脚本**提供的：服务没起来时点开只会是连接被拒，所以按钮跟着 running 禁用
@@ -105,13 +109,18 @@ export default {
       el('div', { class: 'card__head' }, [el('div', { class: 'card__title', text: '② 订阅地址' })]),
       el('div', { class: 'card__rows' }, [
         el('div', { class: 'row' }, [
-          el('span', { class: 'muted nowrap', text: '播放器订阅' }),
+          el('span', { class: 'muted nowrap', text: '本机订阅' }),
           playlistText,
           btnCopy, btnOpenPlaylist,
         ]),
+        el('div', { class: 'row' }, [
+          el('span', { class: 'muted nowrap', text: '局域网订阅' }),
+          lanText,
+          btnCopyLan,
+        ]),
         el('div', { class: 'row' }, [btnHealth, btnDiag]),
       ]),
-      el('div', { class: 'muted', text: '在 TiviMate / APTV 等播放器里添加上面的 m3u 地址即可。手机 / 电视要拉流时，把 127.0.0.1 换成这台 Mac 的局域网 IP（脚本默认监听 0.0.0.0）。' }),
+      el('div', { class: 'muted', text: 'TiviMate / APTV 等播放器里加上面任意一条即可：Mac 本机用「本机订阅」；手机 / 电视用「局域网订阅」（服务监听 0.0.0.0，与本机同一 Wi-Fi / 网段就能拉流）。' }),
     ]);
 
     // ======================= ③ 日志卡 =======================
@@ -198,6 +207,21 @@ export default {
       btnOpenPlaylist.disabled = !s.running;
       btnHealth.disabled = !s.running;
       btnDiag.disabled = !s.running;
+
+      // 局域网订阅：后端已按网卡优先级排好序，第一个就是最可能能用的那个
+      lanUrl = (s.urls && s.urls.playlistLan) || '';
+      const lan0 = Array.isArray(s.lanIps) && s.lanIps.length ? s.lanIps[0] : null;
+      const restLan = Array.isArray(s.lanIps) ? s.lanIps.slice(1) : [];
+      if (lanUrl) {
+        lanText.textContent = lan0 ? `${lanUrl}（${lan0.iface}）` : lanUrl;
+        lanText.title = restLan.length
+          ? `其他网卡：${restLan.map((x) => `${x.iface} ${x.address}`).join('，')}`
+          : '';
+      } else {
+        lanText.textContent = '未检测到局域网 IP（Wi-Fi / 网线没连上？）';
+        lanText.title = '';
+      }
+      btnCopyLan.disabled = !lanUrl;
 
       // 按钮
       btnStart.disabled = st.busy || s.running || !s.installed || !s.python.exists;

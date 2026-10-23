@@ -24,6 +24,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import * as paths from './paths.js';
 import * as exec from './exec.js';
 
@@ -143,6 +144,34 @@ async function probePython() {
   return r.code === 0
     ? { ok: true, version: text, detail: '' }
     : { ok: false, version: '', detail: text || `退出码 ${r.code}` };
+}
+
+/**
+ * 本机可用的**局域网 IPv4**（手机 / 电视拉流要用，127.0.0.1 只在本机有效）。
+ *
+ * 过滤项：回环（internal）、169.254.x.x 这类自分配地址（没连上 DHCP 时会出现，给了也用不了）、
+ * 以及 `utun* / awdl* / llw* / bridge* / gif* / stf*` 这些虚拟网卡（VPN、AirDrop/Wi-Fi Direct、
+ * 虚拟机桥接等）——它们的地址在别的设备上访问不到。
+ * 排序：`en0 / en1 / eth*` 等物理网卡优先（Mac 上 Wi-Fi / 有线通常就是它们）。
+ *
+ * @returns {{iface:string, address:string}[]} 可能为空（完全离线）
+ */
+function lanAddresses() {
+  let ifaces = {};
+  try { ifaces = os.networkInterfaces(); } catch { return []; }
+  const out = [];
+  for (const [iface, list] of Object.entries(ifaces)) {
+    if (/^(utun|awdl|llw|gif|stf|anpi|bridge)/i.test(iface)) continue;
+    for (const item of list || []) {
+      const family = typeof item.family === 'string' ? item.family : `IPv${item.family}`;
+      if (family !== 'IPv4' || item.internal) continue;
+      if (item.address.startsWith('169.254.')) continue;
+      out.push({ iface, address: item.address });
+    }
+  }
+  const rank = (x) => (/^(en|eth)\d/i.test(x.iface) ? 0 : 1);
+  out.sort((a, b) => rank(a) - rank(b) || a.iface.localeCompare(b.iface));
+  return out;
 }
 
 /**
@@ -396,6 +425,8 @@ async function collectStatus() {
   const health = await probeHealth(st ? st.port : paths.YSP_PORT);
   const running = !!health;
   const port = st ? st.port : paths.YSP_PORT;
+  // 局域网地址与运行态无关（服务没起来也能先把地址复制进播放器），所以总是探测
+  const lan = lanAddresses();
 
   return {
     installed: loc.scriptExists,
@@ -427,8 +458,12 @@ async function collectStatus() {
       ? health.engine.active_device_slots
       : null,
     uptimeSec: running && Number.isFinite(health.uptime_sec) ? health.uptime_sec : null,
+    /** 本机局域网 IPv4（可能为空），手机 / 电视要用的就是这几个地址 */
+    lanIps: lan,
     urls: {
       playlist: `http://127.0.0.1:${port}/all.m3u`,
+      /** 局域网订阅地址：取排在最前的网卡；纯离线时为 null */
+      playlistLan: lan.length ? `http://${lan[0].address}:${port}/all.m3u` : null,
       health: `http://127.0.0.1:${port}/health`,
       diag: `http://127.0.0.1:${port}/diag`,
     },
