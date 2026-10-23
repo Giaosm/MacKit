@@ -1,7 +1,7 @@
 /**
  * MacKit · 央视频直播（视图）
  *
- * 界面职责很窄：**托管**第三方脚本 ysp-live-v9.5（Python）—— 起停、看状态、复制订阅地址、看日志。
+ * 界面职责很窄：**托管**第三方脚本 ysp-live-vX.Y（Python）—— 起停、看状态、复制订阅地址、看日志。
  * 直播协议、4K/1080p 双引擎、时移回看全在脚本里，前端一行都不重复实现（见 lib/ysp.js 头部）。
  *
  * 设计要点：
@@ -49,7 +49,7 @@ export default {
     head.append(
       el('div', {}, [
         el('h1', { text: '央视频直播' }),
-        el('div', { class: 'muted', text: '托管 ysp-live-v9.5（第三方 Python 脚本）：央视频全频道 4K / 1080p 直播与 7 天时移，输出 m3u 订阅给播放器。' }),
+        el('div', { class: 'muted', text: '托管 ysp-live-vX.Y（第三方 Python 脚本，版本由目录名自动识别）：央视频全频道 4K / 1080p 直播与 7 天时移，输出 m3u 订阅给播放器。' }),
       ]),
       el('div', { class: 'row' }, [
         el('button', { class: 'btn btn--sm', type: 'button', text: '刷新状态', on: { click: () => refresh(true, true) } }),
@@ -136,8 +136,8 @@ export default {
       const missing = [];
       if (!s.installed) {
         missing.push(el('div', {}, [
-          el('div', { text: `未找到直播脚本：${s.script}` }),
-          el('div', { class: 'muted', text: '把作者发布的 ysp-live-vX.Y 整个目录解压到 MacKit 根目录（与 app/ 同级，名字保持原样），然后点「刷新状态」。' }),
+          el('div', { text: `未找到直播脚本：${s.root} 下没有 ysp-live-vX.Y 目录` }),
+          el('div', { class: 'muted', text: '把作者发布的整个目录解压到上面这个路径（与 app/ 同级，目录名保持原样，里面要有 ysp-live*.py），然后点「刷新状态」。' }),
         ]));
       }
       if (!s.python.exists) {
@@ -186,7 +186,7 @@ export default {
       // 免得用户放了 v9.6 却仍看到 v9.5 在跑时分不清是哪一步没生效。
       const others = Array.isArray(s.otherDists) && s.otherDists.length ? `（忽略旧版：${s.otherDists.join('、')}）` : '';
       val.distver.textContent = `${s.distVersion ? `v${s.distVersion}` : '—'}${others}`;
-      val.script.textContent = s.installed ? s.script : `${s.script}（未找到）`;
+      val.script.textContent = s.installed ? s.script : `未找到（扫描根目录 ${s.root}）`;
       val.data.textContent = s.dataDir;
       val.log.textContent = s.logFile;
 

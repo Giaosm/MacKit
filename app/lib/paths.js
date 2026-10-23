@@ -132,15 +132,14 @@ export const GIT_DIR = path.join(REPO_DIR, '.git');
 // 央视频直播（ysp-live，第三方 Python 脚本）
 // ---------------------------------------------------------------------------
 /**
- * 脚本目录的**兜底约定**（仓库根下的 `ysp-live-v9.5/`）。
+ * 脚本由**用户自己**下载解压后放进 MacKit 根目录，本仓库不分发脚本本体
+ * （作者在 README 里明确「其他任何分发渠道均非作者本人」）。
  *
- * ★ 这个目录由**用户自己**下载解压后放进 MacKit 根目录，本仓库不分发脚本本体
- *   （作者在 README 里明确「其他任何分发渠道均非作者本人」）。所以路径是「约定位置」，
- *   找不到时模块给出明确提示，而不是把 3500 行第三方脚本塞进仓库。
- * ★ 真正使用的目录由 {@link findYspDist} 发现：作者每次发版都会改版本号（v9.5 → v9.6 …），
- *   把目录名写死意味着每次升级都要改代码。这里的常量只在「什么都没发现」时用于报错文案。
+ * ★ 目录名**一个都不写死**：作者每次发版都会改版本号（v9.5 → v9.6 → v9.10 …），
+ *   所以用 {@link findYspDist} 现场扫描根目录、按版本号挑最新的一份。
+ *   找不到时**不编造**一个 `ysp-live-v9.x/ysp-live-v9.x.py` 的假路径 ——
+ *   那会让人以为「就该有这么个文件」，实际只该告诉他「扫的是哪个根目录」。
  */
-const YSP_DIR_DEFAULT = path.join(REPO_DIR, 'ysp-live-v9.5');
 /** 服务端口（脚本默认值；改这里要同步 README 与前端文案） */
 export const YSP_PORT = 8767;
 /** 数据持久化目录：放 ~/.mackit 下，不污染脚本目录（脚本默认会写在自己旁边） */
@@ -223,13 +222,8 @@ export function findYspDist() {
       others: found.slice(1).map((x) => path.basename(x.dir)),
     };
   }
-  return {
-    dir: YSP_DIR_DEFAULT,
-    script: path.join(YSP_DIR_DEFAULT, 'ysp-live-v9.5.py'),
-    version: '',
-    found: false,
-    others: [],
-  };
+  // 一个都没找到：dir 指向「扫描根目录」，script 留空（不虚构具体版本的文件名）
+  return { dir: REPO_DIR, script: '', version: '', found: false, others: [] };
 }
 
 // ---------------------------------------------------------------------------

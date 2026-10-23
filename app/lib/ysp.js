@@ -1,7 +1,7 @@
 /**
  * MacKit · 央视频直播（后端模块）
  *
- * 功能来自第三方脚本 `ysp-live-v9.5`（Python，约 3500 行：央视频 4K/1080p 双引擎、
+ * 功能来自第三方脚本 `ysp-live-vX.Y`（Python，约 3500 行：央视频 4K/1080p 双引擎、
  * HLS 代理、7 天时移回看、单端口 8767 出 m3u 订阅）。**不重写、不内联**：
  *   · 那是作者的完整实现（含设备协议 / AES / WASM 伴生引擎），重写等于重造一遍且必然漂移；
  *   · 作者在 README 里写明「其他任何分发渠道均非作者本人」，所以脚本**不进本仓库** ——
@@ -399,7 +399,10 @@ async function collectStatus() {
 
   return {
     installed: loc.scriptExists,
-    script: loc.script,
+    /** 扫描根目录（= 仓库根）：未找到时前端就拿它当提示里的「该放哪儿」 */
+    root: paths.REPO_DIR,
+    /** 实际使用的脚本绝对路径；未找到时为 null（不虚构某个版本的文件名） */
+    script: loc.script || null,
     /** 目录名里的版本号（自动发现时挑中的那一份）；未发现时为空串 */
     distVersion: loc.version || null,
     /** 同时存在的旧版本目录（已忽略，仅作提示） */
