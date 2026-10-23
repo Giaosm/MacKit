@@ -93,19 +93,23 @@ export default {
     ]);
 
     // ======================= ② 订阅地址卡 =======================
+    /** 当前订阅地址（paint 里更新）——复制 / 打开都读它，不从 DOM 文本反读（那里可能是占位的 '—'） */
+    let playlistUrl = '';
     const playlistText = el('code', { class: 'mono', text: '—' });
-    const healthLink = el('a', { class: 'btn btn--sm', target: '_blank', rel: 'noreferrer', text: '健康检查' });
-    const diagLink = el('a', { class: 'btn btn--sm', target: '_blank', rel: 'noreferrer', text: '诊断日志' });
+    const btnCopy = el('button', { class: 'btn btn--sm btn--primary', type: 'button', text: '复制', on: { click: () => ui.copy(playlistUrl, '已复制订阅地址') } });
+    const btnOpenPlaylist = el('button', { class: 'btn btn--sm', type: 'button', text: '在浏览器打开', on: { click: () => openUrl(playlistUrl) } });
+    // 健康检查 / 诊断页是**脚本**提供的：服务没起来时点开只会是连接被拒，所以按钮跟着 running 禁用
+    const btnHealth = el('button', { class: 'btn btn--sm', type: 'button', text: '健康检查', on: { click: () => openUrl((st.data && st.data.urls && st.data.urls.health) || '') } });
+    const btnDiag = el('button', { class: 'btn btn--sm', type: 'button', text: '诊断日志', on: { click: () => openUrl((st.data && st.data.urls && st.data.urls.diag) || '') } });
     const subCard = el('div', { class: 'card section' }, [
       el('div', { class: 'card__head' }, [el('div', { class: 'card__title', text: '② 订阅地址' })]),
       el('div', { class: 'card__rows' }, [
         el('div', { class: 'row' }, [
           el('span', { class: 'muted nowrap', text: '播放器订阅' }),
           playlistText,
-          el('button', { class: 'btn btn--sm btn--primary', type: 'button', text: '复制', on: { click: () => ui.copy(playlistText.textContent, '已复制订阅地址') } }),
-          el('button', { class: 'btn btn--sm', type: 'button', text: '在浏览器打开', on: { click: () => openUrl(playlistText.textContent) } }),
+          btnCopy, btnOpenPlaylist,
         ]),
-        el('div', { class: 'row' }, [healthLink, diagLink]),
+        el('div', { class: 'row' }, [btnHealth, btnDiag]),
       ]),
       el('div', { class: 'muted', text: '在 TiviMate / APTV 等播放器里添加上面的 m3u 地址即可。手机 / 电视要拉流时，把 127.0.0.1 换成这台 Mac 的局域网 IP（脚本默认监听 0.0.0.0）。' }),
     ]);
@@ -133,7 +137,7 @@ export default {
       if (!s.installed) {
         missing.push(el('div', {}, [
           el('div', { text: `未找到直播脚本：${s.script}` }),
-          el('div', { class: 'muted', text: '把下载解压后的 ysp-live-v9.5 整个目录放到 MacKit 根目录（与 app/ 同级），然后点「刷新状态」。' }),
+          el('div', { class: 'muted', text: '把作者发布的 ysp-live-vX.Y 整个目录解压到 MacKit 根目录（与 app/ 同级，名字保持原样），然后点「刷新状态」。' }),
         ]));
       }
       if (!s.python.exists) {
@@ -186,11 +190,14 @@ export default {
       val.data.textContent = s.dataDir;
       val.log.textContent = s.logFile;
 
-      // 订阅地址
-      const url = (s.urls && s.urls.playlist) || '';
-      playlistText.textContent = url || '—';
-      healthLink.href = (s.urls && s.urls.health) || '#';
-      diagLink.href = (s.urls && s.urls.diag) || '#';
+      // 订阅地址：真实地址存进 playlistUrl（复制 / 打开都读它），界面上的 '—' 只是占位
+      playlistUrl = (s.urls && s.urls.playlist) || '';
+      playlistText.textContent = playlistUrl || '—';
+      // 地址本身与运行态无关（先复制存进播放器也合理），但「打开」只对跑着的实例有意义
+      btnCopy.disabled = !playlistUrl;
+      btnOpenPlaylist.disabled = !s.running;
+      btnHealth.disabled = !s.running;
+      btnDiag.disabled = !s.running;
 
       // 按钮
       btnStart.disabled = st.busy || s.running || !s.installed || !s.python.exists;
@@ -215,7 +222,7 @@ export default {
     }
 
     function openUrl(url) {
-      if (!url || url === '—') { ui.toast('warn', '服务未启动，暂无地址'); return; }
+      if (!url) { ui.toast('warn', '服务未启动，暂无该页面'); return; }
       window.open(url, '_blank', 'noopener');
     }
 
@@ -246,7 +253,11 @@ export default {
           logBox.textContent = text;
           if (atBottom) logBox.scrollTop = logBox.scrollHeight;
         }
-        if (showToast) ui.toast('ok', r.exists ? '日志已刷新' : '还没有日志（服务未启动过）');
+        if (showToast) {
+          if (r.text) ui.toast('ok', '日志已刷新');
+          else if (r.exists) ui.toast('warn', '日志文件是空的（服务还没写过东西）');
+          else ui.toast('warn', '还没有日志文件（服务还没启动过）');
+        }
       } catch (err) {
         if (showToast) ui.toast('err', err.message || '读取日志失败');
       }
@@ -274,8 +285,9 @@ export default {
       } catch { /* runTask 内部已 toast */ }
       finally {
         st.busy = false;
-        await refresh(false, true);
-        await refreshLogs(false);
+        // 成功路径由下面的 'done' 订阅强制刷新一次，这里不再重复请求；
+        // 失败路径（任务没提交成功）状态没变，只需把按钮解禁。
+        if (st.data) paint(st.data);
       }
     }
 

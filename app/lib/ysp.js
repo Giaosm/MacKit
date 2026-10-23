@@ -164,27 +164,25 @@ async function pidOwnedByUs(pid) {
 }
 
 /**
- * 读文件尾部（最多 LOG_TAIL_BYTES）。
+ * 读文件尾部（最多 LOG_TAIL_BYTES，避免把整个大文件读进内存）。
  * @param {string} file
- * @returns {{text:string, size:number, truncated:boolean}|null}
+ * @returns {string|null} 文本；文件不存在 / 读不了 → null
  */
 function readTail(file) {
   let fd = null;
   try {
-    const st = fs.statSync(file);
-    const start = Math.max(0, st.size - LOG_TAIL_BYTES);
-    const len = st.size - start;
-    if (len <= 0) return { text: '', size: st.size, truncated: false };
+    const { size } = fs.statSync(file);
+    const start = Math.max(0, size - LOG_TAIL_BYTES);
+    const len = size - start;
+    if (len <= 0) return '';
     const buf = Buffer.alloc(len);
     fd = fs.openSync(file, 'r');
     fs.readSync(fd, buf, 0, len, start);
-    let text = buf.toString('utf8');
+    const text = buf.toString('utf8');
+    if (start === 0) return text;
     // 从中间截断会切在多字节字符 / 半行上：丢掉第一段残行，避免日志开头出现半截乱码
-    if (start > 0) {
-      const nl = text.indexOf('\n');
-      text = nl >= 0 ? text.slice(nl + 1) : '';
-    }
-    return { text, size: st.size, truncated: start > 0 };
+    const nl = text.indexOf('\n');
+    return nl >= 0 ? text.slice(nl + 1) : '';
   } catch { return null; }
   finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } } }
 }
@@ -196,15 +194,15 @@ function readTail(file) {
  * @param {string} text
  */
 function stripAnsi(text) {
-  // eslint-disable-next-line no-control-regex
+  // 字符类里就是 ESC（\u001b）：本仓库没有引入 eslint，这里的正则是有意为之
   return String(text || '').replace(/\u001b\[[0-9;]*m/g, '');
 }
 
 /** 日志尾部若干行（失败详情用）。 */
 function tailText(lines = 20) {
-  const t = readTail(paths.YSP_LOG);
-  if (!t || !t.text) return '';
-  return stripAnsi(t.text).split(/\r?\n/).filter(Boolean).slice(-lines).join('\n');
+  const text = readTail(paths.YSP_LOG);
+  if (!text) return '';
+  return stripAnsi(text).split(/\r?\n/).filter(Boolean).slice(-lines).join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -255,16 +253,19 @@ function startStep() {
       }
       ctx.log('info', `脚本：${loc.script}${loc.version ? `（v${loc.version}）` : ''}`);
       if (loc.others.length) ctx.log('info', `同时存在旧版本目录（已忽略）：${loc.others.join('、')}`);
-      // 已在运行：可能是上一轮 MacKit 拉起的（状态文件还在），也可能只是端口被占。
-      // 这里必须核对 pid 归属：pid 被复用时会误判成「我们的服务还在跑」。
+      // 已在运行？一次探测同时区分「是我们的实例」与「端口被别人占着」：
+      //   · 状态文件里的 pid 必须核对归属（pid 会被系统复用，不能只凭 alive 就认定是我们的）；
+      //   · 只探测一次 —— 记录里的端口与固定端口是同一个，分两次 probe 纯属重复。
       const prev = readState();
-      if (prev && await pidOwnedByUs(prev.pid) && await probeHealth(prev.port)) {
-        ctx.log('warn', `服务已在运行（pid ${prev.pid}），无需重复启动`);
-        throw new AppError(ERR.SKIP, '服务已在运行');
-      }
-      if (await probeHealth(paths.YSP_PORT)) {
-        ctx.log('warn', `端口 ${paths.YSP_PORT} 上已有服务在响应，未重复启动（可能是你手动运行的实例）`);
-        throw new AppError(ERR.SKIP, `端口 ${paths.YSP_PORT} 已被占用`);
+      const probePort = prev ? prev.port : paths.YSP_PORT;
+      if (await probeHealth(probePort)) {
+        const ours = prev ? await pidOwnedByUs(prev.pid) : false;
+        if (ours) {
+          ctx.log('warn', `服务已在运行（pid ${prev.pid}），无需重复启动`);
+          throw new AppError(ERR.SKIP, '服务已在运行');
+        }
+        ctx.log('warn', `端口 ${probePort} 上已有服务在响应，未重复启动（可能是你手动运行的实例）`);
+        throw new AppError(ERR.SKIP, `端口 ${probePort} 已被占用`);
       }
       const py = await probePython();
       if (!py.ok) {
@@ -449,24 +450,17 @@ async function status(params) {
 
 /**
  * GET /api/ysp/logs?lines=N
- * @param {{lines?:number}} [params]
+ * @param {{lines?:number}} [params] 要最后几行（20~500，默认 120）
+ * @returns {{exists:boolean, file:string, text:string}} 只回文本 + 文件是否存在，
+ *   足够界面区分「没启动过」与「有日志」
  */
 function logs(params) {
   const want = Number(params && params.lines);
   const lines = Number.isInteger(want) ? Math.min(Math.max(want, 20), 500) : 120;
-  const tail = readTail(paths.YSP_LOG);
-  if (!tail) {
-    return { exists: false, file: paths.YSP_LOG, text: '', lines: 0, size: 0, truncated: false };
-  }
-  const all = stripAnsi(tail.text).split(/\r?\n/).filter((l) => l.length > 0);
-  return {
-    exists: true,
-    file: paths.YSP_LOG,
-    text: all.slice(-lines).join('\n'),
-    lines: all.length,
-    size: tail.size,
-    truncated: tail.truncated || all.length > lines,
-  };
+  const text = readTail(paths.YSP_LOG);
+  if (!text) return { exists: false, file: paths.YSP_LOG, text: '' };
+  const all = stripAnsi(text).split(/\r?\n/).filter((l) => l.length > 0);
+  return { exists: true, file: paths.YSP_LOG, text: all.slice(-lines).join('\n') };
 }
 
 export default {
