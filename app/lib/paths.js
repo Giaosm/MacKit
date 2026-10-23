@@ -129,6 +129,110 @@ export const REPO_DIR = path.resolve(APP_DIR, '..');
 export const GIT_DIR = path.join(REPO_DIR, '.git');
 
 // ---------------------------------------------------------------------------
+// 央视频直播（ysp-live，第三方 Python 脚本）
+// ---------------------------------------------------------------------------
+/**
+ * 脚本目录的**兜底约定**（仓库根下的 `ysp-live-v9.5/`）。
+ *
+ * ★ 这个目录由**用户自己**下载解压后放进 MacKit 根目录，本仓库不分发脚本本体
+ *   （作者在 README 里明确「其他任何分发渠道均非作者本人」）。所以路径是「约定位置」，
+ *   找不到时模块给出明确提示，而不是把 3500 行第三方脚本塞进仓库。
+ * ★ 真正使用的目录由 {@link findYspDist} 发现：作者每次发版都会改版本号（v9.5 → v9.6 …），
+ *   把目录名写死意味着每次升级都要改代码。这里的常量只在「什么都没发现」时用于报错文案。
+ */
+const YSP_DIR_DEFAULT = path.join(REPO_DIR, 'ysp-live-v9.5');
+/** 服务端口（脚本默认值；改这里要同步 README 与前端文案） */
+export const YSP_PORT = 8767;
+/** 数据持久化目录：放 ~/.mackit 下，不污染脚本目录（脚本默认会写在自己旁边） */
+export const YSP_DATA_DIR = path.join(MACKIT_DIR, 'ysp-data');
+/** 服务日志（stdout+stderr 追加写；与 server.out 同思路） */
+export const YSP_LOG = path.join(MACKIT_DIR, 'ysp.log');
+/** 运行态：{ pid, port, startedAt }（用于停止 / 判断是否由本应用拉起） */
+export const YSP_STATE_JSON = path.join(MACKIT_DIR, 'ysp.json');
+
+/**
+ * 目录名 → 版本号。只认「ysp-live[-任意词]-vX[.Y[.Z]]」形状，取**末尾**那个 vX.Y。
+ *   ysp-live-v9.5        → 9.5
+ *   ysp-live-v9.10       → 9.10（按数值比，不是字符串）
+ *   ysp-live-2026-v10.2  → 10.2
+ * @param {string} name
+ * @returns {{text:string, segs:number[]}|null}
+ */
+function parseYspVersion(name) {
+  const m = /^ysp-live-.*v(\d+(?:\.\d+)*)$/i.exec(name);
+  if (!m) return null;
+  return { text: m[1], segs: m[1].split('.').map((v) => Number.parseInt(v, 10) || 0) };
+}
+
+/** 逐段按数值比较版本号（缺段视为 0）：a>b 返回正数。 */
+function compareYspVersion(a, b) {
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i += 1) {
+    const d = (a[i] || 0) - (b[i] || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/** 在目录里找出主脚本（优先 `ysp-live*.py`；只有唯一一个 .py 时也认）。 */
+function findYspScript(dir) {
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  const pys = names.filter((n) => !n.startsWith('.') && n.toLowerCase().endsWith('.py'));
+  const main = pys.find((n) => /^ysp-live/i.test(n)) || (pys.length === 1 ? pys[0] : null);
+  return main ? path.join(dir, main) : null;
+}
+
+/**
+ * 发现「当前该用哪份 ysp-live 脚本」。
+ *
+ * 规则：扫 `REPO_DIR` 下所有 `ysp-live-vX.Y/`，**版本号最大者胜**（同版本取目录 mtime 新的），
+ * 且该目录里必须真的有 .py 主脚本 —— 这样用户升级时直接把新目录丢进来即可，
+ * 旧目录留着也不会被选中，不必改任何代码。
+ * 排除名字带 `docker` 的目录：那是作者的 Docker 发行版（用 compose 跑），不是本机直跑的那份。
+ *
+ * @returns {{dir:string, script:string, version:string, found:boolean, others:string[]}}
+ *   found=false 时 dir/script 回落到约定位置，仅用于「未找到」的提示文案。
+ */
+export function findYspDist() {
+  /** @type {{dir:string, script:string, version:string, segs:number[], mtime:number}[]} */
+  const found = [];
+  let entries = [];
+  try { entries = fs.readdirSync(REPO_DIR, { withFileTypes: true }); } catch { entries = []; }
+  for (const e of entries) {
+    if (!e.isDirectory() || !e.name.toLowerCase().startsWith('ysp-live')) continue;
+    if (e.name.toLowerCase().includes('docker')) continue;
+    const ver = parseYspVersion(e.name);
+    if (!ver) continue;
+    const dir = path.join(REPO_DIR, e.name);
+    const script = findYspScript(dir);
+    if (!script) continue;   // 目录在但没脚本（只解压了一半 / 只有引擎文件）→ 跳过
+    let mtime = 0;
+    try { mtime = fs.statSync(dir).mtimeMs; } catch { /* ignore */ }
+    found.push({ dir, script, version: ver.text, segs: ver.segs, mtime });
+  }
+  found.sort((a, b) => compareYspVersion(b.segs, a.segs) || b.mtime - a.mtime);
+
+  if (found.length > 0) {
+    const best = found[0];
+    return {
+      dir: best.dir,
+      script: best.script,
+      version: best.version,
+      found: true,
+      others: found.slice(1).map((x) => path.basename(x.dir)),
+    };
+  }
+  return {
+    dir: YSP_DIR_DEFAULT,
+    script: path.join(YSP_DIR_DEFAULT, 'ysp-live-v9.5.py'),
+    version: '',
+    found: false,
+    others: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 可执行文件路径探测
 //
 // 说明：这里只做「存在性探测」并给出确定路径；真正的子进程调用在 lib/exec.js。
@@ -263,10 +367,27 @@ export const SIPS_BIN = firstExisting(['/usr/bin/sips'], '/usr/bin/sips');
 /** plutil：读 .app 的 Info.plist（Homebrew 管家判断 auto_updates 应用的真实已装版本；只读）。 */
 export const PLUTIL_BIN = firstExisting(['/usr/bin/plutil'], '/usr/bin/plutil');
 /**
+ * ps：只读查看进程命令行。
+ * 唯一用途是央视频直播模块核对「运行态里记的 pid 还是不是那个 Python 脚本」——
+ * pid 会被系统复用（重启电脑后尤其常见），不核对就发信号可能误杀别人整组进程。
+ */
+export const PS_BIN = firstExisting(['/bin/ps', '/usr/bin/ps'], '/bin/ps');
+/**
  * bash 可执行文件：仅用于执行 Homebrew 官方安装脚本（install.sh 需要 bash 解释器）。
  * 以绝对路径形式登记在 exec.js 的 ABSOLUTE_ALLOWED 中，不允许其他用途。
  */
 export const BASH_BIN = firstExisting(['/bin/bash', '/usr/local/bin/bash'], '/bin/bash');
+/**
+ * python3：央视频直播脚本的解释器。
+ *
+ * 探测顺序：Homebrew（Apple Silicon / Intel）→ 系统自带 `/usr/bin/python3`（随 Xcode CLT 安装）。
+ * ★ 系统那个 shim 在未装 CLT 时存在但一执行就报错，所以「文件存在」不等于可用 ——
+ *   模块启动前会真跑一次 `python3 --version` 自检，失败时给出安装指引。
+ */
+export const PYTHON3_BIN = firstExisting(
+  [`${BREW_PREFIX}/bin/python3`, '/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3'],
+  '/usr/bin/python3'
+);
 /**
  * node 可执行文件：启动器优先 /opt/homebrew/bin/node，
  * 代码内自引用则回落到当前进程的 execPath。

@@ -2,7 +2,7 @@
  * MacKit · 执行层（唯一子进程出口）
  *
  *   - 一律 spawn(bin, argsArray, { shell:false })：绝不启用 shell 选项、绝不拼接命令行字符串
- *   - 命令白名单：brew / git / xattr / security / osascript / curl / node / npm / pnpm
+ *   - 命令白名单：brew / git / xattr / security / osascript / curl / node / npm / pnpm / python3 / ps
  *     （+ 绝对路径的 Squirrel）
  *   - 环境变量注入：代理（channel）与 Homebrew 镜像源；PATH 完全固定（不继承宿主）
  *   - 流式 stdout/stderr 逐行回调、超时、AbortSignal 取消（SIGTERM→3s→SIGKILL）
@@ -115,6 +115,13 @@ const BIN_MAP = Object.freeze({
   node: paths.NODE_BIN,
   npm: paths.NPM_BIN,
   pnpm: paths.PNPM_BIN,
+  // ★ 2026-10-23 重新引入：央视频直播（lib/ysp.js）要跑第三方 Python 脚本。
+  //   与当初为「音乐下载」放开的 `~/.mackit/py/**` 前缀 / 解释器文件名两条放宽不同：
+  //   这里只认这一个**固定路径**，参数由模块侧给定（脚本路径 + 端口 + --data-dir），
+  //   没有任何一段来自 HTTP 入参，攻击面等价于其它固定命令。
+  python3: paths.PYTHON3_BIN,
+  // 只读查看进程命令行（ysp 模块核对 pid 归属用，见 lib/ysp.js 的 pidOwnedByUs）
+  ps: paths.PS_BIN,
 });
 
 /**
@@ -199,6 +206,42 @@ export function hasLiveChildren() {
   return LIVE_CHILDREN.size > 0;
 }
 
+/**
+ * pid 是否还活着（signal 0 只探测存在性，不真的发信号）。
+ *
+ * 供「脱离父子关系」的常驻服务用（见 {@link spawnDetached}）：这类进程不在
+ * LIVE_CHILDREN 里，只能靠 pid 判断存活。
+ *
+ * @param {number} pid
+ * @returns {boolean}
+ */
+export function isPidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 1) return false;
+  try { process.kill(n, 0); return true; } catch (err) {
+    // EPERM = 进程存在但属于别的用户（本应用只启自己的进程，按存活处理更安全：
+    // 宁可报「还在运行」，也不要误判成已退出而再拉一个实例抢端口）
+    return !!(err && err.code === 'EPERM');
+  }
+}
+
+/**
+ * 给**进程组**（spawn 时 detached:true → 该 pid 即组长）发信号，组长不存在时退回单进程。
+ *
+ * 与 `run()` 内部的 killTree 同款语义，区别只是这里的目标不是本进程的子进程句柄 ——
+ * 常驻服务用 spawnDetached 起、父进程可能已经重启过，手里只剩 pid。
+ *
+ * @param {number} pid
+ * @param {NodeJS.Signals} [signal='SIGTERM']
+ * @returns {boolean} 是否成功发出（进程已退出一律 false）
+ */
+export function killPid(pid, signal = 'SIGTERM') {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 1) return false;
+  try { process.kill(-n, signal); return true; } catch { /* 不是进程组组长 / 组已空 */ }
+  try { process.kill(n, signal); return true; } catch { return false; }
+}
+
 // ---------------------------------------------------------------------------
 // 解析与校验
 // ---------------------------------------------------------------------------
@@ -213,6 +256,7 @@ export function hasLiveChildren() {
  *   ② 解释器文件名放行（`python3` / `python3.12` 只要落在受信任目录内即可）。
  *   现在全项目的可执行只可能是 BIN_MAP 的键或 ABSOLUTE_ALLOWED 里的绝对路径，
  *   没有任何一条来自 HTTP 入参 / 配置 / 任务 params —— 攻击面比之前更小。
+ * ★ 2026-10-23：python3 以**固定路径**回到 BIN_MAP（央视频直播模块），上面两条放宽层仍然没有恢复。
  *
  * @param {string} name 逻辑名（brew/git/...）或允许的绝对路径
  * @returns {string} 实际可执行文件路径

@@ -352,6 +352,15 @@ const QUERY_ROUTES = Object.freeze([
   // 扫描 /Applications：有可见副作用的 GET（一轮几十个子进程、数秒），必须由界面发起 ——
   // 跨站 `<img src>` 这类不带 Origin 的子资源请求不得触发它（否则任意网页可反复打满 syspolicyd）。
   { path: '/api/unseal/scan', module: 'unseal', query: 'scan', guard: '扫描应用' },
+  // 央视频直播（托管 ysp-live 脚本：起停走任务流，状态与日志走只读查询）
+  {
+    path: '/api/ysp/status', module: 'ysp', query: 'status',
+    params: (url) => ({ force: url.searchParams.get('force') === '1' }),
+  },
+  {
+    path: '/api/ysp/logs', module: 'ysp', query: 'logs',
+    params: (url) => ({ lines: Number(url.searchParams.get('lines')) || 120 }),
+  },
   // 备份中心
   { path: '/api/webdav/backups', module: 'backup', query: 'webdavList' },
 ]);

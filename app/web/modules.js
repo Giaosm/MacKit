@@ -66,6 +66,16 @@ export const MODULES = Object.freeze([
     channel: false,
   },
   {
+    // 央视频直播：托管第三方脚本 ysp-live-v9.5（Python），自身不联网、无通道档位 ——
+    // 联网行为全部发生在那个常驻服务里，MacKit 只负责起停与展示。
+    id: 'ysp',
+    title: '央视频直播',
+    icon: 'tv',
+    view: './views/ysp.js',
+    backend: 'ysp.js',
+    channel: false,
+  },
+  {
     id: 'backup',          // 后端注册表键与 runTask('backup', …) 用这个
     viewId: 'backups',     // 前端路由 #/backups
     title: '备份中心',
