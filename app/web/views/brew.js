@@ -35,7 +35,7 @@ export default {
     const tabsBox = el('div', { class: 'toolbar' });
     const panelBox = el('div');
 
-    // 体检反馈：右上角「上次体检 时间」+ 按钮忙碌态。
+    // 体检反馈：右上角「环境体检 时间」+ 按钮忙碌态（时间取自后端快照的 checkedAt，不是 now）。
     // 修复「点了没反应」：刷新前后卡片数值往往完全一致，若不给任何可见反馈，用户会以为按钮失效。
     const envMeta = el('span', { class: 'view-head__meta' });
     // 「元数据同步于 X」：brew 元数据是「可更新」判定的真相来源，它只由 `brew update` 刷新
@@ -168,7 +168,10 @@ export default {
         env = await ctx.refreshEnv(force);
         renderEnv();
         const b = env.brew || {};
-        envMeta.textContent = `上次体检 ${ctx.fmtTime(Date.now())}`;
+        // ⚠ 用后端快照里的 checkedAt，别用 Date.now()（2026-10-25 修）：
+        //   体检有 30s 缓存，用 now 会把「命中缓存的那次请求时间」当成体检时间 ——
+        //   页面一刷新时间就变，和下面的「可更新检查」永远是两个对不上的数字。
+        envMeta.textContent = `环境体检 ${env.checkedAt ? ctx.fmtTime(env.checkedAt) : '—'}`;
         if (force) ui.toast('ok', `体检完成 · 可更新 ${(b.outdatedFormula || 0) + (b.outdatedCask || 0)} 项`);
       } catch (err) {
         // ctx.refreshEnv 内部已 toast 报错，这里只补卡片区的错误块，避免重复弹窗
@@ -330,11 +333,22 @@ export default {
         const total = data.counts.formula + data.counts.cask;
         if (total === 0) {
           listHost.append(ui.card('可更新项', ui.empty({
-            icon: '🎉', title: '所有 Homebrew 软件包均为最新，无需更新',
-            text: `Formula ${data.counts.formula} 项 · Cask ${data.counts.cask} 项　　上次检查：${data.checkedAt ? ctx.fmtDateTime(data.checkedAt) : '—'}`,
+            icon: '🎉', title: '本列表中暂无可升级项',
+            // 措辞不再说「所有软件包均为最新」（2026-10-25 修）：本列表是**纠偏后**的口径，
+            // 与顶部总览的 brew 原始计数可能不同，绝对化的断言会和那张卡直接打架。
+            text: `Formula ${data.counts.formula} 项 · Cask ${data.counts.cask} 项　　可更新检查：${data.checkedAt ? ctx.fmtDateTime(data.checkedAt) : '—'}`,
             // 这里原先还有一个「重新检查」按钮：与正上方工具条的按钮同名同功能，
             // 两处并存只会让用户分不清各自做什么（2026-09-21 去掉重复入口，说明文字里已给出时间）。
           })));
+          // 顶部总览（体检口径）与这里（纠偏口径）数字不一致时，把原因摊开说清楚，
+          // 否则用户只会看到「明明写着可更新 1 项，下面却说没有」。
+          const envOutdated = env && env.brew ? (env.brew.outdatedFormula || 0) + (env.brew.outdatedCask || 0) : 0;
+          if (envOutdated > 0) {
+            listHost.append(el('div', {
+              class: 'muted section',
+              text: `顶部「可更新 ${envOutdated} 项」来自环境体检的 brew 原始口径；本列表按应用真实版本纠偏后为 0 项 —— 常见原因：应用已自更新到位（brew 记账滞后）、或那几项本机版本已不低于 cask（再装等于降级）。`,
+            }));
+          }
           const emptyAc = upstreamCard();
           if (emptyAc) listHost.append(emptyAc);
           renderSummary();

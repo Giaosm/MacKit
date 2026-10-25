@@ -72,7 +72,7 @@ export default {
       e = e || {};   // API 返回 undefined 时不能整卡抛错（会被 emit 的 try/catch 吞掉，页面永久停在「正在体检…」）
       grid.innerHTML = '';
       const b = e.brew || {}, n = e.network || {}, sh = e.shell || {}, rm = e.rime || {}, g = e.git || {}, m = e.mirror || {}, pp = e.proxyPorts || {};
-      envCheckedAt.textContent = e.checkedAt ? `上次检查 ${ctx.fmtTime(e.checkedAt)}` : '';
+      envCheckedAt.textContent = e.checkedAt ? `环境体检 ${ctx.fmtTime(e.checkedAt)}` : '';
 
       // Homebrew
       const outdated = (b.outdatedFormula || 0) + (b.outdatedCask || 0);
@@ -144,8 +144,10 @@ export default {
       envCheckedAt.textContent = '正在体检…';
       try {
         // refreshEnv 内部 emit('env') → 下面的订阅会渲染网格，这里不再显式 render()（避免重复渲染）
-        await ctx.refreshEnv(force);
-        envCheckedAt.textContent = `上次体检 ${ctx.fmtTime(Date.now())}`;
+        const e = await ctx.refreshEnv(force);
+        // ★ 用快照里的 checkedAt（2026-10-25 修，与 Homebrew 管家同步）：体检有 30s 缓存，
+        //   用 Date.now() 会把「请求返回的时刻」当成体检时间 —— 刷新一次页面数字就变，看着像刚体检过。
+        envCheckedAt.textContent = e && e.checkedAt ? `环境体检 ${ctx.fmtTime(e.checkedAt)}` : '';
       } catch (err) {
         grid.innerHTML = '';
         grid.append(el('div', { class: 'err-box', text: `体检失败：${err.message || err}` }));

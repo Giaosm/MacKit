@@ -13,7 +13,7 @@ import path from 'node:path';
 
 import * as exec from './exec.js';
 import { bareChannel, policyForHost, policyForUrl, resolvePolicy } from './netpolicy.js';
-import { compare, parseStrict, samePrefix, sameVersion } from './version.js';
+import { compare, samePrefix, sameVersion, segments } from './version.js';
 
 /**
  * 兜底通道策略：URL 按主机名、裸字符串按主机判，再套 brew 模块档位。
@@ -84,6 +84,79 @@ export function readAppVersionCached(appTarget, cache) {
   return p;
 }
 
+/** 该段是否纯数字（build 号那类：`39217423`）。 */
+const isNumericSeg = (s) => /^\d+$/.test(s);
+
+/**
+ * 版本串拆成「语义三段」+「尾部」。
+ * 尾部 = 第 4 段起的内容，可能是 build 号（`4.12.1.39217423`）也可能是预发布标记（`0.2.1-rc.2`）。
+ * @param {string[]} segs {@link segments} 的结果
+ * @returns {{core:number[]|null, tail:string[]}} core=null → 前三段里出现非数字，调用方走兜底
+ */
+function splitRelease(segs) {
+  const core = [];
+  for (let i = 0; i < 3; i += 1) {
+    const s = segs[i];
+    if (s === undefined) { core.push(0); continue; }
+    if (!isNumericSeg(s)) return { core: null, tail: [] };
+    core.push(Number(s));
+  }
+  return { core, tail: segs.slice(3) };
+}
+
+/** 尾部逐段比较（数字按数值、其余按字典序；缺段更小，即 `rc` < `rc.1`）。 */
+function compareTail(a, b) {
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i += 1) {
+    const x = a[i];
+    const y = b[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (isNumericSeg(x) && isNumericSeg(y)) {
+      const d = Number(x) - Number(y);
+      if (d !== 0) return d > 0 ? 1 : -1;
+    } else if (x !== y) {
+      return x > y ? 1 : -1;
+    }
+  }
+  return 0;
+}
+
+/**
+ * 「应用版本」相对「cask 版本」的新旧 —— 专门处理 build 后缀与**预发布标记**。
+ *
+ * 判定表（前三个语义段相同的前提下）：
+ *   · 两边都没尾巴                      → 0（同一版）
+ *   · 应用没尾巴、cask 有（build 或 rc） → 0（正式版不比同核心的 cask 旧；升级只会降级）
+ *   · 应用有尾巴、cask 没：
+ *       - 尾巴全数字                     → 1（`4.12.1.1` 比 `4.12.1` 新）
+ *       - 带预发布标记                   → -1（`4.12.1-rc.1` 比 `4.12.1` 旧 → 该升级）
+ *   · 两边都有尾巴                      → 逐段比（`rc.2` < `rc.3` → 该升级）
+ * 前三段不同则直接按数值比大小（缺段按 0），所以 `1.2` vs `1.2.5` 判「更旧」。
+ *
+ * ★ 与 {@link compare} 的区别：通用 compare 把「缺段」一律当更小，于是
+ *   `0.2.1` vs `0.2.1-rc.1` 会得出「正式版更旧」→ 误触发降级升级。这里按语义单独处理。
+ *
+ * @param {unknown} appVer 应用 CFBundleShortVersionString
+ * @param {unknown} caskVer cask 的 version
+ * @returns {number} 1 应用更新 / 0 同一版 / -1 应用更旧
+ */
+function compareRelease(appVer, caskVer) {
+  const A = splitRelease(segments(appVer));
+  const B = splitRelease(segments(caskVer));
+  if (!A.core || !B.core) {
+    // 前三段里有非数字（极少见）→ 退回通用比较；解析不出来也别谎报「同一版」
+    if (sameVersion(appVer, caskVer)) return 0;
+    return compare(appVer, caskVer) > 0 ? 1 : -1;
+  }
+  for (let i = 0; i < 3; i += 1) {
+    if (A.core[i] !== B.core[i]) return A.core[i] > B.core[i] ? 1 : -1;
+  }
+  if (A.tail.length === 0) return 0;                    // 应用是正式版（或只差 build）
+  if (B.tail.length === 0) return A.tail.every(isNumericSeg) ? 1 : -1;
+  return compareTail(A.tail, B.tail);
+}
+
 /**
  * 应用是否**已经就是** cask 记录的那一版 —— 据此剔除 brew 的假阳性（「应用早自更新到位、
  * 只是 brew 记账没跟上」）。
@@ -115,18 +188,15 @@ export function sameAsCask(appShort, appBuild, caskVer) {
   //   要求「短版本是逗号前那截的前缀」+「build 与逗号后那截完全相等」双条件：
   //   对 wechat 成立、对真落后的旧版本（build 270100 ≠ 270102）不成立 → 不漏报。
   if (buildSeg && build && build === buildSeg && samePrefix(short, ver)) return true;
-  // 约定 C：应用没有可用的 build 号（或与短版本相同）→ 只能按短版本判定。两步判，兼顾不误吞与不误报：
-  //   ① **前三段相同**即同一版：cask 常把发布号拼在补丁号之后（codebuddy-cn 是
-  //      `4.12.1.39217423,757a5b2f`，而应用只有 4.12.1）→ 差异只是 build 元数据。
-  //      这条同时覆盖「应用段数更多」（应用其实更新）→ 隐藏即避免降级，方向是安全的。
-  //   ② 前三段判不出来（应用如 `1.2` 只有两段、没有补丁号）时，退回 {@link sameVersion}
-  //      的**完整相等**判定（容忍尾部补零）→ `1.2` vs `1.2.5` 不相等 → 照常列出升级。
+  // 约定 C：应用没有可用的 build 号（或与短版本相同）→ 只能按短版本判定。
+  //   ★ 2026-10-25 修：这里曾经「前三段数字相同就判同一版」，用 parseStrict 截断在补丁号，
+  //     于是 `0.2.1-rc.2`（应用）与 `0.2.1-rc.3`（cask）都被截成 [0,2,1] → 判成「已是最新」
+  //     → 真落后的预发布版被静默吞掉（实测 deepseek-harness：brew 三种口径都报 outdated，
+  //     管家页却 0 项，总览的「可更新 1 项」永远降不下来）。现在交给 compareRelease：
+  //     语义三段 + 尾部（build / 预发布）分开判，见该函数。
   // 有独立 build 但逗号后为空的情况下刻意**不**判定相等（宁可多提，不可漏报）。
   if (!build || build === short) {
-    const a = parseStrict(short);
-    const b = parseStrict(ver);
-    if (a && b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2]) return true;
-    if (sameVersion(short, ver)) return true;
+    if (compareRelease(short, ver) >= 0) return true;   // 同一版，或应用反而更新（升级会降级）
   }
   return false;
 }

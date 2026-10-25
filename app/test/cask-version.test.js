@@ -37,6 +37,21 @@ test('sameAsCask：不误报（同一版要判等，否则 brew 升级会降级�
   assert.equal(sameAsCask('', '', '1.0'), false);               // 读不到应用版本 → 不判定为「同一版」
 });
 
+test('sameAsCask：预发布后缀必须参与比较（2026-10-25 漏报）', () => {
+  // 实测 deepseek-harness：应用 0.2.1-rc.2、cask 0.2.1-rc.3，brew 三种口径都报 outdated，
+  // 但旧实现用 parseStrict 把两边都截成 [0,2,1] → 判成「已是最新」→ 永远列不出来。
+  assert.equal(sameAsCask('0.2.1-rc.2', '0.2.1-rc.2', '0.2.1-rc.3'), false);  // 真落后 → 必须列出
+  assert.equal(sameAsCask('0.2.1-rc.3', '0.2.1-rc.3', '0.2.1-rc.3'), true);   // 已是这一版 → 不列
+  assert.equal(sameAsCask('0.2.1-rc.4', '0.2.1-rc.4', '0.2.1-rc.3'), true);   // 应用更新 → 不列（避免降级）
+  // 正式版 vs 同核心的预发布：正式版更新，不该被 brew 降级到 rc
+  assert.equal(sameAsCask('0.2.1', '0.2.1', '0.2.1-rc.3'), true);
+  // 应用是预发布、cask 是正式版 → 应用更旧 → 列出升级
+  assert.equal(sameAsCask('0.2.1-rc.1', '0.2.1-rc.1', '0.2.1'), false);
+  // 复现「前三段相同但第 4 段数字不同」的通用情形
+  assert.equal(sameAsCask('1.0.0.5', '1.0.0.5', '1.0.0.9'), false);
+  assert.equal(sameAsCask('1.0.0.9', '1.0.0.9', '1.0.0.5'), true);
+});
+
 test('githubRepoFromCaskUrl：只认 releases 路径', () => {
   assert.equal(githubRepoFromCaskUrl('https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.5.7/x.dmg'), 'clash-verge-rev/clash-verge-rev');
   assert.equal(githubRepoFromCaskUrl('https://inputsource.pro/stable/Input%20Source%20Pro%202.13.1.dmg'), null);
