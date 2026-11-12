@@ -396,11 +396,48 @@ function applyMirrorEnv(env, mirror) {
 }
 
 /**
+ * 让 **git 的 `http.proxy`** 跟随本层的通道结论。
+ *
+ * ★ 为什么光注入环境变量不够（2026-11-12 实测）：git 的 `http.proxy` 配置优先级**高于**
+ *   `http_proxy` 环境变量。用户换了代理客户端（Clash 7897 → v2rayN 10808）后，全局配置里
+ *   那个死端口会把这里注入的端口整个顶掉 —— 自更新的 fetch 在「直连 / 代理」两条通道上
+ *   撞到同一个 7897，两次报错一字不差，看起来像网络问题而不是配置问题。
+ *
+ * ★ 用 `GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n`（等价命令行 `-c`）：
+ *   只作用于本次子进程、不落盘、优先级最高。实测两种取值语义：
+ *     · 空值 `http.proxy=` → **禁用**代理（即使环境变量指向别的端口也照样直连）；
+ *     · 非空值 → 即使环境变量指向别的端口，也以它为准。
+ *
+ * ★ **只在调用方显式给了 channel 时才覆盖**：`git config --get/set` 这类管理命令不带
+ *   channel，必须读到用户真实配置，否则「系统初始化」里的 Git 全局代理会显示成空，
+ *   保存时还会把真实值判断成「未变更」。
+ *
+ * @param {Record<string,string>} env
+ * @param {'direct'|'proxy'|undefined} channel
+ * @param {{httpPort:number, scheme?:'http'|'socks5h'}} cfg
+ */
+function applyGitProxyEnv(env, channel, cfg) {
+  if (channel !== 'direct' && channel !== 'proxy') return;
+  // 用户/上层可能已注入过同名前缀的变量，先清干净再写，避免 COUNT 与实际条目对不上
+  for (const k of Object.keys(env)) {
+    if (/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(k)) delete env[k];
+  }
+  const url = channel === 'proxy' ? paths.proxyUrl(cfg.httpPort, cfg.scheme) : '';
+  const keys = ['http.proxy', 'https.proxy'];
+  env.GIT_CONFIG_COUNT = String(keys.length);
+  keys.forEach((k, i) => {
+    env[`GIT_CONFIG_KEY_${i}`] = k;
+    env[`GIT_CONFIG_VALUE_${i}`] = url;
+  });
+}
+
+/**
  * 构造子进程环境变量。
  * @param {{env?:Record<string,string>, channel?:('direct'|'proxy'), mirror?:string, noMirror?:boolean}} opts
+ * @param {string} [bin] 逻辑命令名（git 需要额外覆盖 http.proxy，见 applyGitProxyEnv）
  * @returns {Record<string,string>}
  */
-function buildEnv(opts) {
+function buildEnv(opts, bin) {
   /** @type {Record<string,string>} */
   const env = {};
   /**
@@ -442,6 +479,8 @@ function buildEnv(opts) {
     // 「直连 / 代理」两种语义就只对显式传 channel 的调用成立（历史上卸载 / cleanup /
     // git 读取等未传 channel 的路径确实会继承宿主代理）。
     applyProxyEnv(env, opts.channel === 'proxy' ? 'proxy' : 'direct', cfg);
+    // git 另需一遍「配置级」覆盖：它的 http.proxy 优先级高于上面这些环境变量
+    if (bin === 'git') applyGitProxyEnv(env, opts.channel, cfg);
   }
   // 显式追加的环境变量优先级最高
   if (opts.env) {
@@ -491,7 +530,7 @@ export async function run(bin, args, opts = {}) {
   if (opts.channel === 'proxy') {
     try { await proxyAuto.ensure(); } catch { /* 探测失败不影响命令本身 */ }
   }
-  const env = buildEnv(opts);
+  const env = buildEnv(opts, bin);
   const timeoutMs = typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0
     ? opts.timeoutMs
     : DEFAULT_TIMEOUT_MS;
@@ -690,7 +729,7 @@ export async function run(bin, args, opts = {}) {
 export function spawnStream(bin, args, opts = {}) {
   const binPath = resolveBin(bin);
   const argsArr = Array.isArray(args) ? args.slice() : [];
-  const env = buildEnv(opts);
+  const env = buildEnv(opts, bin);
   const timeoutMs = typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0
     ? opts.timeoutMs
     : DEFAULT_TIMEOUT_MS;

@@ -20,6 +20,7 @@ import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
 import * as git from './git.js';
+import * as proxyAuto from './proxy-auto.js';
 import { resolvePolicy } from './netpolicy.js';
 
 const { ERR, AppError } = exec;
@@ -274,9 +275,27 @@ function updateStep() {
       };
 
       ctx.log('info', '执行：git fetch --prune origin');
-      await ctx.exec.runWithChannel(resolvePolicy('selfupdate', 'proxy_first'), '拉取远端信息', 'git', ['fetch', '--prune', 'origin'], {
-        cwd: paths.REPO_DIR, noMirror: true, timeoutMs: UPDATE_FETCH_TIMEOUT_MS, onLine,
-      });
+      try {
+        await ctx.exec.runWithChannel(resolvePolicy('selfupdate', 'proxy_first'), '拉取远端信息', 'git', ['fetch', '--prune', 'origin'], {
+          cwd: paths.REPO_DIR, noMirror: true, timeoutMs: UPDATE_FETCH_TIMEOUT_MS, onLine,
+        });
+      } catch (err) {
+        // ★ 只贴 git 的 fatal 等于没提示（2026-11-12 实测）：全局配置里留着旧客户端的端口时，
+        //   直连 / 代理两条通道会撞同一个死端口，两次报错一字不差，看着像网络故障。
+        //   这里把「我们做了什么覆盖」和「你还能手动怎么走」一并写清楚。
+        const detail = String((err && (err.detail || err.message)) || '').trim();
+        ctx.log('warn', `拉取远端失败：${detail || '未知错误'}`);
+        const eff = proxyAuto.effectivePorts(store.readBrewgo());
+        if (eff.ok) {
+          const url = paths.proxyUrl(eff.httpPort, eff.scheme);
+          ctx.log('info', `本次已用 ${url} 覆盖 git 的 http.proxy（优先级高于全局配置，无需手动改）`);
+          ctx.log('warn', `仍失败可在终端手动重试：cd ${paths.REPO_DIR} && git -c http.proxy=${url} pull --ff-only`);
+        } else {
+          ctx.log('warn', '没有探测到可用的代理端口：请先确认代理客户端已启动（本应用会自动识别常见端口）');
+          ctx.log('info', '如果 git 全局配置里留着失效的代理，可执行：git config --global --unset http.proxy');
+        }
+        throw new AppError(ERR.CMD_FAILED, '拉取远端信息失败（网络或代理不通）', detail);
+      }
 
       const upstream = await upstreamRef(branch);
       const bRes = await repoGit(['rev-list', '--count', `HEAD..${upstream}`]);

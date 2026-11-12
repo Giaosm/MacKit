@@ -9,6 +9,8 @@
  * 隧道：向 `www.google.com:443` 发 **HTTP CONNECT**（拿到 200 才算 HTTP 代理），
  * 失败再试 **SOCKS5 握手**（成功则这个端口是纯 SOCKS5 代理，对应 `socks5h://`）。
  * 两种都失败 → 该端口记为不可用。
+ * ★ 握手成功之后还要在隧道里**真跑一次 TLS**：客户端上游断了的时候端口照样 accept、
+ *   CONNECT 照样回 200，紧接着就 reset —— 只看状态码会把死代理当成可用（见 verifyTlsThrough）。
  *
  * ★ 顺序永远「配置端口优先」：配置可用时行为与之前完全一致，不会凭空改道。
  * ★ 只改**本进程内**的生效端口，不写 `~/.brewgo_config` —— 那是用户与 brewgo 共用的配置，
@@ -24,6 +26,7 @@
  */
 
 import net from 'node:net';
+import tls from 'node:tls';
 
 import * as paths from './paths.js';
 import * as store from './store.js';
@@ -103,26 +106,66 @@ function withSocket(port, timeoutMs, onConnect) {
 }
 
 /**
- * 用 HTTP CONNECT 探一次：能拿到 200 说明该端口能当 HTTP 代理。
+ * 「隧道建起来了」之后，再确认它**真的能过数据**。
+ *
+ * ★ 为什么不能只看握手成功（2026-11-12 实测踩到）：代理客户端的进程还在、端口也 accept，
+ *   但上游（订阅节点）已经断了 —— 此时它对 CONNECT 照样回 `200 Connection established`，
+ *   紧接着把隧道 reset 掉。只看状态码就会把它当成可用端口，自动切换把整条通道切过去，
+ *   结果所有联网动作全废（而当时**直连反而是通的**）。真相只有真过一次数据才知道：
+ *   在隧道里做一次 TLS 握手，能拿到 ServerHello 才算通。
+ *
+ * ★ 不校验证书（rejectUnauthorized:false）：这里只测「通不通」，不测「是谁」。
+ *
+ * @param {import('node:net').Socket} sock 已完成 CONNECT / SOCKS5 握手的隧道
+ * @param {Buffer} leftover 握手回复里多读到的字节（要交还给 TLS 层，否则会被当成垃圾）
+ * @returns {Promise<boolean>}
+ */
+function verifyTlsThrough(sock, leftover) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+    /** @type {import('node:tls').TLSSocket} */
+    let secure;
+    try {
+      secure = tls.connect({ socket: sock, servername: 'www.google.com', rejectUnauthorized: false }, () => finish(true));
+    } catch { finish(false); return; }
+    if (leftover && leftover.length) secure.write(leftover);
+    secure.setTimeout(PROBE_TIMEOUT_MS, () => { secure.destroy(); finish(false); });
+    secure.once('error', () => finish(false));
+    secure.once('close', () => finish(false));
+  });
+}
+
+/**
+ * 用 HTTP CONNECT 探一次：拿到 200 **且**隧道能跑通 TLS，才算该端口能当 HTTP 代理。
  * @param {number} port
  * @returns {Promise<boolean>}
  */
 function probeHttpProxy(port) {
   return withSocket(port, PROBE_TIMEOUT_MS, (sock, done) => {
     let buf = '';
-    sock.write('CONNECT www.google.com:443 HTTP/1.1\r\nHost: www.google.com:443\r\nProxy-Connection: keep-alive\r\n\r\n');
-    sock.on('data', (d) => {
+    const onData = (d) => {
       buf += d.toString('latin1');
+      const headEnd = buf.indexOf('\r\n\r\n');
       const nl = buf.indexOf('\r\n');
       if (nl < 0) return;
-      done(/^HTTP\/1\.[01] 200/i.test(buf.slice(0, nl)));
-    });
+      sock.removeListener('data', onData);   // 后续字节是隧道数据，不能再当文本解析
+      if (!/^HTTP\/1\.[01] 200/i.test(buf.slice(0, nl))) { done(false); return; }
+      const leftover = headEnd >= 0 ? Buffer.from(buf.slice(headEnd + 4), 'latin1') : Buffer.alloc(0);
+      verifyTlsThrough(sock, leftover).then(done);
+    };
+    sock.on('data', onData);
+    sock.write('CONNECT www.google.com:443 HTTP/1.1\r\nHost: www.google.com:443\r\nProxy-Connection: keep-alive\r\n\r\n');
   });
 }
 
 /**
  * 用最小 SOCKS5 握手（无认证）探一次：`05 01 00` → `05 00` → CONNECT 到 google:443 → `05 00`。
- * 成功说明该端口是纯 SOCKS5 代理（只能用 socks5h:// 访问）。
+ * 成功且隧道能跑通 TLS，说明该端口是纯 SOCKS5 代理（只能用 socks5h:// 访问）。
+ *
+ * ★ 必须等**完整**的 CONNECT 回复（长度由 ATYP 决定，IPv4 是 10 字节）再交棒给 TLS：
+ *   只读完 2 个状态字节就撒手，回复尾巴会被 TLS 层当成垃圾，造成假阴性。
+ *
  * @param {number} port
  * @returns {Promise<boolean>}
  */
@@ -131,12 +174,11 @@ function probeSocksProxy(port) {
     const host = Buffer.from('www.google.com');
     let buf = Buffer.alloc(0);
     let stage = 0;
-    sock.write(Buffer.from([0x05, 0x01, 0x00]));
-    sock.on('data', (d) => {
+    const onData = (d) => {
       buf = Buffer.concat([buf, d]);
       if (stage === 0) {
         if (buf.length < 2) return;
-        if (buf[0] !== 0x05 || buf[1] !== 0x00) { done(false); return; }
+        if (buf[0] !== 0x05 || buf[1] !== 0x00) { sock.removeListener('data', onData); done(false); return; }
         buf = buf.subarray(2);
         stage = 1;
         sock.write(Buffer.concat([
@@ -146,14 +188,26 @@ function probeSocksProxy(port) {
         ]));
         return;
       }
-      if (buf.length < 2) return;
-      done(buf[0] === 0x05 && buf[1] === 0x00);
-    });
+      if (buf.length < 4) return;
+      if (buf[0] !== 0x05 || buf[1] !== 0x00) { sock.removeListener('data', onData); done(false); return; }
+      const atyp = buf[3];
+      let need = 0;
+      if (atyp === 0x01) need = 10;                                   // IPv4：4 + 4 + 2
+      else if (atyp === 0x04) need = 22;                              // IPv6：4 + 16 + 2
+      else if (atyp === 0x03) { if (buf.length < 5) return; need = 5 + buf[4] + 2; }  // 域名
+      else { sock.removeListener('data', onData); done(false); return; }
+      if (buf.length < need) return;
+      const leftover = buf.subarray(need);
+      sock.removeListener('data', onData);
+      verifyTlsThrough(sock, leftover).then(done);
+    };
+    sock.on('data', onData);
+    sock.write(Buffer.from([0x05, 0x01, 0x00]));
   });
 }
 
 /**
- * 探测单个端口可用的协议。
+ * 探测单个端口可用的协议（导出的唯一探测入口，测试也用它）。
  *
  * ★ 两种探测**并发**发起，但 **HTTP 优先**：混合端口（Clash 7897 这类）两者都通，
  *   `http://` 对 curl / git 更通用，结果必须是确定的 http 而不是「谁先回算谁」。
@@ -162,7 +216,7 @@ function probeSocksProxy(port) {
  * @param {number} port
  * @returns {Promise<'http'|'socks5h'|null>}
  */
-async function probe(port) {
+export async function probePort(port) {
   const socksP = probeSocksProxy(port);
   if (await probeHttpProxy(port)) return 'http';
   return (await socksP) ? 'socks5h' : null;
@@ -214,12 +268,12 @@ async function doProbe(cfg) {
   //   此前把配置端口和 8 个候选一起 Promise.all，即使配置正常也要并发开 8 条 TCP、
   //   对着一堆没开代理的本地端口做 CONNECT / SOCKS 握手（其中「有人监听但不是代理」的端口
   //   还要各等满 1.5s 超时）。正常用户每 30s 就白付一次这种开销。
-  const configuredScheme = await probe(cfg.httpPort);
+  const configuredScheme = await probePort(cfg.httpPort);
   let hit = configuredScheme ? { port: cfg.httpPort, scheme: configuredScheme } : null;
   if (!hit) {
     const cands = FALLBACK_PORTS.filter((p) => p !== cfg.httpPort);
     // 配置端口不通才探候选；results 顺序 = FALLBACK_PORTS 顺序，故 find 取到的就是最优优先级
-    const results = await Promise.all(cands.map(async (port) => ({ port, scheme: await probe(port) })));
+    const results = await Promise.all(cands.map(async (port) => ({ port, scheme: await probePort(port) })));
     hit = results.find((r) => r.scheme) || null;
   }
 

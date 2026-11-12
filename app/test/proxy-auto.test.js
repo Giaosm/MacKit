@@ -49,6 +49,30 @@ test('reset() 后状态为空（不得复用旧结论）', () => {
   assert.equal(s.port, 0);
 });
 
+test('只回「200 已建立」但隧道不通的端口，不算可用代理', async () => {
+  // 复刻实测现场：代理客户端进程还在、端口 accept，上游节点已断 ——
+  // 它对 CONNECT 照样回 200，然后立刻 reset。只看状态码会误判成可用。
+  const server = net.createServer((sock) => {
+    sock.on('error', () => { /* 关闭时的 ECONNRESET 忽略 */ });
+    sock.once('data', () => {
+      sock.write('HTTP/1.1 200 Connection established\r\n\r\n');
+      sock.destroy();
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  assert.equal(await proxyAuto.probePort(port), null);
+  await new Promise((resolve) => server.close(resolve));
+});
+
+test('只监听不说话（不是代理协议）的端口，也不算可用代理', async () => {
+  const server = net.createServer((sock) => { sock.on('error', () => { /* ignore */ }); });  // 不回任何字节
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  assert.equal(await proxyAuto.probePort(port), null);
+  await new Promise((resolve) => server.close(resolve));
+});
+
 test('tcpReachable：监听中的端口 true，关掉后 false', async () => {
   const server = net.createServer((sock) => sock.destroy());
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
