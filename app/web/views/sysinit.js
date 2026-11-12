@@ -189,25 +189,6 @@ export default {
     }
 
     // ============================ ④ 代理端口 ============================
-    /**
-     * 「当前实际生效端口」提示行（数据来自后端 lib/proxy-auto.js）。
-     *
-     * 端口自动切换只看**能不能真的建隧道**（HTTP CONNECT / SOCKS5 握手），所以这里必须如实
-     * 告诉用户当前命令实际走的是哪个口 —— 否则界面上写着 7897、命令却从 10808 出去，
-     * 排查网络问题时会被自己的界面误导。pp.usable === false 表示连常见端口都没一个通的。
-     */
-    function effectiveLine(pp) {
-      const kind = pp.effectiveScheme === 'socks5h' ? 'SOCKS5' : 'HTTP';
-      if (pp.usable === false) {
-        return el('div', { class: 'warn-box section', text: `⚠ 配置端口 ${pp.http || '—'} 与常见代理端口都连不通：请先确认代理客户端已启动，或点下面的常用组合换个端口。` });
-      }
-      if (pp.effective == null) return null;   // 尚未探测（后端异常）→ 不显示，避免出现「生效：null」
-      if (pp.switched) {
-        return el('div', { class: 'warn-box section', text: `⚠ 配置端口 ${pp.http} 不通，本应用当前自动改走 ${pp.effective}（${kind}）。该切换只在本应用内生效，不会改写 ~/.brewgo_config。` });
-      }
-      return el('div', { class: 'muted section', text: `当前实际生效：${pp.effective}（${kind}）` });
-    }
-
     function portSection(pp) {
       const httpI = el('input', { type: 'number', min: '1', max: '65535', value: String(pp.http == null ? '' : pp.http), style: 'max-width:140px' });
       const socksI = el('input', { type: 'number', min: '1', max: '65535', value: String(pp.socks5 == null ? '' : pp.socks5), style: 'max-width:140px' });
@@ -231,38 +212,16 @@ export default {
             try {
               const e = await ctx.refreshEnv(true);
               const gp = e.git && e.git.httpProxy;
-              const want = ctx.proxyUrl(h);
+              const want = `http://127.0.0.1:${h}`;
               if (gp && gp !== want) setHint(`Git 全局代理仍为 ${gp}，如需同步请在下方 Git 配置中修改`);
               else if (!gp) setHint(`Git 全局代理未设置；如需使用请在下方 Git 配置中设为 ${want}`);
             } catch { /* 体检失败忽略 */ }
           },
         },
       });
-      // 常用组合的事实源在后端 lib/proxy-auto.js（PORT_PRESETS），这里只渲染 ——
-      // 前端静态根是 web/，import 不到 lib/，此前硬编码第四份端口表必然与探测候选漂移。
-      const presets = Array.isArray(pp.presets) ? pp.presets : [];
-      const presetRow = presets.length ? el('div', { class: 'row section', style: 'flex-wrap:wrap' }, [
-        el('span', { class: 'muted nowrap', text: '常用组合：' }),
-        ...presets.map((p) => el('button', {
-          class: 'btn btn--sm', type: 'button', text: p.label, title: p.title,
-          on: {
-            click: () => {
-              // 只填入输入框，**不自动保存**：端口是全局生效的配置，
-              // 静默改掉会把用户所有联网动作切到另一个代理上。
-              httpI.value = String(p.http);
-              socksI.value = String(p.socks);
-              ui.toast('ok', `已填入 HTTP ${p.http} / SOCKS5 ${p.socks}，确认后点「保存端口」`);
-            },
-          },
-        })),
-      ]) : null;
       return ui.card('④ 代理端口', el('div', {}, [
         el('div', { class: 'field__row' }, [el('span', { class: 'muted', style: 'width:120px', text: 'HTTP 端口' }), httpI]),
         el('div', { class: 'field__row section' }, [el('span', { class: 'muted', style: 'width:120px', text: 'SOCKS5 端口' }), socksI]),
-        effectiveLine(pp),
-        presetRow,
-        // 各预设的端口含义写在按钮 title 里（数据来自后端），这里只说明交互，不重复端口说明
-        el('div', { class: 'muted', text: '点「常用组合」只会填入上面的输入框，仍需点「保存端口」才生效。' }),
         el('div', { class: 'muted', text: '非纯数字或超出 1–65535 的输入将被忽略并保持原值。' }),
         el('div', { class: 'row section' }, [btn]),
         hint,

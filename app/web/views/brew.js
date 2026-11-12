@@ -661,7 +661,7 @@ export default {
         try {
           const e = await ctx.refreshEnv(true);
           const gp = e.git && e.git.httpProxy;
-          const want = ctx.proxyUrl(http);
+          const want = `http://127.0.0.1:${http}`;
           if (gp && gp !== want) hintBox.append(el('div', { class: 'warn-box section', text: `Git 全局代理仍为 ${gp}，如需同步请在系统初始化模块修改。` }));
           else if (!gp) hintBox.append(el('div', { class: 'warn-box section', text: `Git 全局代理未设置；如需使用请在系统初始化模块设为 ${want}。` }));
         } catch { /* 体检失败忽略 */ }

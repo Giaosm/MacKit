@@ -141,24 +141,6 @@ function stripValueComment(v) {
   return (i < 0 ? s : s.slice(0, i)).trim();
 }
 
-/**
- * 端口合法性：纯数字整数、1–65535。**唯一实现**。
- *
- * readBrewgo（读）、writeBrewgo（写）与 sysinit 的「保存端口」动作都走这里 ——
- * 否则三处规则一漂移，就会出现「日志说保存了 99999、文件里其实是 7897」这种
- * 日志与事实不符的情况（2026-09-21 踩过）。
- * 只认纯数字：`8080.0`、` 8080 `、`+8080` 一律判非法（与前端 web/app.js 的 portOk 同款口径）。
- *
- * @param {unknown} v 端口（数字或字符串）
- * @returns {boolean}
- */
-export function isValidPort(v) {
-  const s = String(v == null ? '' : v).trim();
-  if (!/^[0-9]+$/.test(s)) return false;
-  const n = Number(s);
-  return n >= 1 && n <= 65535;
-}
-
 /** 读取 brewgo 配置（容错：跳过空行与注释、端口须纯数字、MIRROR 须在枚举内）。 */
 export function readBrewgo() {
   const result = { httpPort: 7897, socksPort: 7897, mirror: 'official', mirrorRaw: null, hadMirrorKey: false, exists: false };
@@ -173,10 +155,11 @@ export function readBrewgo() {
     const key = line.slice(0, eq).trim();
     const value = stripValueComment(line.slice(eq + 1));
     if (key === 'PROXY_HTTP_PORT' || key === 'PROXY_SOCKS5_PORT') {
-      // 非法值不生效、保持默认（默认值即 7897，与 brewgo 缺省一致）
-      if (isValidPort(value)) {
-        const n = Number(value);
-        if (key === 'PROXY_HTTP_PORT') result.httpPort = n; else result.socksPort = n;
+      if (/^[0-9]+$/.test(value)) {
+        const n = Number.parseInt(value, 10);
+        if (n >= 1 && n <= 65535) {
+          if (key === 'PROXY_HTTP_PORT') result.httpPort = n; else result.socksPort = n;
+        }
       }
     } else if (key === 'MIRROR') {
       result.hadMirrorKey = true;
@@ -200,8 +183,8 @@ export function readBrewgo() {
  * mirrorRaw 是「用户显式给出的原值」，仅在**通过安全字符校验**时生效，优先级高于 mirror。
  */
 function normalizeBrewgoInput(v) {
-  const httpPort = isValidPort(v.httpPort) ? Number(v.httpPort) : 7897;
-  const socksPort = isValidPort(v.socksPort) ? Number(v.socksPort) : 7897;
+  const httpPort = Number.isInteger(v.httpPort) && v.httpPort >= 1 && v.httpPort <= 65535 ? v.httpPort : 7897;
+  const socksPort = Number.isInteger(v.socksPort) && v.socksPort >= 1 && v.socksPort <= 65535 ? v.socksPort : 7897;
   const raw = typeof v.mirrorRaw === 'string' ? v.mirrorRaw.trim() : '';
   // 防注入：这个值会被原样写进 `MIRROR=<值>` 行，因此禁止换行 / # / 空白，
   // 只放行 URL / 主机名 / 常见路径字符。

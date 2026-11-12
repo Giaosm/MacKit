@@ -162,15 +162,8 @@ async function copyText(text, okMsg = '已复制') {
   catch { toast('warn', '复制失败，请手动选择'); }
 }
 
-/** 端口字符串校验：纯数字且 1–65535（与后端 store.isValidPort 同款口径）。 */
+/** 端口字符串校验：纯数字且 1–65535。 */
 const portOk = (v) => /^[0-9]+$/.test(v) && Number(v) >= 1 && Number(v) <= 65535;
-
-/**
- * 本机代理 URL（**前端唯一拼接点**，口径与后端 paths.proxyUrl 一致）。
- * 静态服务根是 web/，视图 import 不到 lib/，所以前端必须留一份；但只许留这一份 ——
- * 此前 brew 与 sysinit 两个视图各自手拼，改端口口径时必然漏改一处。
- */
-const proxyUrl = (port) => `http://127.0.0.1:${port}`;
 
 /**
  * 当前打开的弹窗关闭器。同屏只允许一个弹窗：
@@ -884,7 +877,6 @@ function makeCtx(subs) {
       subs.push(u); return u;
     },
     refreshEnv: refreshEnv,
-    proxyUrl,
     fmtTime, fmtDateTime, fmtRel, fmtSize,
     ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, kv, card, copy: copyText, portOk, netChannel },
   };

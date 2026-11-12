@@ -464,21 +464,5 @@ export const DEFAULT_PORT = 18080;
 /** 本机回环地址（全局唯一绑定地址） */
 export const LOOPBACK = '127.0.0.1';
 
-/** 代理主机（本机回环，与 LOOPBACK 同源，避免两处字面量各自漂移） */
-export const PROXY_HOST = LOOPBACK;
-
-/**
- * 本机代理 URL（**唯一拼接点**）。
- *
- * 端口自动切换可能挑到一个纯 SOCKS5 端口，此时必须用 `socks5h://`（让代理解析域名，
- * 顺带规避 DNS 污染）；拿 `http://` 去打 SOCKS 端口只会得到「代理不可达」。
- * 此前 `sysinit / env / exec` 各自手拼 `http://127.0.0.1:${port}`，加 scheme 后必然漂移。
- *
- * @param {number} port
- * @param {'http'|'socks5'|'socks5h'} [scheme] 非法/缺省一律按 http 处理
- * @returns {string}
- */
-export function proxyUrl(port, scheme = 'http') {
-  const s = scheme === 'socks5h' || scheme === 'socks5' ? scheme : 'http';
-  return `${s}://${PROXY_HOST}:${port}`;
-}
+/** 代理主机 */
+export const PROXY_HOST = '127.0.0.1';

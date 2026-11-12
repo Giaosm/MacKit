@@ -16,7 +16,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as paths from './paths.js';
 import * as store from './store.js';
-import * as proxyAuto from './proxy-auto.js';
 
 // ---------------------------------------------------------------------------
 // 错误对象
@@ -283,22 +282,15 @@ function resolveBin(name) {
 // ---------------------------------------------------------------------------
 
 /**
- * 读取 brewgo 配置（端口 / 镜像）并叠加「自动切换」后的生效端口；读取失败时回落到安全默认值。
- *
- * 「用哪个端口」的判断只有一处（{@link proxyAuto.effectivePorts}），env 的体检快照也用同一份，
- * 两边各写一份迟早漂移成「界面显示走 10808、命令实际走 7897」。
- *
- * @returns {{httpPort:number, socksPort:number, mirror:string, scheme:'http'|'socks5h', switched:boolean}}
+ * 读取 brewgo 配置（端口 / 镜像）；读取失败时回落到安全默认值。
+ * @returns {{httpPort:number, socksPort:number, mirror:string}}
  */
 function safeConfig() {
   try {
     const c = store.readBrewgo();
-    // ★ 自动切换（见 lib/proxy-auto.js）：配置端口不通时，用探测到的可用端口代替。
-    //   注意这里只读**缓存**（同步路径不能等探测），刷新由 run() 在 proxy 通道上 await 完成。
-    const eff = proxyAuto.effectivePorts(c);
-    return { httpPort: eff.httpPort, socksPort: eff.socksPort, scheme: eff.scheme, switched: eff.switched, mirror: c.mirror };
+    return { httpPort: c.httpPort, socksPort: c.socksPort, mirror: c.mirror };
   } catch {
-    return { httpPort: 7897, socksPort: 7897, mirror: 'official', scheme: 'http', switched: false };
+    return { httpPort: 7897, socksPort: 7897, mirror: 'official' };
   }
 }
 
@@ -316,7 +308,7 @@ function safeConfig() {
  *   所以调用方**有意**注入大写 HTTP_PROXY/HTTPS_PROXY 时，其注入不受本函数影响。
  * @param {Record<string,string|undefined>} env
  * @param {'direct'|'proxy'} channel
- * @param {{httpPort:number, socksPort:number, scheme?:'http'|'socks5h', switched?:boolean}} cfg
+ * @param {{httpPort:number,socksPort:number}} cfg
  */
 export function applyProxyEnv(env, channel, cfg) {
   // 大小写不敏感地摘掉全部代理相关键（http_proxy/https_proxy/all_proxy/no_proxy 各自的大小写形态）
@@ -324,17 +316,11 @@ export function applyProxyEnv(env, channel, cfg) {
     if (/^(https?_proxy|all_proxy|no_proxy)$/i.test(k)) delete env[k];
   }
   if (channel === 'proxy') {
-    // 自动切换可能挑到一个**纯 SOCKS5** 端口（如只开 SOCKS 的 10808）→ 必须用 socks5h://，
-    // 拿 http:// 去打 SOCKS 端口只会得到「代理不可达」。socks5h 让代理解析域名，顺带规避 DNS 污染。
-    const scheme = cfg.scheme === 'socks5h' ? 'socks5h' : 'http';
-    const httpUrl = paths.proxyUrl(cfg.httpPort, scheme);
+    const host = paths.PROXY_HOST;
+    const httpUrl = `http://${host}:${cfg.httpPort}`;
     env.http_proxy = httpUrl;
     env.https_proxy = httpUrl;
-    // all_proxy 的协议必须是这个端口**真的会说**的：
-    //   · 自动切换后 httpPort/socksPort 是同一个口，协议只由 scheme 决定
-    //     （此前恒写 socks5://，切到纯 HTTP 端口 10809 时，认 ALL_PROXY 的工具会直接连不上）；
-    //   · 未切换时 socksPort 是客户端配置的 SOCKS5 口，沿用 socks5://。
-    env.all_proxy = paths.proxyUrl(cfg.socksPort, cfg.switched === true ? scheme : 'socks5');
+    env.all_proxy = `socks5://${host}:${cfg.socksPort}`;
   }
 }
 
@@ -396,48 +382,11 @@ function applyMirrorEnv(env, mirror) {
 }
 
 /**
- * 让 **git 的 `http.proxy`** 跟随本层的通道结论。
- *
- * ★ 为什么光注入环境变量不够（2026-11-12 实测）：git 的 `http.proxy` 配置优先级**高于**
- *   `http_proxy` 环境变量。用户换了代理客户端（Clash 7897 → v2rayN 10808）后，全局配置里
- *   那个死端口会把这里注入的端口整个顶掉 —— 自更新的 fetch 在「直连 / 代理」两条通道上
- *   撞到同一个 7897，两次报错一字不差，看起来像网络问题而不是配置问题。
- *
- * ★ 用 `GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n`（等价命令行 `-c`）：
- *   只作用于本次子进程、不落盘、优先级最高。实测两种取值语义：
- *     · 空值 `http.proxy=` → **禁用**代理（即使环境变量指向别的端口也照样直连）；
- *     · 非空值 → 即使环境变量指向别的端口，也以它为准。
- *
- * ★ **只在调用方显式给了 channel 时才覆盖**：`git config --get/set` 这类管理命令不带
- *   channel，必须读到用户真实配置，否则「系统初始化」里的 Git 全局代理会显示成空，
- *   保存时还会把真实值判断成「未变更」。
- *
- * @param {Record<string,string>} env
- * @param {'direct'|'proxy'|undefined} channel
- * @param {{httpPort:number, scheme?:'http'|'socks5h'}} cfg
- */
-function applyGitProxyEnv(env, channel, cfg) {
-  if (channel !== 'direct' && channel !== 'proxy') return;
-  // 用户/上层可能已注入过同名前缀的变量，先清干净再写，避免 COUNT 与实际条目对不上
-  for (const k of Object.keys(env)) {
-    if (/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(k)) delete env[k];
-  }
-  const url = channel === 'proxy' ? paths.proxyUrl(cfg.httpPort, cfg.scheme) : '';
-  const keys = ['http.proxy', 'https.proxy'];
-  env.GIT_CONFIG_COUNT = String(keys.length);
-  keys.forEach((k, i) => {
-    env[`GIT_CONFIG_KEY_${i}`] = k;
-    env[`GIT_CONFIG_VALUE_${i}`] = url;
-  });
-}
-
-/**
  * 构造子进程环境变量。
  * @param {{env?:Record<string,string>, channel?:('direct'|'proxy'), mirror?:string, noMirror?:boolean}} opts
- * @param {string} [bin] 逻辑命令名（git 需要额外覆盖 http.proxy，见 applyGitProxyEnv）
  * @returns {Record<string,string>}
  */
-function buildEnv(opts, bin) {
+function buildEnv(opts) {
   /** @type {Record<string,string>} */
   const env = {};
   /**
@@ -479,8 +428,6 @@ function buildEnv(opts, bin) {
     // 「直连 / 代理」两种语义就只对显式传 channel 的调用成立（历史上卸载 / cleanup /
     // git 读取等未传 channel 的路径确实会继承宿主代理）。
     applyProxyEnv(env, opts.channel === 'proxy' ? 'proxy' : 'direct', cfg);
-    // git 另需一遍「配置级」覆盖：它的 http.proxy 优先级高于上面这些环境变量
-    if (bin === 'git') applyGitProxyEnv(env, opts.channel, cfg);
   }
   // 显式追加的环境变量优先级最高
   if (opts.env) {
@@ -522,15 +469,10 @@ function buildEnv(opts, bin) {
  * @param {import('./exec.js').RunOpts} [opts]
  * @returns {Promise<import('./exec.js').RunResult>}
  */
-export async function run(bin, args, opts = {}) {
+export function run(bin, args, opts = {}) {
   const binPath = resolveBin(bin);
   const argsArr = Array.isArray(args) ? args.slice() : [];
-  // 走代理通道前刷新「当前生效端口」（TTL 内直接复用，不产生额外开销）：
-  // 用户的代理客户端换了端口时，这里能把整条通道自动切过去，见 lib/proxy-auto.js。
-  if (opts.channel === 'proxy') {
-    try { await proxyAuto.ensure(); } catch { /* 探测失败不影响命令本身 */ }
-  }
-  const env = buildEnv(opts, bin);
+  const env = buildEnv(opts);
   const timeoutMs = typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0
     ? opts.timeoutMs
     : DEFAULT_TIMEOUT_MS;
@@ -729,7 +671,7 @@ export async function run(bin, args, opts = {}) {
 export function spawnStream(bin, args, opts = {}) {
   const binPath = resolveBin(bin);
   const argsArr = Array.isArray(args) ? args.slice() : [];
-  const env = buildEnv(opts, bin);
+  const env = buildEnv(opts);
   const timeoutMs = typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0
     ? opts.timeoutMs
     : DEFAULT_TIMEOUT_MS;

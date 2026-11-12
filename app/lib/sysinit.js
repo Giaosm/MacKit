@@ -17,7 +17,6 @@ import * as store from './store.js';
 import * as env from './env.js';
 import * as exec from './exec.js';
 import * as git from './git.js';
-import * as proxyAuto from './proxy-auto.js';
 
 const { ERR, AppError } = exec;
 
@@ -50,13 +49,12 @@ const writeText = paths.writeText;
 function suggestions(port) {
   let userName = '';
   try { userName = os.userInfo().username || ''; } catch { userName = ''; }
-  const proxy = paths.proxyUrl(port);
   return {
     'user.name': userName,
     'user.email': '',
     'safe.directory': '*',
-    'http.proxy': proxy,
-    'https.proxy': proxy,
+    'http.proxy': `http://127.0.0.1:${port}`,
+    'https.proxy': `http://127.0.0.1:${port}`,
     'credential.helper': 'osxkeychain',
   };
 }
@@ -143,14 +141,6 @@ async function queryState() {
 
   const tokenExistsFlag = gitInstalled ? await git.credentialExists() : false;
 
-  // 实际生效端口（见 lib/proxy-auto.js）：配置端口不通时它会自动改走能用的那个。
-  // ★ 必须 await ensure()（而不是读 current() 缓存）：首屏先进本页时缓存还是空的，
-  //   如实显示「现在到底走哪个口」比省一次探测更重要；TTL 内不会重复探。
-  // ★ 这是唯一一处带网络副作用的只读查询：探测全不通时最坏要等一轮全端口超时。
-  //   有 30s TTL 兜底，且本页是低频入口，换来的是「界面显示 = 命令实际走的通道」。
-  try { await proxyAuto.ensure(); } catch { /* 探测失败按「不可用」显示 */ }
-  const eff = proxyAuto.effectivePorts(cfg);
-
   return {
     shell: { kind, rcFile },
     alias: {
@@ -164,17 +154,7 @@ async function queryState() {
     git: gitInfo,
     gitForm,
     tokenExists: tokenExistsFlag,
-    proxyPorts: {
-      http: cfg.httpPort,
-      socks5: cfg.socksPort,
-      /** 实际生效端口；null = 一个可用端口都没探到 */
-      effective: eff.ok ? eff.httpPort : null,
-      effectiveScheme: eff.ok ? eff.scheme : null,
-      switched: eff.switched,
-      usable: eff.ok,
-      /** ④ 卡的「常用组合」按钮：事实源在 proxy-auto.PORT_PRESETS，前端只负责渲染 */
-      presets: proxyAuto.PORT_PRESETS,
-    },
+    proxyPorts: { http: cfg.httpPort, socks5: cfg.socksPort },
   };
 }
 
@@ -341,30 +321,29 @@ const actions = {
       id: 'save_ports', title: '保存代理端口',
       run: async (ctx) => {
         const cur = store.readBrewgo();
-        // 端口规则唯一实现在 store.isValidPort（与读写 ~/.brewgo_config 同一份口径）：
-        // 非法值忽略、保持原值 —— 此前越界值会被 store 静默回落 7897，而日志回显的是用户输入的
-        // 99999，日志与事实不符。
-        const pick = (v, fallback) => (store.isValidPort(v) ? Number(String(v).trim()) : fallback);
-        const hasInput = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+        // 端口必须是 1–65535 的整数；否则忽略、保持原值（此前只判「纯数字」，
+        // 越界值会被 store 静默回落 7897，而日志回显的是用户输入的 99999 —— 日志与事实不符）。
+        const pick = (v, fallback) => {
+          const n = Number(String(v));
+          return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : fallback;
+        };
         const httpPort = pick(params.httpPort, cur.httpPort);
         const socks5Port = pick(params.socksPort, cur.socksPort);
-        if (hasInput(params.httpPort) && !store.isValidPort(params.httpPort)) {
+        if (String(params.httpPort) !== '' && httpPort !== Number(params.httpPort)) {
           ctx.log('warn', `HTTP 端口 ${params.httpPort} 非法（需 1–65535 的整数），保持原值 ${cur.httpPort}`);
         }
-        if (hasInput(params.socksPort) && !store.isValidPort(params.socksPort)) {
+        if (String(params.socksPort) !== '' && socks5Port !== Number(params.socksPort)) {
           ctx.log('warn', `SOCKS5 端口 ${params.socksPort} 非法（需 1–65535 的整数），保持原值 ${cur.socksPort}`);
         }
         // 不传 mirror：本次只改端口，MIRROR 行原样保留（含自定义的枚举外镜像）
         // 用**返回值**打日志：它是唯一事实（写入侧还会再校验一次），不要回显入参。
         const saved = store.writeBrewgo({ httpPort, socksPort: socks5Port });
         ctx.log('ok', `已保存到 ~/.brewgo_config：HTTP=${saved.httpPort}, SOCKS5=${saved.socksPort}`);
-        // 端口变了 → 先作废自动探测缓存（否则 30s 内还按旧端口探好的结果改道 / 或干脆不重探），
-        // 再作废环境体检缓存，否则其它标签页仍显示旧端口（apply_alias 同理）
-        try { proxyAuto.reset(); } catch { /* ignore */ }
+        // 端口变了 → 作废环境体检缓存，否则 30s 内其它标签页仍显示旧端口（apply_alias 同理）
         try { env.invalidate(); } catch { /* ignore */ }
         // 不自动改 Git 代理，仅提示
         const gp = await git.config('http.proxy');
-        const want = paths.proxyUrl(saved.httpPort);
+        const want = `http://127.0.0.1:${saved.httpPort}`;
         if (gp && gp !== want) {
           ctx.log('warn', `Git 全局代理仍为 ${gp}，如需同步请在「系统初始化 → Git 全局配置」中修改`);
         } else if (!gp) {
