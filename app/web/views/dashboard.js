@@ -90,6 +90,16 @@ export default {
       // 网络
       grid.append(ui.card('🌐 网络', el('div', { class: 'card__rows' }, [
         ...netRows('直连', n.direct), ...netRows('代理', n.proxy),
+        // 代理不通、但候选端口上有人在听 → 客户端起来了但「不是能用的代理」（模式/端口对不上）。
+        // ★ 不要再建议用户「去点常用组合就能通」：那些端口 proxy-auto 已经逐个真建过隧道并失败，
+        //   换端口这件事本来也由它自动完成，能通的话这里根本不会出现。
+        ...((n.proxy && Array.isArray(n.proxy.availablePorts) && n.proxy.availablePorts.length > 0) ? [
+          el('div', { class: 'warn-box' }, [
+            el('div', { text: `代理端口 ${pp.http} 连不通；${n.proxy.availablePorts.join(' / ')} 端口有服务在监听，但都无法建立代理隧道。` }),
+            el('div', { class: 'muted', text: '常见原因：客户端刚启动还没就绪、只开了 TUN/系统代理没开 HTTP/SOCKS5 入站、或端口不是代理口。换端口（Clash 7897 ↔ v2rayN 10808）会自动生效，无需手动改。' }),
+            el('button', { class: 'btn btn--sm section', type: 'button', text: '查看代理设置 →', on: { click: () => ctx.navigate('#/sysinit') } }),
+          ]),
+        ] : []),
         n.allFailed ? el('div', { class: 'err-box', text: '直连与代理均不可用，请检查网络或代理端口配置。' }) : null,
       ].filter(Boolean)), { light: lightOf(n.status) }));
 
@@ -128,6 +138,9 @@ export default {
       grid.append(ui.card('⚙ 镜像源 / 代理', el('div', { class: 'card__rows' }, [
         ui.kv('镜像源', m.label || m.id || '—'),
         ui.kv('代理端口', `${pp.http || '—'} (HTTP) / ${pp.socks5 || '—'} (SOCKS5)`),
+        // 端口自动切换（见 lib/proxy-auto.js）：配置端口不通时本应用会改走能用的那个。
+        // 界面必须如实显示，否则卡片写着 7897、命令却从 10808 出去，排查网络时会被界面误导。
+        ...(pp.switched ? [ui.kv('生效端口', `🟡 ${pp.effective}（配置 ${pp.http} 不通，已自动切换）`)] : []),
         ui.kv('配置文件', el('span', { class: 'mono', text: pp.configPath || '—' })),
       ]), { light: lightOf(m.status) }));
 

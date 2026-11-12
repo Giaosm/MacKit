@@ -5,6 +5,7 @@
  *   - networkTest()：直连与代理各探一次（含出口 IP），任一可达即不算全断
  *   - Git 的读写在 lib/git.js（2026-09-18 收敛），本文件只负责把它们聚合成快照
  *   - 镜像源表（5 项）
+ *   - 代理端口：生效端口 / 候选端口 / 自动切换的唯一事实源在 lib/proxy-auto.js，本文件只消费结论
  *
  * 附加：shell rc 的别名解析与删除范围计算
  *   analyzeRc() / computeAliasRemovalRange() / expectedAliasLines()（供 sysinit 使用）
@@ -16,6 +17,7 @@
 import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
+import * as proxyAuto from './proxy-auto.js';
 import * as git from './git.js';
 import { parseRimeAppearance } from './rime-appearance.js';
 
@@ -145,9 +147,11 @@ export function computeAliasRemovalRange(text, name) {
  */
 export function expectedAliasLines(port) {
   const p = port;
+  // URL 拼接统一走 paths.proxyUrl（与 exec 的通道注入同源，避免两处各自写字面量）
+  const url = paths.proxyUrl(p);
   return [
     `# 代理设置（端口 ${p}）`,
-    `alias proxy='export http_proxy=http://127.0.0.1:${p}; export https_proxy=http://127.0.0.1:${p}; echo "✅ 代理已开启 (${p})"; echo "🌍 当前IP信息:"; curl -s https://myip.ipip.net'`,
+    `alias proxy='export http_proxy=${url}; export https_proxy=${url}; echo "✅ 代理已开启 (${p})"; echo "🌍 当前IP信息:"; curl -s https://myip.ipip.net'`,
     `alias unproxy='unset http_proxy; unset https_proxy; echo "❌ 代理已关闭"'`,
   ];
 }
@@ -249,12 +253,22 @@ async function probeIp(channel) {
  * 直连：curl --max-time 3 -sSf https://www.baidu.com
  * 代理：curl --max-time 5 -sSfL https://www.google.com
  * 两者全失败 → allFailed=true。
+ *
+ * ★ 代理不通时额外探一遍候选端口（{@link proxyAuto.FALLBACK_PORTS}），把「正在监听但没被
+ *   配置」的端口放进 `proxy.availablePorts`，让界面说清「这些口有人在听，但不是能用的代理」。
+ *
+ *   看起来与 proxy-auto 的探测重复，其实是**两个问题**：那边问「能不能真的建隧道」（CONNECT /
+ *   SOCKS5 握手），这边问「TCP 有没有人监听」。后者能解释「客户端起来了但模式不对 / 端口对不上」
+ *   这类情况，代价只是 8 次 400ms 内必定结束的连一下，且只在代理全不通这条路径上跑。
+ *   只做提示，**不自动改配置**：端口是全局生效的，静默切换等于偷偷改掉所有联网行为。
+ *
+ * @param {{httpPort:number, socksPort:number}} [cfg] 当前代理端口配置
  * @returns {Promise<{direct:any, proxy:any, allFailed:boolean}>}
  */
-async function networkTest() {
+async function networkTest(cfg) {
   /** @type {{ok:boolean, ip:string|null, location:string|null, error?:any}} */
   const direct = { ok: false, ip: null, location: null };
-  /** @type {{ok:boolean, ip:string|null, location:string|null, error?:any}} */
+  /** @type {{ok:boolean, ip:string|null, location:string|null, error?:any, availablePorts?:number[]}} */
   const proxy = { ok: false, ip: null, location: null };
 
   const dRes = await runQuiet(
@@ -283,6 +297,11 @@ async function networkTest() {
     proxy.location = info.location;
   } else {
     proxy.error = { code: exec.ERR.NET_UNREACHABLE, message: '代理网络异常' };
+    // 代理不通 → 看看候选端口里哪些其实有人在监听（并发探，最坏 400ms）
+    const configured = new Set([cfg && cfg.httpPort, cfg && cfg.socksPort].filter(Boolean));
+    const hits = await Promise.all(proxyAuto.FALLBACK_PORTS.map(async (p) => (configured.has(p) ? null : ((await proxyAuto.tcpReachable(p)) ? p : null))));
+    const available = hits.filter((p) => typeof p === 'number');
+    if (available.length) proxy.availablePorts = available;
   }
 
   return { direct, proxy, allFailed: !direct.ok && !proxy.ok };
@@ -497,8 +516,14 @@ async function buildSnapshot(gen) {
   const cfg = store.readBrewgo();
   const mackit = store.readMackit();
 
-  const brew = await brewSnapshot();
-  const network = await networkTest();
+  // 刷新「当前生效代理端口」（配置端口不通时自动切到能用的那个，见 lib/proxy-auto.js），
+  // 再按它做网络体检 —— 否则用户换了客户端端口，体检会拿一个死端口去测，白报「代理不可达」。
+  // ★ 与 brewSnapshot() 并行：两者互不依赖，串行会让冷启动白等一次端口探测。
+  const [brew] = await Promise.all([brewSnapshot(), proxyAuto.ensure()]);
+  const eff = proxyAuto.effectivePorts(cfg);
+  const effCfg = { ...cfg, httpPort: eff.httpPort, socksPort: eff.socksPort };
+
+  const network = await networkTest(effCfg);
   const gitInfo = await gitSnapshot(); // 变量名避开上方的 git 模块导入
   const rime = rimeSnapshot();
   const shell = shellSnapshot();
@@ -528,8 +553,16 @@ async function buildSnapshot(gen) {
     },
     proxyPorts: {
       status: cfg.exists ? 'ok' : 'warn',
+      /** 配置文件里的端口（用户设置的） */
       http: cfg.httpPort,
       socks5: cfg.socksPort,
+      /** 实际生效端口：配置端口不通时会被自动切换（见 lib/proxy-auto.js），平时与 http 相同 */
+      effective: eff.ok ? eff.httpPort : null,
+      effectiveScheme: eff.ok ? eff.scheme : null,
+      /** true = 生效端口不是配置里那个（发生了自动切换） */
+      switched: eff.switched,
+      /** 自动探测是否发现任何一个端口可用 */
+      usable: eff.ok,
       configPath: paths.BREWGO_CONFIG,
       hadMirrorKey: cfg.hadMirrorKey,
     },
