@@ -351,6 +351,26 @@ function readShellenvConfigured() {
   return false;
 }
 
+/**
+ * 「可更新」计数提供者 —— 由 lib/brew.js 在模块加载时注册（见该文件的 outdatedCounts）。
+ *
+ * ★ 为什么要有这层间接（2026-11-14）：Homebrew 管家列表的口径是「纠偏后」的
+ *   （auto_updates 应用按 .app 本体真实版本判定，假阳性会被剔除），而体检快照此前自己跑
+ *   `brew outdated --cask --greedy-latest --quiet` 另算一次 —— 两条路各算一次，
+ *   同一屏就会出现「顶部可更新 2 项 / 列表 Formula 2 + Cask 1」这种自相矛盾。
+ *   依赖方向只能是 brew.js → env.js（brew.js 已 import env 做缓存作废），所以这里留一个
+ *   注入点，由 brew.js 反向注册，避免循环 import。
+ */
+let outdatedProvider = null;
+
+/**
+ * 注册「可更新」计数提供者（传 null 可注销）。
+ * @param {null | (() => Promise<{formula:number,cask:number,checkedAt?:number|null}>)} fn
+ */
+export function registerOutdatedProvider(fn) {
+  outdatedProvider = typeof fn === 'function' ? fn : null;
+}
+
 async function brewSnapshot() {
   const installed = paths.exists(paths.BREW_BIN);
   const snap = {
@@ -362,6 +382,10 @@ async function brewSnapshot() {
     caskCount: 0,
     outdatedFormula: 0,
     outdatedCask: 0,
+    // 可更新计数的来源：'brew-view' = 与 Homebrew 管家列表同一口径（含 auto_updates 纠偏）；
+    // 'brew-raw' = 提供者不可用时的回落口径。界面据此标注，不假装两边天然一致。
+    outdatedSource: 'brew-raw',
+    outdatedCheckedAt: null,
     tapList: [],
     tapEmpty: true,
     // 终端环境变量是否已配置（~/.zprofile 或 ~/.bash_profile 内是否含 brew shellenv）
@@ -374,6 +398,12 @@ async function brewSnapshot() {
   };
   if (!installed) return snap;
 
+  // 「可更新」计数与下面几条 brew 命令**并行**启动：提供者内部自己会跑 brew 查询，
+  // 串起来等就白白多花几秒（实测这一路冷启动 3~5s，其余探测加起来差不多，并行后总耗时取大者）。
+  const pCounts = outdatedProvider
+    ? Promise.resolve().then(() => outdatedProvider()).catch(() => null)
+    : null;
+
   const ver = await runQuiet('brew', ['--version'], { timeoutMs: 15_000 });
   if (ver.code === 0) snap.version = nonEmptyLines(ver.stdout)[0] || null;
 
@@ -383,35 +413,48 @@ async function brewSnapshot() {
   const cList = await runQuiet('brew', ['list', '--cask'], { timeoutMs: 30_000 });
   snap.caskCount = nonEmptyLines(cList.stdout).length;
 
-  const oF = await runQuiet('brew', ['outdated', '--formula', '--quiet'], { timeoutMs: 60_000 });
-  snap.outdatedFormula = nonEmptyLines(oF.stdout).length;
+  // ★ 2026-11-14：可更新计数优先用 brew 模块提供的口径（与 Homebrew 管家列表同一事实源，
+  //   含 auto_updates 纠偏）。此前这里自己跑 --greedy-latest 另算一次，于是总览与列表在同屏打架。
+  //   提供者缺失（模块未加载）或抛错时才回落到下面的轻量口径 —— 总览不能因为一条链路挂掉就空白。
+  snap.outdatedSource = 'brew-raw';
+  const counts = pCounts ? await pCounts : null;
+  if (counts && Number.isFinite(counts.formula) && Number.isFinite(counts.cask)) {
+    snap.outdatedFormula = counts.formula;
+    snap.outdatedCask = counts.cask;
+    snap.outdatedSource = 'brew-view';
+    snap.outdatedCheckedAt = counts.checkedAt || null;
+  } else {
+    // ↓ 以下为回落口径（仅当 brew 模块的提供者不可用时才会执行），保留以保证总览不空白。
+    const oF = await runQuiet('brew', ['outdated', '--formula', '--quiet'], { timeoutMs: 60_000 });
+    snap.outdatedFormula = nonEmptyLines(oF.stdout).length;
 
-  // 口径：`--greedy-latest` = **brew 默认口径 + `version :latest` 的 cask**，不带 auto_updates
-  // 那一档 greedy。
-  // ★ 为什么不用 `--greedy`（2026-09-25 查 brew 源码 cask.rb#outdated_version 后更正）：
-  //   不带 greedy 时，brew 对 `auto_updates true` 的 cask 会走 `auto_updates_bundle_outdated?`
-  //   —— 真去读已装 .app 的 Info.plist 判断是否落后（由 HOMEBREW_NO_UPGRADE_AUTO_UPDATES_CASKS
-  //   控制，默认关 → 即默认启用该检查）。所以「应用已自更新到位、只是 brew 记账滞后」的假阳性
-  //   （本机实测 codebuddy-cn）**本来就不会被列出**；而 `--greedy` 会跳过这个 bundle 检查、
-  //   无条件纳入，于是总览常年虚报 1 项。
-  //   （更正：此前这里写「--greedy-latest 排除 auto_updates 应用」是错的 —— keka / wechat 同样是
-  //     auto_updates，但它们确实落后，所以照常列出，实测两边都是 3 项。）
-  // 为什么不跟 brew 管家页完全一致：那边要逐个读 .app 真实版本 + 探上游版本才能纠偏，
-  // 这里只是总览的轻量计数；**管家页才是权威口径**，总览只是同一个数字的近似。
-  //
-  // ★ 回落（2026-09-25）：`--greedy-latest` 是较新的开关，老 brew 不认会直接报错，而 runQuiet
-  //   把错误吞掉了 → 总览会**静默显示 0 项**（数字错得无声无息，最难排查）。故失败时回落到
-  //   不带 greedy 的口径（至少不漏普通 cask）；**不要回落 `--greedy`** —— 那会把上面那个假阳性
-  //   算回来。附带一条一次性 console.warn（与 warnedNotAllowed 同款），让「为什么是 0」有据可查。
-  let oC = await runQuiet('brew', ['outdated', '--cask', '--greedy-latest', '--quiet'], { timeoutMs: 60_000 });
-  if (oC.code !== 0) {
-    if (!warnedGreedyLatest) {
-      warnedGreedyLatest = true;
-      console.warn(`[env] 本机 brew 不支持 --greedy-latest（exit=${oC.code}），可更新计数回落到 --cask 口径`);
+    // 口径：`--greedy-latest` = **brew 默认口径 + `version :latest` 的 cask**，不带 auto_updates
+    // 那一档 greedy。
+    // ★ 为什么不用 `--greedy`（2026-09-25 查 brew 源码 cask.rb#outdated_version 后更正）：
+    //   不带 greedy 时，brew 对 `auto_updates true` 的 cask 会走 `auto_updates_bundle_outdated?`
+    //   —— 真去读已装 .app 的 Info.plist 判断是否落后（由 HOMEBREW_NO_UPGRADE_AUTO_UPDATES_CASKS
+    //   控制，默认关 → 即默认启用该检查）。所以「应用已自更新到位、只是 brew 记账滞后」的假阳性
+    //   （本机实测 codebuddy-cn）**本来就不会被列出**；而 `--greedy` 会跳过这个 bundle 检查、
+    //   无条件纳入，于是总览常年虚报 1 项。
+    //   （更正：此前这里写「--greedy-latest 排除 auto_updates 应用」是错的 —— keka / wechat 同样是
+    //     auto_updates，但它们确实落后，所以照常列出，实测两边都是 3 项。）
+    //   注：回落口径与管家列表（纠偏后）仍可能有差 —— 所以快照里带 outdatedSource，
+    //   界面据此如实标注，不再假装两边天然一致。
+    //
+    // ★ 回落（2026-09-25）：`--greedy-latest` 是较新的开关，老 brew 不认会直接报错，而 runQuiet
+    //   把错误吞掉了 → 总览会**静默显示 0 项**（数字错得无声无息，最难排查）。故失败时回落到
+    //   不带 greedy 的口径（至少不漏普通 cask）；**不要回落 `--greedy`** —— 那会把上面那个假阳性
+    //   算回来。附带一条一次性 console.warn（与 warnedNotAllowed 同款），让「为什么是 0」有据可查。
+    let oC = await runQuiet('brew', ['outdated', '--cask', '--greedy-latest', '--quiet'], { timeoutMs: 60_000 });
+    if (oC.code !== 0) {
+      if (!warnedGreedyLatest) {
+        warnedGreedyLatest = true;
+        console.warn(`[env] 本机 brew 不支持 --greedy-latest（exit=${oC.code}），可更新计数回落到 --cask 口径`);
+      }
+      oC = await runQuiet('brew', ['outdated', '--cask', '--quiet'], { timeoutMs: 60_000 });
     }
-    oC = await runQuiet('brew', ['outdated', '--cask', '--quiet'], { timeoutMs: 60_000 });
+    snap.outdatedCask = nonEmptyLines(oC.stdout).length;
   }
-  snap.outdatedCask = nonEmptyLines(oC.stdout).length;
 
   const taps = await runQuiet('brew', ['tap'], { timeoutMs: 15_000 });
   snap.tapList = nonEmptyLines(taps.stdout);

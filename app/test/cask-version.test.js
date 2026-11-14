@@ -37,6 +37,19 @@ test('sameAsCask：不误报（同一版要判等，否则 brew 升级会降级�
   assert.equal(sameAsCask('', '', '1.0'), false);               // 读不到应用版本 → 不判定为「同一版」
 });
 
+test('sameAsCask：cask 逗号后是应用自家构建号（2026-11-14 抖音形态）', () => {
+  // 实测 douyin：应用 CFBundleShortVersionString=8.8.0 / CFBundleVersion=014320，
+  // cask 版本 8.8.0,7044145585217083655,540056698 —— 逗号后那套编码与 CFBundleVersion 无关，
+  // 旧实现三种约定全落空 → 本体已是 8.8.0 却被列成「可更新」（界面显示「当前 8.8.0 → 可用 8.8.0」）。
+  assert.equal(sameAsCask('8.8.0', '014320', '8.8.0,7044145585217083655,540056698'), true);
+  // steam 形态：只有 CFBundleVersion（short 由 readAppVersion 回落成 6.1）
+  assert.equal(sameAsCask('6.1', '6.1', '6.1,1791918634,984652b88a9737e3f4e77c656d9ffa67d5042c2c'), true);
+  // 逗号前那截不等 → 仍是真落后，不能被吞
+  assert.equal(sameAsCask('8.5.1', '014320', '8.8.0,7044145585217083655,540056698'), false);
+  // 无逗号的 cask 不受这条影响（保守口径：宁可多提）
+  assert.equal(sameAsCask('2.13.1', '1169', '2.13.1'), false);
+});
+
 test('sameAsCask：预发布后缀必须参与比较（2026-10-25 漏报）', () => {
   // 实测 deepseek-harness：应用 0.2.1-rc.2、cask 0.2.1-rc.3，brew 三种口径都报 outdated，
   // 但旧实现用 parseStrict 把两边都截成 [0,2,1] → 判成「已是最新」→ 永远列不出来。

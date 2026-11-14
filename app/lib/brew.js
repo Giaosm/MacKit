@@ -391,6 +391,11 @@ function parseOutdatedJson(text, key) {
       current: Array.isArray(it.installed_versions) && it.installed_versions.length
         ? it.installed_versions.join(', ') : null,
       latest: typeof it.current_version === 'string' ? it.current_version : null,
+      // 「当前」的来源：brew 记账值（Cellar / Caskroom 里记的版本）。
+      // ★ 2026-11-14：界面必须能说清这个数字是哪来的 —— 记账值可能与**应用本体**版本不同
+      //   （auto_updates 应用自更新后 brew 不会跟着记账），只写「当前 x.y.z」会误导。
+      //   有应用真实版本时由 queryCaskOutdated() 覆盖成 'app'。
+      currentSource: 'brew',
     }));
   } catch { return null; }
 }
@@ -480,6 +485,20 @@ async function caskMetaMap(names) {
 }
 
 /**
+ * 把应用本体版本拼成一个可读串：短版本 +（独立的）build 号。
+ * steam 这类只有 CFBundleVersion 的应用（fromBuild=true）直接返回 build 值。
+ * @param {{short:string,build:string|null,fromBuild?:boolean}|null} app
+ * @returns {string|null}
+ */
+function appVersionText(app) {
+  if (!app) return null;
+  const short = String(app.short || '').trim();
+  const build = String(app.build || '').trim();
+  if (!short) return build || null;
+  return build && build !== short ? `${short}-${build}` : short;
+}
+
+/**
  * cask 的「可更新」判定（返回可交给 brew 升级的项 + 上游已有新版本的提示项）。
  *
  * 上游版本有**两个来源**，按此优先级取：
@@ -513,7 +532,11 @@ async function queryCaskOutdated() {
     }
     if (sameAsCask(app.short, app.build, m.version)) continue;  // 假阳性：应用已是 cask 版本（记账滞后）
     if (compare(app.short, m.version) > 0) continue;            // 应用反而更新 → brew 装下去是降级，不列
-    items.push({ ...it, autoUpdates: true });                   // 真落后 → 参与 brew 升级
+    // 真落后 → 参与 brew 升级。
+    // ★ 2026-11-14：「当前版本」改用**应用本体**版本并标注来源（currentSource='app'）。
+    //   brew outdated 给的 installed_versions 是 Caskroom 记账值，与本体可能差好几版
+    //   （用户实测的「本体已是 7.0.13-136，界面还写旧版本」就是这个原因）。
+    items.push({ ...it, autoUpdates: true, current: appVersionText(app), currentSource: 'app' });
   }
 
   // ② 上游探测：抓「cask 自己没跟上」的假阴性（brew 完全不报的那种）
@@ -1768,6 +1791,30 @@ for (const a of Object.values(actions)) {
   if (typeof origSteps !== 'function') continue;
   a.steps = (params, ctx) => { invalidateOutdated(); return origSteps(params, ctx); };
 }
+
+/**
+ * 环境体检口径的「可更新」计数 —— **与 Homebrew 管家列表同一事实源**。
+ *
+ * ★ 2026-11-14 修（用户反馈的自相矛盾）：此前总览卡走 env.js 的 `brew outdated --cask
+ *   --greedy-latest --quiet` 轻量口径，管家列表走本模块的纠偏口径（auto_updates 应用按
+ *   本体真实版本判定）。两条路各算一次，于是同一屏出现「可更新 2 项」和「Formula 2 + Cask 1」
+ *   两个数字。现在总览直接用这里的 counts，环境卡与列表永远一致。
+ *
+ * 代价：/api/env 首屏可能要等一次完整纠偏查询（冷启动约 3~5s，有 60s 短缓存）。
+ * 换来的是「总览数字 = 列表数字」，不再需要向用户解释两套口径 —— 这个取舍是有意的。
+ * @returns {Promise<{formula:number,cask:number,checkedAt:number,cached:boolean}>}
+ */
+export async function outdatedCounts() {
+  const v = await queryOutdated({ force: false });
+  return {
+    formula: Array.isArray(v.formulae) ? v.formulae.length : 0,
+    cask: Array.isArray(v.casks) ? v.casks.length : 0,
+    checkedAt: v.checkedAt || null,
+    cached: v.cached === true,
+  };
+}
+// 注册给 env.js：总览 / 环境卡的「可更新 N 项」由此复用本模块口径（唯一事实源）。
+env.registerOutdatedProvider(outdatedCounts);
 
 export default {
   id: 'brew',

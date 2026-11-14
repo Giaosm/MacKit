@@ -48,9 +48,16 @@ export function githubRepoFromCaskUrl(url) {
 
 /**
  * 读 .app 的真实已装版本：**短版本 + build 号**（CFBundleShortVersionString / CFBundleVersion）。
- * 两个都要，理由见 sameAsCask()。读不到短版本 → null（调用方回退 brew 口径）。
+ * 两个都要，理由见 sameAsCask()。
+ *
+ * ★ 2026-11-14 补：短版本缺失时回落到 CFBundleVersion（steam 就是这种 ——
+ *   它的 Info.plist 只有 CFBundleVersion=`6.1`，没有 CFBundleShortVersionString）。
+ *   此前一律返回 null → 界面把它列成「可更新 + 版本未知」，而 cask 版本也是 6.1，
+ *   纯属误报；用户点升级只是把 brew 记账刷一遍。回落时打 `fromBuild` 标记，
+ *   调用方可以据此把「当前版本」的展示标注成 build 号来源。
+ * 两个都读不到 → null（调用方回退 brew 口径）。
  * @param {string|null} appTarget 形如 /Applications/Clash Verge.app
- * @returns {Promise<{short:string,build:string|null}|null>}
+ * @returns {Promise<{short:string,build:string|null,fromBuild?:boolean}|null>}
  */
 export async function readAppVersion(appTarget) {
   if (!appTarget) return null;
@@ -64,7 +71,9 @@ export async function readAppVersion(appTarget) {
     } catch { return null; }
   };
   const [short, build] = await Promise.all([read('CFBundleShortVersionString'), read('CFBundleVersion')]);
-  return short ? { short, build } : null;
+  if (short) return { short, build };
+  if (build) return { short: build, build, fromBuild: true };
+  return null;
 }
 
 /**
@@ -188,6 +197,16 @@ export function sameAsCask(appShort, appBuild, caskVer) {
   //   要求「短版本是逗号前那截的前缀」+「build 与逗号后那截完全相等」双条件：
   //   对 wechat 成立、对真落后的旧版本（build 270100 ≠ 270102）不成立 → 不漏报。
   if (buildSeg && build && build === buildSeg && samePrefix(short, ver)) return true;
+  // 约定 D（2026-11-14）：cask 版本**带逗号**（即逗号后还有构建号那一套编码），
+  //   而逗号前那截与应用短版本**字符串完全相同** → 同一版，直接判等。
+  //   抖音实测：应用 CFBundleShortVersionString=`8.8.0` / CFBundleVersion=`014320`，
+  //   cask 版本 `8.8.0,7044145585217083655,540056698` —— 逗号后是抖音自己的构建号，
+  //   与 CFBundleVersion 完全不是一套编码，约定 A/B/C 都对不上，于是「本体已是 8.8.0」的
+  //   应用被天天列成可更新（界面表现为「当前 8.8.0 → 可用 8.8.0」，用户只会觉得版本号乱套）。
+  //   只认**逗号存在 + 字符串完全相等**两个条件：
+  //     · 无逗号的 cask（如 `2.13.1`）不触发 —— 那种情况仍按约定 A/B/C 保守处理（宁可多提）；
+  //     · 预发布差一档（app `0.2.1-rc.2` / cask `0.2.1-rc.3`）字符串不等 → 不会误吞真落后。
+  if (buildSeg && ver && short.toLowerCase() === ver.toLowerCase()) return true;
   // 约定 C：应用没有可用的 build 号（或与短版本相同）→ 只能按短版本判定。
   //   ★ 2026-10-25 修：这里曾经「前三段数字相同就判同一版」，用 parseStrict 截断在补丁号，
   //     于是 `0.2.1-rc.2`（应用）与 `0.2.1-rc.3`（cask）都被截成 [0,2,1] → 判成「已是最新」

@@ -80,7 +80,14 @@ export default {
         ui.kv('版本', b.version || '未检测到'),
         ui.kv('路径', el('span', { class: 'mono', text: b.path || '—' })),
         ui.kv('已安装', `formula ${b.formulaCount || 0} / cask ${b.caskCount || 0}`),
-        ui.kv('可更新', outdated > 0 ? `${outdated} 项` : '0 项'),
+        // 口径说明（2026-11-14）：这个数字现在与 Homebrew 管家「升级列表」同源（后端 brew 模块的
+        // 纠偏计数），不再是体检路径各算一次的近似值 —— 两处数字一致是刻意保证的。
+        ui.kv('可更新', el('span', {
+          title: b.outdatedSource === 'brew-raw'
+            ? 'brew 原始口径（brew outdated --quiet），未按应用本体版本纠偏；可能与 Homebrew 管家的升级列表略有出入。'
+            : '与 Homebrew 管家「升级列表」同一口径（已按应用本体版本纠偏）。',
+          text: outdated > 0 ? `${outdated} 项` : '0 项',
+        })),
       ]);
       if (outdated === 0) brewRows.append(el('div', { class: 'empty', style: 'padding:12px' }, [el('div', { class: 'empty__title', text: '🎉 所有 Homebrew 软件包均为最新' }), el('div', { class: 'muted', text: '无需更新' })]));
       brewRows.append(metaLine());   // 「元数据同步于 X」：说明这个数字有多新

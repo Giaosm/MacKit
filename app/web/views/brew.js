@@ -25,6 +25,39 @@ const MIRRORS = [
 const CORE_TAPS = ['homebrew/core', 'homebrew/cask'];
 const CHANNEL_LABEL = { direct: '直连', proxy: '代理', direct_first: '直连优先', proxy_first: '代理优先', auto: '自动' };
 
+/**
+ * 版本串的「正文短化」：正文只显示主段，完整串放 title。
+ *
+ * ★ 2026-11-14 修（用户反馈「版本号看着很怪」）：cask 的 version 会把 build / hash 拼在后面，
+ *   实测 `8.5.1,7044145585217083655,469669512`、`4.12.4.43368774,62ef1801` 这类串直接铺在
+ *   列表里，用户根本读不出「当前是几版、可用是几版」。规则：
+ *     · 逗号后是 build / hash 段（抖音、steam 那种）→ 只留逗号前那截；
+ *     · 点分段超过 3 段（`4.12.4.43368774`）→ 只留语义三段（第 4 段起基本都是 build 号）；
+ *     · `latest`（brew 对 version :latest 的 cask 就是这么写的）→ 原样显示，它本身没有可比数字。
+ *   只看不改数据：title 里永远是后端给的完整原串，鼠标悬停即可核对。
+ * @param {string|null|undefined} v
+ * @returns {string}
+ */
+function shortVer(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!s) return '—';
+  if (/^latest$/i.test(s)) return 'latest';
+  const head = s.split(',')[0].trim();
+  const m = head.match(/^\d+(?:\.\d+){0,3}/);
+  if (!m) return head;
+  const segs = m[0].split('.');
+  return segs.length > 3 ? segs.slice(0, 3).join('.') : m[0];
+}
+
+/** 「当前版本」的来源标注：后端 currentSource 只有 'app'（应用本体）与 'brew'（记账值）两种。 */
+const CURRENT_SRC = {
+  app: { text: '应用本体', tip: '「当前版本」读取自应用包内的 Info.plist（应用本体版本），不是 brew 的安装记录。' },
+  brew: {
+    text: 'brew 记账',
+    tip: '「当前版本」来自 brew 的安装记录（Cellar / Caskroom 记账值），可能与应用本体版本不同 —— 自带更新（auto_updates）的应用在应用内升级后，brew 不会同步记账。',
+  },
+};
+
 export default {
   id: 'brew',
   title: 'Homebrew 管家',
@@ -66,6 +99,19 @@ export default {
     const panelSubs = [];
 
     // ---------------- 环境卡 ----------------
+    /**
+     * 网络卡的单通道取值：出口 IP + 归属地。
+     * ★ 2026-11-14 补归属地（用户反馈「网络信息卡缺归属地」）：后端早就探到了
+     *   （直连走 myip.ipip.net 给中文归属地，代理走 api.ip.sb/geoip 给 `国家 · 地区 · 城市`），
+     *   只是这张卡此前只渲染了 ip 字段。完整串放 title，防止窄卡片截断后看不全。
+     */
+    function netVal(p) {
+      if (!p || !p.ok) return '🔴 不可达';
+      const ip = p.ip || '已连通';
+      const loc = p.location ? ` · ${p.location}` : '';
+      return el('span', { title: `${ip}${loc}`, text: `🟢 ${ip}${loc}` });
+    }
+
     function renderEnv() {
       envBox.innerHTML = '';
       if (!env) { envBox.append(el('div', { class: 'view-loading', text: '正在体检…' })); return; }
@@ -73,16 +119,28 @@ export default {
       const running = ctx.state.task && ctx.state.task.status === 'running' ? ctx.state.task : null;
       const chStep = running && running.steps ? running.steps.filter((s) => s.channel).pop() : null;
       const chBadge = chStep ? ui.badge('当前通道 ' + CHANNEL_LABEL[chStep.channel], chStep.channel) : ui.badge('空闲', 'muted');
+      const outdatedTotal = (b.outdatedFormula || 0) + (b.outdatedCask || 0);
       const grid = el('div', { class: 'grid grid--3' }, [
         ui.card('🍺 环境', el('div', { class: 'card__rows' }, [
           ui.kv('版本', b.version || '未检测到'),
           ui.kv('已装', `formula ${b.formulaCount || 0} / cask ${b.caskCount || 0}`),
-          ui.kv('可更新', `${(b.outdatedFormula || 0) + (b.outdatedCask || 0)} 项`),
+          // 数字口径（2026-11-14 统一）：正常来自后端 brew 模块的纠偏口径 → 与下方升级列表一致；
+          // 只有该提供者不可用时后端才回落到 brew 原始口径（outdatedSource='brew-raw'），此时如实说明。
+          ui.kv('可更新', el('span', {
+            title: b.outdatedSource === 'brew-raw'
+              ? '环境体检的 brew 原始口径（brew outdated --quiet），未按应用本体版本纠偏 —— 可能与下方「升级列表」的数字略有出入。'
+              : '与下方「升级列表」同一口径（已按应用本体版本纠偏），两处数字一致。',
+            text: `${outdatedTotal} 项`,
+          })),
         ]), { light: b.status || 'warn', extra: chBadge }),
         ui.card('🌐 网络', el('div', { class: 'card__rows' }, [
-          ui.kv('直连', n.direct && n.direct.ok ? `🟢 ${n.direct.ip || '正常'}` : '🔴 不可达'),
-          ui.kv('代理', n.proxy && n.proxy.ok ? `🟢 ${n.proxy.ip || '正常'}` : '🔴 不可达'),
-        ]), { light: n.status || 'warn' }),
+          ui.kv('直连', netVal(n.direct)),
+          ui.kv('代理', netVal(n.proxy)),
+          // 两个通道用的是不同回显站点（国内 ipip / 境外 ip.sb），IP 仍相同 → 代理没把流量送出去
+          n.proxy && n.proxy.sameAsDirect
+            ? el('div', { class: 'warn-box', text: '两个出口 IP 相同：这条「代理」实际没把流量送出去。' })
+            : null,
+        ].filter(Boolean)), { light: n.status || 'warn' }),
         ui.card('⚙ 配置', el('div', { class: 'card__rows' }, [
           ui.kv('镜像源', m.label || m.id || '—'),
           ui.kv('代理端口', `${pp.http || '—'} / ${pp.socks5 || '—'}`),
@@ -290,6 +348,8 @@ export default {
       function itemRow(it) {
         const key = keyOf(it);
         const cur = decisions.get(key) || null;
+        const src = CURRENT_SRC[it.currentSource === 'app' ? 'app' : 'brew'];
+        const full = `当前 ${it.current || '—'} → 可用 ${it.latest || '—'}`;
         return el('div', { class: 'row row--between', style: 'padding:6px 0; border-bottom:1px solid var(--border,#2a2a2a)' }, [
           el('span', {}, [
             el('span', { class: 'mono', text: it.name }), ' ', ui.badge(it.kind, 'muted'), ' ',
@@ -299,7 +359,10 @@ export default {
             // 读不到应用真实版本（plutil 被拒 / 路径缺失）→ 升级方向**未经验证**：照实标注，
             // 别让用户以为已经核对过（2026-09-22 的反向降级事故正是这种「以为核对过」）。
             it.unverified ? ui.badge('版本未知', 'warn') : null, it.unverified ? ' ' : null,
-            el('span', { class: 'muted', text: `当前 ${it.current || '—'} → 可用 ${it.latest || '—'}` }),
+            // 正文只显示主段，完整串（含 build / hash）放 title —— 见 shortVer 的注释。
+            el('span', { class: 'muted', title: full, text: `当前 ${shortVer(it.current)} → 可用 ${shortVer(it.latest)}` }),
+            // 「当前」是哪来的：应用本体版本 / brew 记账值（两者可能差好几版，必须说清）
+            el('span', { class: 'muted', title: src.tip, text: ` · 来源 ${src.text}` }),
             it.unverified ? el('span', { class: 'muted', text: '（读不到应用真实版本，升级前请确认，以免回退）' }) : null,
           ]),
           el('span', {}, [mutualBtn(key, cur, 'proxy', '代理'), ' ', mutualBtn(key, cur, 'direct', '直连')]),
@@ -320,7 +383,12 @@ export default {
         const rows = items.map((it) => el('div', { class: 'row row--between', style: 'padding:6px 0' }, [
           el('span', {}, [
             el('span', { class: 'mono', text: it.name }), ' ', ui.badge('上游有新版本', 'muted'), ' ',
-            el('span', { class: 'muted', text: `本机 ${it.current || '—'} → 上游 ${it.latest || '—'}（homebrew-cask 仍是 ${it.cask || '—'}）` }),
+            el('span', {
+              class: 'muted',
+              title: `本机 ${it.current || '—'} → 上游 ${it.latest || '—'}（homebrew-cask 仍是 ${it.cask || '—'}）`,
+              // 统一短化：正文只留主段，完整串在 title 里核对（与升级列表同款处理）
+              text: `本机 ${shortVer(it.current)} → 上游 ${shortVer(it.latest)}（homebrew-cask 仍是 ${shortVer(it.cask)}）`,
+            }),
             // 说清这个「上游版本」是哪来的：GitHub Release 还是应用自带的 Sparkle 更新源
             el('span', { class: 'muted', text: it.source === 'appcast' ? ' · 来源：应用自己的更新源' : ' · 来源：GitHub Release' }),
           ]),
@@ -334,16 +402,16 @@ export default {
         if (total === 0) {
           listHost.append(ui.card('可更新项', ui.empty({
             icon: '🎉', title: '本列表中暂无可升级项',
-            // 措辞不再说「所有软件包均为最新」（2026-10-25 修）：本列表是**纠偏后**的口径，
-            // 与顶部总览的 brew 原始计数可能不同，绝对化的断言会和那张卡直接打架。
+            // 措辞不再说「所有软件包均为最新」（2026-10-25 修）：本列表是**纠偏后**的口径。
+            // 2026-11-14 起顶部总览也改用同一口径，正常情况下两处数字必然一致。
             text: `Formula ${data.counts.formula} 项 · Cask ${data.counts.cask} 项　　可更新检查：${data.checkedAt ? ctx.fmtDateTime(data.checkedAt) : '—'}`,
             // 这里原先还有一个「重新检查」按钮：与正上方工具条的按钮同名同功能，
             // 两处并存只会让用户分不清各自做什么（2026-09-21 去掉重复入口，说明文字里已给出时间）。
           })));
-          // 顶部总览（体检口径）与这里（纠偏口径）数字不一致时，把原因摊开说清楚，
-          // 否则用户只会看到「明明写着可更新 1 项，下面却说没有」。
+          // 顶部总览与这里默认**同源**（2026-11-14 起环境卡的计数就取自本列表口径），
+          // 只有在后端回落到 brew 原始口径（outdatedSource='brew-raw'）时才会出现数字不一致。
           const envOutdated = env && env.brew ? (env.brew.outdatedFormula || 0) + (env.brew.outdatedCask || 0) : 0;
-          if (envOutdated > 0) {
+          if (envOutdated > 0 && env.brew.outdatedSource === 'brew-raw') {
             listHost.append(el('div', {
               class: 'muted section',
               text: `顶部「可更新 ${envOutdated} 项」来自环境体检的 brew 原始口径；本列表按应用真实版本纠偏后为 0 项 —— 常见原因：应用已自更新到位（brew 记账滞后）、或那几项本机版本已不低于 cask（再装等于降级）。`,
