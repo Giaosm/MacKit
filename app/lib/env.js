@@ -230,13 +230,49 @@ function parseIpInfo(text) {
   return { ip, location: location || null };
 }
 
+/** 直连口径的回显：国内服务，能给中文归属地。 */
+const IP_ECHO_DIRECT = 'https://myip.ipip.net';
+
+/**
+ * 代理口径的回显：**必须是境外站点**。
+ *
+ * ★ 2026-11-14 实测踩到的坑：此前两个通道都用 myip.ipip.net，而规则分流的代理客户端
+ *   会把国内域名（ipip.net）走**直连**，于是「代理出口 IP」显示的是本地 IP ——
+ *   界面看起来像「代理没生效」，实际是分流规则的正常结果。改成境外回显后，
+ *   同一台机器实测：直连 117.174.233.140（成都移动）、代理 35.78.245.173（东京 AWS），
+ *   对比才有意义。
+ * ★ 用 geoip 接口（JSON）而不是纯 IP：顺带拿到归属地，省一次请求。
+ */
+const IP_ECHO_PROXY = 'https://api.ip.sb/geoip';
+
 /**
  * 单通道出口 IP 探测。
  * @param {'direct'|'proxy'} channel
  * @returns {Promise<{ip:string|null, location:string|null}>}
  */
 async function probeIp(channel) {
-  const res = await runQuiet('curl', ['--max-time', '5', '-sSf', 'https://myip.ipip.net'], {
+  if (channel === 'proxy') {
+    const res = await runQuiet('curl', ['--max-time', '6', '-sSf', IP_ECHO_PROXY], {
+      channel,
+      timeoutMs: 9000,
+    });
+    if (res.code !== 0) return { ip: null, location: null };
+    try {
+      const j = JSON.parse(String(res.stdout).trim());
+      // region 与 city 常常同名（Tokyo / Tokyo），去重后再拼，避免「Japan · Tokyo · Tokyo」
+      const parts = [...new Set([j.country, j.region, j.city]
+        .filter((s) => typeof s === 'string' && s.trim())
+        .map((s) => s.trim()))];
+      return {
+        ip: typeof j.ip === 'string' && j.ip ? j.ip : null,
+        location: parts.length ? parts.join(' · ') : (typeof j.isp === 'string' && j.isp ? j.isp : null),
+      };
+    } catch {
+      // 服务端偶尔返回纯文本 IP（或 HTML），退回通用解析
+      return parseIpInfo(res.stdout);
+    }
+  }
+  const res = await runQuiet('curl', ['--max-time', '5', '-sSf', IP_ECHO_DIRECT], {
     channel,
     timeoutMs: 8000,
   });
@@ -283,6 +319,12 @@ async function networkTest() {
     proxy.location = info.location;
   } else {
     proxy.error = { code: exec.ERR.NET_UNREACHABLE, message: '代理网络异常' };
+  }
+
+  // 两个通道用的回显服务不同（见 IP_ECHO_*），正常情况下 IP 必然不同；
+  // 若仍然相同，说明这条「代理」没把流量送出去（或客户端把该域名也分流成直连），值得提示。
+  if (direct.ok && proxy.ok && direct.ip && proxy.ip && direct.ip === proxy.ip) {
+    proxy.sameAsDirect = true;
   }
 
   return { direct, proxy, allFailed: !direct.ok && !proxy.ok };

@@ -90,6 +90,10 @@ export default {
       // 网络
       grid.append(ui.card('🌐 网络', el('div', { class: 'card__rows' }, [
         ...netRows('直连', n.direct), ...netRows('代理', n.proxy),
+        // 两通道用的是不同回显（国内 / 境外），IP 还相同就说明代理没把流量送出去
+        n.proxy && n.proxy.sameAsDirect
+          ? el('div', { class: 'warn-box', text: '两个出口 IP 相同：这条「代理」实际没把流量送出去。常见原因：客户端没选节点、规则把该域名分流成直连、或只开了 TUN 却没接管流量。' })
+          : null,
         n.allFailed ? el('div', { class: 'err-box', text: '直连与代理均不可用，请检查网络或代理端口配置。' }) : null,
       ].filter(Boolean)), { light: lightOf(n.status) }));
 
