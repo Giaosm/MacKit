@@ -1382,8 +1382,18 @@ function finalizeSync(task, { log }) {
 const META_TTL_MS = 30 * 60 * 1000;
 /** 失败后的静默窗口：断网 / 代理没开时不要每隔一分钟重试。 */
 const META_FAIL_BACKOFF_MS = 5 * 60 * 1000;
-/** 单次 `brew update` 的超时（实测 1.7~3.2s，给足余量）。 */
-const META_TIMEOUT_MS = 120_000;
+/**
+ * 单次 `brew update` 的超时。
+ *
+ * ★ 2026-11-14 修正：原为 120s，注释里「实测 1.7~3.2s」是**缓存命中（304）**时的数字。
+ *   官方源每次索引更新（ETag 变化）都要整包重下 `api/internal/packages.<平台>.jws.json`：
+ *   gzip 后 3.86 MB / 解压后 16 MB。走代理的实测吞吐只有 14~140 KB/s（Fastly 新加坡 POP），
+ *   120s 内下不完 → 每 30 分钟一次同步**必然**超时，界面上就是「元数据总是同步失败」；
+ *   更糟的是被超时打断后 `.new` 只落一半，下次还得从头再来（curl --output 不续传）。
+ *   给到 500 秒（实测单连接 42~142 KB/s，最坏约 90 秒~4 分钟；500s 留足余量）。
+ *   失败仍有 5 分钟退避，不会因为放宽超时变成「一直占着」。
+ */
+const META_TIMEOUT_MS = 500_000;
 
 const metaState = { refreshing: false, inflight: null, failedAt: 0, lastError: null };
 
@@ -1450,6 +1460,9 @@ export async function refreshBrewMeta(opts = {}) {
   metaState.refreshing = true;
   metaState.inflight = (async () => {
     try {
+      // 先说明「可能在等什么」：官方源索引整包 3.86 MB（解压 16 MB），慢线路要几分钟，
+      // 不写出来用户只会看到界面转圈，误以为卡死。
+      log('info', '正在同步 Homebrew 元数据（brew update；官方 API 索引较大时可能需要几分钟）');
       await run(policyForMirror(), '同步 Homebrew 元数据', 'brew', ['update'], { timeoutMs: META_TIMEOUT_MS, env: BREW_ENV });
       markMetaRefreshed(); // 时间戳 + 清失败状态（唯一实现点，别再各写一份）
       log('ok', '已同步 Homebrew 元数据（brew update）');
