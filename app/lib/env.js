@@ -225,8 +225,16 @@ function parseIpInfo(text) {
   const ip = m ? m[1] : null;
   let location = t;
   if (m) location = t.replace(m[0], '').replace(/^[\s：:]+/, '').trim();
-  // 去掉可能的 "IP：" 前缀残留
-  location = location.replace(/^IP[\s：:]*/i, '').trim();
+  // 去掉回显文本里的标签残留。myip.ipip.net 的原文是
+  //   「当前 IP：117.174.233.140  来自于：中国 四川 成都 移动」
+  // 摘掉 IP 后剩「当前 IP： 来自于：中国 四川 成都 移动」，直接铺到卡片上就是
+  // 「· 当前 IP： 来自于：中国 四川 成都 移动」（2026-11-17 实测截图）。只留归属地正文。
+  location = location
+    .replace(/当前\s*IP[\s：:]*/gi, '')
+    .replace(/来自于[\s：:]*/g, '')
+    .replace(/^IP[\s：:]*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   return { ip, location: location || null };
 }
 

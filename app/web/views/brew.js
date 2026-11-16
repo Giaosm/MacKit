@@ -43,10 +43,15 @@ function shortVer(v) {
   if (!s) return '—';
   if (/^latest$/i.test(s)) return 'latest';
   const head = s.split(',')[0].trim();
+  // ★ brew formula 的 revision 后缀（`4.0.0_1`）**必须保留**（2026-11-17 修）：
+  //   它本身就是版本差异，吃掉之后列表会出现「当前 4.0.0 → 可用 4.0.0」这种自相矛盾的行
+  //   （实测 ada-url `4.0.0_1 → 4.0.0_2`、merve `1.2.2_4 → 1.2.2_5`）。
+  const rev = (head.match(/_(\d+)$/) || [])[1];
   const m = head.match(/^\d+(?:\.\d+){0,3}/);
   if (!m) return head;
   const segs = m[0].split('.');
-  return segs.length > 3 ? segs.slice(0, 3).join('.') : m[0];
+  const core = segs.length > 3 ? segs.slice(0, 3).join('.') : m[0];
+  return rev ? `${core}_${rev}` : core;
 }
 
 /** 「当前版本」的来源标注：后端 currentSource 只有 'app'（应用本体）与 'brew'（记账值）两种。 */
@@ -91,6 +96,13 @@ export default {
     let env = null;
     let envBusy = false;
     let config = null;
+    /**
+     * 「升级列表」最近一次拉到的计数（{ formula, cask }）。
+     * ★ 环境卡的「可更新 N 项」优先用它（2026-11-17）：列表是本页最权威、最实时的口径，
+     *   而体检快照可能比它旧（30s 缓存）—— 同屏两个数字必须同源，否则用户看到
+     *   「环境卡 1 项 / 列表 11 项」只会认为程序算错了。
+     */
+    let listCounts = null;
     // 本实例的延时器（Cask 搜索防抖）与**面板级**订阅（解绑器）登记表。
     // 必须是 mount 局部变量：unmount() 是 mount() 的兄弟方法、看不到这里，而路由 teardown
     // 已按实例回收订阅；若放模块作用域，旧实例晚执行的清理会误杀新实例的订阅与延时器。
@@ -119,19 +131,21 @@ export default {
       const running = ctx.state.task && ctx.state.task.status === 'running' ? ctx.state.task : null;
       const chStep = running && running.steps ? running.steps.filter((s) => s.channel).pop() : null;
       const chBadge = chStep ? ui.badge('当前通道 ' + CHANNEL_LABEL[chStep.channel], chStep.channel) : ui.badge('空闲', 'muted');
-      const outdatedTotal = (b.outdatedFormula || 0) + (b.outdatedCask || 0);
+      // 可更新数字（2026-11-17）：升级列表已加载就用它的 counts —— 同一屏两处必须同源。
+      // 列表还没拉到（例如首屏体检先回来）时才回落到体检快照里的值。
+      const outdatedTotal = listCounts
+        ? listCounts.formula + listCounts.cask
+        : (b.outdatedFormula || 0) + (b.outdatedCask || 0);
+      const outdatedTip = listCounts
+        ? `与下方「升级列表」同一份数据（Formula ${listCounts.formula} + Cask ${listCounts.cask}）。`
+        : (b.outdatedSource === 'brew-raw'
+          ? '环境体检的 brew 原始口径（brew outdated --quiet），未按应用本体版本纠偏 —— 可能与下方「升级列表」的数字略有出入。'
+          : '与下方「升级列表」同一口径（已按应用本体版本纠偏）；列表加载完成后会直接沿用它的计数。');
       const grid = el('div', { class: 'grid grid--3' }, [
         ui.card('🍺 环境', el('div', { class: 'card__rows' }, [
           ui.kv('版本', b.version || '未检测到'),
           ui.kv('已装', `formula ${b.formulaCount || 0} / cask ${b.caskCount || 0}`),
-          // 数字口径（2026-11-14 统一）：正常来自后端 brew 模块的纠偏口径 → 与下方升级列表一致；
-          // 只有该提供者不可用时后端才回落到 brew 原始口径（outdatedSource='brew-raw'），此时如实说明。
-          ui.kv('可更新', el('span', {
-            title: b.outdatedSource === 'brew-raw'
-              ? '环境体检的 brew 原始口径（brew outdated --quiet），未按应用本体版本纠偏 —— 可能与下方「升级列表」的数字略有出入。'
-              : '与下方「升级列表」同一口径（已按应用本体版本纠偏），两处数字一致。',
-            text: `${outdatedTotal} 项`,
-          })),
+          ui.kv('可更新', el('span', { title: outdatedTip, text: `${outdatedTotal} 项` })),
         ]), { light: b.status || 'warn', extra: chBadge }),
         ui.card('🌐 网络', el('div', { class: 'card__rows' }, [
           ui.kv('直连', netVal(n.direct)),
@@ -292,7 +306,15 @@ export default {
        */
       async function load(force) {
         host.innerHTML = ''; host.append(el('div', { class: 'view-loading', text: '正在检查可更新项…' }));
-        try { data = await api('GET', force ? '/api/brew/outdated?force=1' : '/api/brew/outdated'); } catch (err) { host.innerHTML = ''; host.append(el('div', { class: 'err-box', text: `检查失败：${err.message || err}` })); return; }
+        try {
+          data = await api('GET', force ? '/api/brew/outdated?force=1' : '/api/brew/outdated');
+        } catch (err) {
+          host.innerHTML = ''; host.append(el('div', { class: 'err-box', text: `检查失败：${err.message || err}` }));
+          // 拉取失败 → 不要继续拿旧计数给环境卡背书（那正是「两处数字打架」的来源之一）
+          listCounts = null;
+          if (env) renderEnv();
+          return;
+        }
         // 形状兜底：后端契约是 { formulae, casks, counts, checkedAt }，缺字段时按空处理，
         // 避免后端演进 / 代理层返回异形 JSON 时把整个面板炸成白屏（2026-09-19）。
         data = {
@@ -301,6 +323,10 @@ export default {
           counts: { formula: 0, cask: 0, ...((data && data.counts) || {}) },
         };
         decisions.clear();
+        // 列表计数回灌环境卡（同屏同源，见 listCounts 的注释）—— 让「顶部可更新 N 项」
+        // 与「共 N 项可更新」永远出自同一份数据，无论体检快照是否更旧。
+        listCounts = { formula: data.counts.formula, cask: data.counts.cask };
+        if (env) renderEnv();
         draw();
       }
 
@@ -320,8 +346,10 @@ export default {
           catch (err) { ui.toast('warn', `元数据同步失败（仍按现有数据重算）：${err.message || err}`); }
           finally { btn.disabled = false; btn.textContent = idle; }
         }
-        load(true);   // 用户主动重查：绕过短缓存
-        // 同步过就顺带刷一次体检，避免顶部「可更新 N 项」与下面的列表数字打架
+        // ★ 必须 await（2026-11-17）：先让列表拿到新数据（后端会顺手作废体检快照），
+        //   再刷体检。此前不 await，loadEnv 往往在列表返回前就用旧快照渲染了环境卡，
+        //   于是「顶部 1 项 / 列表 11 项」照样出现。
+        await load(true);   // 用户主动重查：绕过短缓存
         if (refreshed) loadEnv(false);
       }
 

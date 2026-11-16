@@ -432,6 +432,11 @@ async function queryOutdated(params = {}) {
     checkedAt,
   };
   outdatedCache = { at: Date.now(), value };
+  // ★ 2026-11-17 修：用户主动重查（force）拿到新结果后，必须顺手作废**环境体检快照**。
+  //   否则总览卡的「可更新 N 项」仍是 30s 内那份旧快照里的数字，与刚刷新的列表打架 ——
+  //   实测现场：环境卡「1 项」/ 列表「Formula 6 + Cask 5 = 11 项」，差一个数量级。
+  //   根因是两层缓存各自计时（本模块 60s、体检快照 30s），列表带 force 绕过而体检没有。
+  if (params.force === true) { try { env.invalidate(); } catch { /* 快照作废失败不影响列表结果 */ } }
   return value;
 }
 
