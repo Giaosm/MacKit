@@ -192,7 +192,7 @@ export default {
       val.uptime.textContent = s.running ? fmtDuration(s.uptimeSec) : '—';
       val.python.textContent = s.python.exists ? s.python.bin : `${s.python.bin}（缺失）`;
       // 目录是自动发现的（取版本号最大的那份）：把挑中的版本与「被忽略的旧版本」都摊开，
-      // 免得用户放了 v9.6 却仍看到 v9.5 在跑时分不清是哪一步没生效。
+      // 免得用户放了新版目录却仍看到旧版在跑时分不清是哪一步没生效。
       const others = Array.isArray(s.otherDists) && s.otherDists.length ? `（忽略旧版：${s.otherDists.join('、')}）` : '';
       val.distver.textContent = `${s.distVersion ? `v${s.distVersion}` : '—'}${others}`;
       val.script.textContent = s.installed ? s.script : `未找到（扫描根目录 ${s.root}）`;

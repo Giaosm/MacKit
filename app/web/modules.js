@@ -66,7 +66,8 @@ export const MODULES = Object.freeze([
     channel: false,
   },
   {
-    // 央视频直播：托管第三方脚本 ysp-live-v9.5（Python），自身不联网、无通道档位 ——
+    // 央视频直播：托管第三方脚本 ysp-live-vX.Y（Python，版本由 paths.findYspDist 自动挑），
+    // 自身不联网、无通道档位 ——
     // 联网行为全部发生在那个常驻服务里，MacKit 只负责起停与展示。
     id: 'ysp',
     title: '央视频直播',
