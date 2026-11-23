@@ -533,7 +533,15 @@ function installBaseSteps(installed) {
 // —— 万象语法模型：下载（install_grammar）与应用/移除（apply_grammar / remove_grammar）分离 ——
 // 模型是独立共享文件（下载一次全方案可用）；方案通过 ${schema}.custom.yaml 的 grammar 补丁决定是否启用。
 const GRAMMAR_MODEL_NAME = 'wanxiang-lts-zh-hans.gram';
-const GRAMMAR_MODEL_URL = `https://github.com/amzxyz/RIME-LMDG/releases/download/LTS/${GRAMMAR_MODEL_NAME}`;
+// 万象的两个仓库很容易搞混，写清楚：
+//   · amzxyz/rime-wanxiang       —— 输入方案本体（rime-wanxiang-base.zip / -lite / -pure / 各双拼变体）
+//   · amzxyz/rime-wanxiang-data  —— 数据与模型仓库（2026-11 由 amzxyz/RIME-LMDG 改名而来）
+// `.gram` 语法模型**只在后者**的 Releases 里，所以下载与版本检测都指向它。
+// 统一用改名后的官方名：旧名目前仍是 301 永久重定向（实测 200、落到同一 asset UUID），
+// 但没必要依赖重定向多跳一次。
+const GRAMMAR_REPO = 'amzxyz/rime-wanxiang-data';
+const GRAMMAR_MODEL_URL = `https://github.com/${GRAMMAR_REPO}/releases/download/LTS/${GRAMMAR_MODEL_NAME}`;
+const GRAMMAR_RELEASE_API = `https://api.github.com/repos/${GRAMMAR_REPO}/releases/tags/LTS`;
 /** 与雾凇官方 grammar 配方 patch/+/grammar 完全等价的 plain patch 格式 */
 const GRAMMAR_PATCH_TEXT = `patch:
   grammar:
@@ -956,6 +964,70 @@ async function queryUpstream() {
 }
 
 /**
+ * 拉取万象模型在上游的 size 与上传时间（两级兜底）。
+ * ① GitHub API：一次就能拿到 size + updated_at，信息最全；api.github.com 走代理实测可达。
+ * ② HEAD 资产 URL：API 被限流（未认证 60 次/小时）或解析失败时用，只能拿到 content-length。
+ * @returns {Promise<{size:number|null, updatedAt:string|null, error:string|null}>}
+ */
+async function fetchGrammarRemote() {
+  try {
+    const res = await exec.runWithChannel(netPolicy({}), '检测万象模型版本', 'curl',
+      ['-fsSL', '--max-time', '30', '-H', 'Accept: application/vnd.github+json', GRAMMAR_RELEASE_API],
+      { timeoutMs: 45_000 });
+    if (res.code === 0) {
+      const data = JSON.parse(res.stdout);
+      const asset = (data.assets || []).find((a) => a && a.name === GRAMMAR_MODEL_NAME);
+      if (asset) return { size: Number(asset.size) || null, updatedAt: asset.updated_at || data.published_at || null, error: null };
+      return { size: null, updatedAt: null, error: `LTS 通道里没有 ${GRAMMAR_MODEL_NAME}` };
+    }
+  } catch { /* 落到 ② */ }
+
+  try {
+    const res = await exec.runWithChannel(netPolicy({}), '检测万象模型版本', 'curl',
+      ['-sSIL', '--max-time', '30', GRAMMAR_MODEL_URL], { timeoutMs: 45_000 });
+    if (res.code === 0) {
+      const m = /content-length:\s*(\d+)/i.exec(res.stdout || '');
+      if (m) return { size: Number(m[1]) || null, updatedAt: null, error: null };
+    }
+  } catch { /* 两级都失败，下面统一报错 */ }
+
+  return { size: null, updatedAt: null, error: '上游版本信息拉取失败（API 与文件头均不可达）' };
+}
+
+/**
+ * GET /api/rime/grammar-upstream → 万象模型是否有新版本（代理优先）。
+ *
+ * 判等只看**文件大小**：`.gram` 是二进制模型，上游每次重打包大小都会变（实测
+ * 419,910,700 B @2026-09-16 → 390,786,092 B @2026-11-18）；大小相同基本就是同一份。
+ * 为什么不比时间：本地 mtime 只是「下载完成的时刻」，换代理重下同一份会让它变新，
+ * 反而把「确实有新版」掩盖掉；上游 updated_at 也可能只是资产元数据被触摸。
+ * 时间字段保留给界面展示（让用户知道上游多久没更新了），不参与判定。
+ */
+async function queryGrammarUpstream() {
+  let localSize = null;
+  let localMtime = null;
+  try {
+    const st = fs.statSync(grammarModelPath());
+    localSize = st.size;
+    localMtime = st.mtimeMs;
+  } catch { /* 未安装：installed=false，界面提示去下载 */ }
+
+  const remote = await fetchGrammarRemote();
+  const upToDate = (localSize != null && remote.size != null) ? localSize === remote.size : null;
+  return {
+    installed: localSize != null,
+    localSize,
+    localMtime,
+    remoteSize: remote.size,
+    remoteUpdatedAt: remote.updatedAt,
+    remoteError: remote.error,
+    upToDate,
+    modelUrl: GRAMMAR_MODEL_URL,
+    checkedAt: Date.now(),
+  };
+}
+
+/**
  * 外观总览（供前端渲染当前值 + 可选项）：当前皮肤/布局/方向 + 8 方案 + 4 布局 + 皮肤来源。
  * 注：REST 表中 `/api/rime/status` 直接取 env.snapshot().rime；本查询为模块扩展点。
  */
@@ -979,5 +1051,6 @@ export default {
     skins: querySkins,
     appearance: queryAppearance,
     upstream: queryUpstream,
+    grammarUpstream: queryGrammarUpstream,
   },
 };

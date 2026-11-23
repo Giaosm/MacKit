@@ -327,6 +327,7 @@ const QUERY_ROUTES = Object.freeze([
   { path: '/api/rime/skins', module: 'rime', query: 'skins' },
   { path: '/api/rime/appearance', module: 'rime', query: 'appearance' },
   { path: '/api/rime/upstream', module: 'rime', query: 'upstream' },
+  { path: '/api/rime/grammar-upstream', module: 'rime', query: 'grammarUpstream' },
   // 系统初始化
   { path: '/api/sysinit/state', module: 'sysinit', query: 'state' },
   {
