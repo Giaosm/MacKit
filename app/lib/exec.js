@@ -135,6 +135,9 @@ const BIN_MAP = Object.freeze({
  */
 const ABSOLUTE_ALLOWED = Object.freeze([
   paths.SQUIRREL_BIN,
+  // Squirrel 自带的用户词典管理工具：备份中心借它把 `*.userdb` 导成文本、恢复时导入。
+  // 参数全部由模块侧固定构造（-e/-i + 词典名 + 我们自己造的临时路径），无 HTTP 入参直通。
+  paths.RIME_DICT_MANAGER,
   `${paths.PLUM_DIR}/rime-install`,
   paths.BASH_BIN,
   // 在 Finder 打开目录：只调用 `open <目录>`（参数数组，不拼 shell）。

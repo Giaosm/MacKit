@@ -119,6 +119,13 @@ export const RIME_DEFAULT_CUSTOM = path.join(RIME_DIR, 'default.custom.yaml');
 export const PLUM_DIR = path.join(HOME, 'plum');
 /** Squirrel 可执行文件（重部署 --reload 用） */
 export const SQUIRREL_BIN = '/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel';
+/**
+ * Squirrel 自带的用户词典管理工具（备份中心导出入 `*.userdb` 用）。
+ * 注意它**不是** librime 上游那套 `-d/-e<name>` 参数（那会报 "invalid arguments."），
+ * 这个打包版是：`-e <dict> <out.txt>` / `-i <dict> <in.txt>` / `-r <xxx.userdb.txt>`，
+ * 且以 **cwd 作为用户目录**。详见 lib/backup.js 的 collectUserDicts / applyUserDicts。
+ */
+export const RIME_DICT_MANAGER = '/Library/Input Methods/Squirrel.app/Contents/MacOS/rime_dict_manager';
 
 // ---------------------------------------------------------------------------
 // MacKit 自身（自更新用）

@@ -41,7 +41,7 @@ export function buildWebdavSection(ctx) {
   configBtn.addEventListener('click', () => openSettingsModal(ctx));
 
   return ui.card('☁ WebDAV 备份', el('div', {}, [
-    el('div', { class: 'muted', text: '把本机配置备份到你的 WebDAV 服务器（NAS）' }),
+    el('div', { class: 'muted', text: '把本机配置备份到你的 WebDAV 服务器（NAS）—— 含 Rime 个人词频 / 自造词，换机后可直接恢复' }),
     el('div', { class: 'row row--between section' }, [
       el('div', { class: 'row' }, [backupBtn, recordsBtn]),
       configBtn,
@@ -184,8 +184,8 @@ function openRecordsModal(ctx) {
       title: '从 WebDAV 恢复备份',
       confirmLabel: '确认恢复',
       body: el('div', {}, [
-        el('p', { class: 'muted', text: `将从远程下载「${it.name}」并覆盖本机配置：MacKit 设置、代理端口/镜像、Git 全局配置、GitHub 凭据（钥匙串）、Rime 自定义配置，完成后自动重新部署输入法。` }),
-        el('div', { class: 'err-box section', text: '⚠ 将覆盖本机配置，且不可撤销。' }),
+        el('p', { class: 'muted', text: `将从远程下载「${it.name}」并覆盖本机配置：MacKit 设置、代理端口/镜像、Git 全局配置、GitHub 凭据（钥匙串）、Rime 自定义配置与用户词典（个人词频 / 自造词），完成后自动重新部署输入法。` }),
+        el('div', { class: 'err-box section', text: '⚠ 将覆盖本机配置与输入法用户词典（个人词频 / 自造词会被备份内容替换），且不可撤销。' }),
       ]),
     });
     if (!ok) return;

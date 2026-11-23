@@ -13,6 +13,8 @@
  *   - github  : 钥匙串 GitHub 凭据（**明文 Token**，用户已确认打入；绝不写日志）
  *   - rime    : Rime 目录下全部 *.custom.yaml 原文（外观 squirrel.custom.yaml、
  *               方案列表 default.custom.yaml、语法模型补丁等）+ 已装 .gram 清单
+ *   - rime.userDicts : 用户词典文本（个人词频 / 自造词）——2026-11-23 新增，是唯一
+ *               无法重建的数据（配置能重敲、词库能重下、模型能重装，词频丢了就没了）
  *
  * 安全约束：
  *   - Token 只从 `git credential-osxkeychain get` 读取、只经 stdin 写回 `store`，
@@ -24,6 +26,8 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import * as paths from './paths.js';
 import * as store from './store.js';
 import * as exec from './exec.js';
@@ -66,13 +70,85 @@ function collectGrammarModels() {
   return out;
 }
 
+/** 单个用户词典文本的体积上限（信封总上限 32MB，留足余量）。 */
+const USERDICT_MAX_BYTES = 8 * 1024 * 1024;
+const DICT_MANAGER = paths.RIME_DICT_MANAGER;
+
+/**
+ * 导出用户词典（`*.userdb` LevelDB 目录 → Rime 标准文本）。
+ *
+ * ★ 2026-11-23 新增。此前备份只含 `*.custom.yaml`，换个电脑，**个人词频与自造词全丢**，
+ *   而那是唯一真正无法重建的东西（配置能重敲、词库能重下、模型能重装）。
+ *
+ * 两个必须绕开的坑（都实测过）：
+ *   ① `rime_dict_manager -e` 直接对 ~/Library/Rime 跑会失败：
+ *      `Error opening db 'rime_ice' read-only.` —— Squirrel 常驻进程持有 LevelDB 的 LOCK。
+ *      解法：把 `*.userdb` **复制**到临时目录，对副本导出（锁不跟随文件）。
+ *   ② 这个打包版不是上游参数：`-e <dict> <out.txt>` 要两个参数，`-d` 不支持（会 "invalid arguments."），
+ *      并且**以 cwd 作为用户目录**，所以必须 `cwd = 副本目录`。
+ *
+ * 体积实测：1.0 MB 的 LevelDB → 241 KB 文本 / 12,553 条，进信封毫无压力。
+ *
+ * @param {object} ctx 任务上下文（仅用于日志）
+ * @returns {Promise<Array<{name:string, text:string}>>}
+ */
+async function collectUserDicts(ctx) {
+  const out = [];
+  let names = [];
+  try {
+    names = fs.readdirSync(paths.RIME_DIR, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && d.name.endsWith('.userdb'))
+      .map((d) => d.name.slice(0, -'.userdb'.length))
+      .sort();
+  } catch { return out; }                       // Rime 目录不存在（未安装）
+  if (!names.length) return out;
+  if (!paths.exists(DICT_MANAGER)) {
+    ctx.log('warn', '未找到 rime_dict_manager（Squirrel 未安装？），本次备份不含用户词典');
+    return out;
+  }
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mackit-userdb-'));
+  try {
+    for (const name of names) {
+      const work = path.join(tmpRoot, name);
+      const outFile = path.join(work, `${name}.userdb.txt`);
+      try {
+        fs.mkdirSync(work, { recursive: true });
+        fs.cpSync(`${paths.RIME_DIR}/${name}.userdb`, path.join(work, `${name}.userdb`), { recursive: true });
+      } catch (err) {
+        ctx.log('warn', `用户词典 ${name} 复制失败，本次不含该词典：${err && err.message}`);
+        continue;
+      }
+      const res = await exec.run(DICT_MANAGER, ['-e', name, outFile], { cwd: work, noMirror: true, timeoutMs: 180_000 });
+      if (res.code !== 0) {
+        ctx.log('warn', `用户词典 ${name} 导出失败（退出码 ${res.code}），本次不含该词典：${paths.tailLines(res.stderr)}`);
+        continue;
+      }
+      let text = '';
+      try { text = fs.readFileSync(outFile, 'utf8'); } catch { text = ''; }
+      if (!text) { ctx.log('warn', `用户词典 ${name} 导出结果为空，跳过`); continue; }
+      const bytes = Buffer.byteLength(text, 'utf8');
+      if (bytes > USERDICT_MAX_BYTES) {
+        ctx.log('warn', `用户词典 ${name} 文本过大（${Math.round(bytes / 1024)} KB），超过单份上限，跳过`);
+        continue;
+      }
+      const count = text.split('\n').filter((l) => l && !l.startsWith('#')).length;
+      out.push({ name, text });
+      ctx.log('ok', `已导出用户词典 ${name}（${count} 条，${Math.round(bytes / 1024)} KB）`);
+    }
+  } finally {
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* 临时目录清理失败不影响备份 */ }
+  }
+  return out;
+}
+
 /**
  * 收集备份数据（payload 本体，不含信封）。
  * 含钥匙串里的 GitHub 凭据（明文 Token）—— 只在 webdav_backup 的「收集」步调用，
  * 结果只进上传信封，绝不写日志 / 落盘。
  * @returns {Promise<object>}
  */
-async function collectData() {
+async function collectData(ctx) {
   const mackit = store.readMackit();
   const brewgo = store.readBrewgo();
   const gitCfg = {};
@@ -80,6 +156,8 @@ async function collectData() {
     const v = await git.config(key);
     if (v !== null && v !== '') gitCfg[key] = v;
   }
+  // 用户词典要跑 rime_dict_manager（子进程），放在最后收集，失败只降级不中断备份
+  const userDicts = await collectUserDicts(ctx);
   return {
     // 每模块网络通道档位一并备份（2026-09-22）：换电脑/重装后不用重新一个个设。
     mackit: {
@@ -92,7 +170,8 @@ async function collectData() {
     brewgo: { httpPort: brewgo.httpPort, socksPort: brewgo.socksPort, mirror: brewgo.mirror, mirrorRaw: brewgo.mirrorRaw },
     git: gitCfg,
     github: await git.readCredential(),
-    rime: { files: collectRimeFiles(), grammarModels: collectGrammarModels() },
+    // userDicts：用户词典文本（个人词频 / 自造词）。唯一无法重建的数据，优先级最高。
+    rime: { files: collectRimeFiles(), grammarModels: collectGrammarModels(), userDicts },
   };
 }
 
@@ -135,6 +214,75 @@ function applyRimeFiles(ctx, files) {
     paths.writeText(`${paths.RIME_DIR}/${f.name}`, f.text);
     ctx.log('ok', `已写入 Rime 配置：${f.name}`);
   }
+}
+
+/**
+ * 恢复用户词典：落 txt → 挪开现有 userdb → `-i` 导入 → 交给后续「重新部署」加载。
+ *
+ * ★ 为什么是 `-i` 而不是 `-r`（2026-11-23 实测对比，这点很关键）：
+ *   `-r xxx.userdb.txt` 的文本格式与 `-e` 导出**并不对称** —— 导出的 `词\t编码\t频率`
+ *   经 `-r` 再导出会变成 `编码\t词\t0`（两列对调、频率归零），等于把词库搞坏。
+ *   `-i` 才是对称的：12553 条导出 → 导入 → 再导出，**集合完全一致**。
+ *
+ * ★ 为什么先 rename 现有 userdb：
+ *   Squirrel 常驻进程持有 LevelDB 的 LOCK，直接 `-i` 写原目录会失败。rename 是原子操作，
+ *   旧文件句柄继续有效，因此**不需要退出输入法**；新路径不存在时 `-i` 会自己创建 db 并导入。
+ *   旧目录只临时挪到 `<name>.userdb.restore-tmp`，**导入成功即删除**（用户明确不要留档）；
+ *   导入失败则原样挪回，保证「失败的恢复不改变现状」。
+ *
+ * @param {object} ctx
+ * @param {unknown} dicts 备份里的 rime.userDicts
+ */
+async function applyUserDicts(ctx, dicts) {
+  const list = Array.isArray(dicts) ? dicts : [];
+  if (!list.length) { ctx.log('info', '备份中无用户词典，跳过'); return; }
+  if (!paths.exists(DICT_MANAGER)) {
+    ctx.log('warn', '未找到 rime_dict_manager，无法恢复用户词典（请确认 Squirrel 已安装）');
+    return;
+  }
+  if (!paths.exists(paths.RIME_DIR)) fs.mkdirSync(paths.RIME_DIR, { recursive: true });
+  for (const d of list) {
+    if (!d || typeof d.name !== 'string' || !/^[A-Za-z0-9_.-]+$/.test(d.name) || typeof d.text !== 'string') {
+      ctx.log('warn', `跳过非法的用户词典条目：${d && d.name}`);
+      continue;
+    }
+    const name = d.name;
+    const txtPath = `${paths.RIME_DIR}/${name}.userdb.txt`;
+    try { paths.writeText(txtPath, d.text); }
+    catch (err) { throw new AppError(ERR.IO_ERROR, `写入 ${name}.userdb.txt 失败`, String(err && err.message)); }
+
+    const dbPath = `${paths.RIME_DIR}/${name}.userdb`;
+    // 旧的 db 只**临时**挪开（导入期间腾出路径给新库），成功后立即删除 —— 不保留任何 .bak 留档。
+    // 挪开是必需的：Squirrel 常驻持有 LOCK，不腾路径 `-i` 会失败；rename 是原子的，
+    // 旧句柄继续有效，所以不需要让输入法退出。
+    const parkedPath = `${dbPath}.restore-tmp`;
+    let parked = false;
+    if (paths.exists(dbPath)) {
+      try { fs.rmSync(parkedPath, { recursive: true, force: true }); } catch { /* 上次中断的残留 */ }
+      try {
+        fs.renameSync(dbPath, parkedPath);
+        parked = true;
+      } catch (err) {
+        throw new AppError(ERR.IO_ERROR, `无法挪开现有词典 ${name}.userdb`, String(err && err.message));
+      }
+    }
+
+    const res = await exec.run(DICT_MANAGER, ['-i', name, txtPath], { cwd: paths.RIME_DIR, noMirror: true, timeoutMs: 300_000 });
+    if (res.code !== 0) {
+      // 回滚：失败的恢复不能把现状弄坏。删掉可能生成了一半的新 db，把挪开的旧库放回去。
+      try { fs.rmSync(dbPath, { recursive: true, force: true }); } catch { /* ignore */ }
+      if (parked) {
+        try { fs.renameSync(parkedPath, dbPath); ctx.log('warn', `已回滚 ${name}.userdb（导入失败，现有词典不受影响）`); }
+        catch { ctx.log('warn', `回滚 ${name}.userdb 失败，原词典仍在 ${parkedPath}`); }
+      }
+      throw new AppError(ERR.CMD_FAILED, `用户词典 ${name} 导入失败（退出码 ${res.code}）`, paths.tailLines(res.stderr));
+    }
+    // 成功 → 清理临时挪开的旧库（用户明确不要留档）
+    if (parked) { try { fs.rmSync(parkedPath, { recursive: true, force: true }); } catch { /* 占用中，重启后自清 */ } }
+    const summary = String(res.stdout || '').trim().split('\n').filter(Boolean).pop() || '';
+    ctx.log('ok', `用户词典 ${name} 已导入${summary ? `（${summary}）` : ''}`);
+  }
+  ctx.log('info', '下一步「重新部署输入法」会让 Squirrel 加载这份词典');
 }
 
 /**
@@ -215,11 +363,20 @@ function applyPayloadSteps(getPayload) {
       },
     },
     {
+      id: 'userdict', title: '恢复用户词典（个人词频 / 自造词）',
+      run: async (ctx) => {
+        const { data } = validatePayload(getPayload());
+        await applyUserDicts(ctx, data.rime && data.rime.userDicts);
+      },
+    },
+    {
       id: 'deploy', title: '重新部署输入法',
       run: async (ctx) => {
         const { data } = validatePayload(getPayload());
         const hasRime = data.rime && Array.isArray(data.rime.files) && data.rime.files.length > 0;
-        if (!hasRime) { ctx.log('info', '无 Rime 配置变更，跳过部署'); return; }
+        // 用户词典也是「必须部署才生效」的变更（Squirrel 在 reload 时才重新加载 userdb）
+        const hasUserDict = data.rime && Array.isArray(data.rime.userDicts) && data.rime.userDicts.length > 0;
+        if (!hasRime && !hasUserDict) { ctx.log('info', '无 Rime 配置变更，跳过部署'); return; }
         if (!paths.exists(paths.SQUIRREL_BIN)) { ctx.log('warn', '未找到 Squirrel，请手动重新部署（菜单栏「重新部署」）'); return; }
         const res = await exec.run(paths.SQUIRREL_BIN, ['--reload'], { noMirror: true, timeoutMs: 60_000 });
         if (res.code === 0) ctx.log('ok', '重新部署完成');
@@ -267,7 +424,7 @@ const actions = {
         {
           id: 'collect', title: '收集本机设置',
           run: async (ctx) => {
-            payloadRef = { app: 'MacKit', version: 1, createdAt: Date.now(), data: await collectData() };
+            payloadRef = { app: 'MacKit', version: 1, createdAt: Date.now(), data: await collectData(ctx) };
             // ★ readCredential 返回 null 有三种原因：钥匙串里没有（正常）、读取超时、用户拒绝了
             //   授权弹窗。它们无法区分，所以不能无条件宣称「含凭据」——否则用户换机恢复后
             //   发现 Token 缺失，却一直以为备份是完整的（2026-09-25 修）。
