@@ -20,6 +20,13 @@ const POLL_MS = 5_000;
 /** 模块级定时器：切换视图时由 unmount 清掉 */
 let pollTimer = null;
 
+/**
+ * 上游版本结论（跨 mount 复用）：进页面要看得到「有没有新版」，但每次切页都联网没必要，
+ * 5 分钟内直接复用它；点「检查更新」时强制重查。
+ */
+let latestCache = { at: 0, value: null };
+const LATEST_TTL_MS = 5 * 60_000;
+
 /** 运行时长 → `1 小时 23 分` / `3 分 12 秒` */
 function fmtDuration(sec) {
   const n = Number(sec);
@@ -236,10 +243,21 @@ export default {
       lanHint.hidden = !lanCheck.checked;
     }
 
+    /** 有确定的「上游版本且本地已安装」且上游更新 → 才允许点「更新」 */
+    function updateState() {
+      const L = st.latest;
+      const installed = !!(st.data && st.data.installed);
+      if (!L) return { ok: false, text: '正在检查上游版本…' };
+      if (L.error) return { ok: false, text: `检查失败（${L.error}），可点「检查更新」重试` };
+      if (!installed) return { ok: false, text: '请先安装' };
+      if (L.upToDate) return { ok: false, text: `已是最新版本 v${L.version}` };
+      return { ok: true, text: `可更新到 v${L.version}` };
+    }
+
     function paintLatest() {
       const L = st.latest;
-      if (!L) { val.upstream.textContent = '—'; return; }
-      if (L.error) { val.upstream.textContent = `检查失败：${L.error}`; return; }
+      if (!L) { val.upstream.textContent = st.checking ? '检查中…' : '—'; return; }
+      if (L.error) { val.upstream.textContent = '检查失败'; return; }
       const up = L.upToDate === null ? '' : (L.upToDate ? '（已是最新）' : '（可更新）');
       val.upstream.textContent = `v${L.version}${up}`;
     }
@@ -284,12 +302,18 @@ export default {
       nodeText.textContent = s.node.exists ? s.node.bin : `${s.node.bin}（缺失）`;
 
       // 按钮
-      btnInstall.disabled = st.busy;
-      btnInstall.classList.toggle('btn--primary', !s.installed);
+      // 装好了就不该再点「安装」：那一步是下载 + 解压最新官方包，装完再点只会白等一次；
+      // 要重装请先卸载（按钮 tooltip 里说清楚）。
+      btnInstall.disabled = st.busy || s.installed;
+      btnInstall.title = s.installed ? `已安装 v${s.version}；如需重装请先「卸载」` : '下载官方 standalone 包并解压';
+      btnInstall.classList.toggle('btn--primary', !s.installed && !st.busy);
       btnStart.disabled = st.busy || s.running || !s.installed;
       btnStop.disabled = st.busy || !s.running || !s.managed;
       btnRestart.disabled = st.busy || !s.installed;
-      btnUpdate.disabled = st.busy || !s.installed;
+      // 「更新」只在确实存在新版本时可点（上游版本未知 / 检查失败 / 已最新 都禁用）
+      const upd = updateState();
+      btnUpdate.disabled = st.busy || !upd.ok;
+      btnUpdate.title = upd.text;
       btnUninstall.disabled = st.busy || (!s.installed && !s.running);
       btnCheck.disabled = st.busy || st.checking;
       btnCheck.textContent = st.checking ? '检查中…' : '检查更新';
@@ -355,7 +379,11 @@ export default {
       }
     }
 
-    /** 查上游最新版本（会真的联网，只在挂载与手动点击时跑） */
+    /**
+     * 查上游最新版本（真的联网）。调用即重查 —— 缓存只用于「切回本页时不必再等一次」，
+     * 由 mount 自己判断，不在这里做。
+     * @param {boolean} [showToast] 手动点「检查更新」/ 任务结束后给反馈
+     */
     async function checkLatest(showToast) {
       if (st.checking) return;
       st.checking = true;
@@ -363,7 +391,7 @@ export default {
       try {
         const r = await api('GET', '/api/libretv/latest');
         st.latest = r;
-        if (st.data) paint(st.data);
+        latestCache = { at: Date.now(), value: r };
         if (showToast) {
           if (r.error) ui.toast('warn', `检查更新失败：${r.error}`);
           else if (r.upToDate) ui.toast('ok', `已是最新版本 v${r.version}`);
@@ -474,13 +502,22 @@ export default {
 
     // 任务结束后刷新（安装 / 更新会改版本，启停会改运行态，configure 会改配置回显）
     ctx.on('done', (t) => {
-      if (t && t.module === 'libretv') { refresh(false, true); refreshLogs(false); }
+      if (!t || t.module !== 'libretv') return;
+      refresh(false, true);
+      refreshLogs(false);
+      // 装完 / 更新完，「是否还有新版」变了 —— 必须重查，否则「更新」按钮的可用态是旧的
+      if (t.action === 'install' || t.action === 'update') checkLatest(false);
     });
 
     refresh(false);
     refreshLogs(false);
-    // 不在这里自动查上游：那会真的联网（走代理），一进页面就产生一次请求，
-    // 离线环境下还会白失败一次。「上游版本」一栏只在用户点「检查更新」后填。
+    // 进页面就把上游版本展示出来（用户不该为了看一眼版本号先点一次按钮）；
+    // 5 分钟内的结论直接复用，切页不会反复联网。
+    if (latestCache.value && Date.now() - latestCache.at < LATEST_TTL_MS) {
+      st.latest = latestCache.value;
+    } else {
+      checkLatest(false);
+    }
     // 同一个视图可能被反复 mount（切走再切回）：先清掉上一轮定时器，避免叠加轮询
     if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
     pollTimer = setInterval(() => {
