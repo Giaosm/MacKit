@@ -250,7 +250,10 @@ function emptyState({ icon = '·', title, text, actions = [] }) {
   return box;
 }
 
-const kv = (k, v) => el('div', { class: 'kv' }, [el('span', { class: 'kv__k', text: k }), el('span', { class: 'kv__v' }, [v && v.nodeType ? v : String(v == null ? '—' : v)])]);
+/** 值 → 可直接放进节点的内容：节点原样返回，null/undefined 显示破折号，其余转字符串。 */
+const asText = (v) => (v === null || v === undefined ? '—' : v.nodeType ? v : String(v));
+
+const kv = (k, v) => el('div', { class: 'kv' }, [el('span', { class: 'kv__k', text: k }), el('span', { class: 'kv__v' }, [asText(v)])]);
 
 /**
  * 紧凑信息块：小标签在上、值在下（**不要**再用 .kv 铺状态行，理由见 style.css 的 .stat-grid 注释）。
@@ -259,7 +262,7 @@ const kv = (k, v) => el('div', { class: 'kv' }, [el('span', { class: 'kv__k', te
  */
 const stat = (label, value) => el('div', {}, [
   el('div', { class: 'stat__k', text: label }),
-  el('div', { class: 'stat__v' }, [value && value.nodeType ? value : String(value == null ? '—' : value)]),
+  el('div', { class: 'stat__v' }, [asText(value)]),
 ]);
 /**
  * 信息块网格：一行 3~6 个，列宽自适应（窄卡片自然落到 2 列）。
@@ -279,7 +282,7 @@ function statGrid(items, opts = {}) {
  */
 const detailLines = (items) => el('div', { class: 'detail-lines' }, (items || []).map(([k, v]) => el('div', { class: 'detail-line' }, [
   el('span', { class: 'detail-line__k', text: k }),
-  el('span', { class: 'mono' }, [v && v.nodeType ? v : String(v == null ? '—' : v)]),
+  el('span', { class: 'mono' }, [asText(v)]),
 ])));
 
 // ============================== 模块网络通道 ==============================

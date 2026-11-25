@@ -81,7 +81,6 @@ export default {
     const statusCard = el('div', { class: 'card section' }, [
       el('div', { class: 'card__head' }, [
         el('div', { class: 'card__title' }, [lamp, '① 服务状态']),
-        el('div', { class: 'muted', style: 'font-size:12px', text: '独立于 MacKit 运行，关界面不中断播放' }),
       ]),
       el('div', { class: 'stat-grid', style: 'margin-top:var(--space-2)' }, [
         mkStat('state', '状态'),
@@ -105,6 +104,7 @@ export default {
       ]),
       note,
       el('div', { class: 'row', style: 'margin-top:var(--space-4)' }, [btnStart, btnStop, btnRestart]),
+      el('div', { class: 'muted', style: 'margin-top:var(--space-3); font-size:12px', text: '直播服务独立于 MacKit 运行：关闭 / 重启 MacKit 界面不会中断正在播放的流；要停就点上面的「停止」。' }),
     ]);
 
     // ======================= ② 订阅地址卡 =======================

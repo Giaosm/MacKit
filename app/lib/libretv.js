@@ -35,6 +35,8 @@ const READY_TIMEOUT_MS = 45_000;
 const READY_POLL_MS = 500;
 const STOP_TIMEOUT_MS = 8_000;
 const PROBE_TIMEOUT_MS = 1_500;
+/** 清理残留进程后，等它把监听 socket 真正交还的上限 */
+const PORT_FREE_TIMEOUT_MS = 3_000;
 /** 下载超时：直连 GitHub 实测只有 7KB/s，9MB 可能 20 分钟；代理下 1.3 秒 */
 const DOWNLOAD_TIMEOUT_MS = 30 * 60_000;
 const LOG_TAIL_BYTES = 128 * 1024;
@@ -96,30 +98,45 @@ function tailText(lines = 20) {
 /**
  * 读 state.json。永远返回一个完整对象（缺字段用默认值补齐），
  * 这样调用方不需要到处写 `st && st.xxx`。
- * @returns {{version:string|null, port:number, password:string, lan:boolean, pid:number, startedAt:number}}
+ *
+ * `port` 是**配置值**（下次启动用），`livePort` 是**实际在跑的端口** —— 两者会短暂不同：
+ * 运行中改端口后，进程还在旧端口上，重启才生效（`restartPending`）。
+ * @returns {{version:string|null, port:number, livePort:number, password:string, lan:boolean,
+ *   pid:number, startedAt:number, restartPending:boolean}}
  */
 function readState() {
   const fallback = {
     version: null,
     port: paths.LIBRETV_DEFAULT_PORT,
+    livePort: 0,
     password: '',
     lan: false,
     pid: 0,
     startedAt: 0,
+    restartPending: false,
   };
+  const asPort = (v, dft) => (Number.isInteger(v) && v > 0 && v < 65536 ? v : dft);
   try {
     const raw = JSON.parse(fs.readFileSync(paths.LIBRETV_STATE_JSON, 'utf8'));
     if (!raw || typeof raw !== 'object') return fallback;
     return {
       version: typeof raw.version === 'string' && raw.version ? raw.version : null,
-      port: Number.isInteger(raw.port) && raw.port > 0 && raw.port < 65536 ? raw.port : fallback.port,
+      port: asPort(raw.port, fallback.port),
+      livePort: asPort(raw.livePort, 0),
       password: typeof raw.password === 'string' ? raw.password : '',
       lan: raw.lan === true,
       pid: Number.isInteger(raw.pid) && raw.pid > 1 ? raw.pid : 0,
       startedAt: typeof raw.startedAt === 'number' ? raw.startedAt : 0,
+      restartPending: raw.restartPending === true,
     };
   } catch { return fallback; }
 }
+
+/**
+ * 该去探测哪个端口：有 pid 且记了 livePort 就用它（运行中改过端口的情形），
+ * 否则用配置端口（此时可能根本没有实例，探测是为了发现「非本应用启动的」服务）。
+ */
+const probePort = (st) => (st.pid && st.livePort ? st.livePort : st.port);
 
 /** 合并写回 state.json（600）。写失败不致命：界面会如实显示「未运行」。 */
 function writeState(patch) {
@@ -136,7 +153,7 @@ function writeState(patch) {
 function clearPid(pid) {
   const cur = readState();
   if (cur.pid && pid && cur.pid !== pid) return;
-  writeState({ pid: 0, startedAt: 0 });
+  writeState({ pid: 0, startedAt: 0, livePort: 0 });
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +209,22 @@ async function pickPort(start) {
   throw new AppError(ERR.CMD_FAILED, `端口 ${from}~${from + 19} 全被占用，请换一个起始端口`);
 }
 
+/**
+ * 等端口真正释放再继续。
+ * 为什么不能只 sleep 一下：Next standalone 是主进程 + worker，SIGTERM 之后 worker 可能
+ * 还占着监听 socket 几百毫秒，这时 isPortFree 会判「被占用」，于是顺延端口并持久化 ——
+ * 用户只看到端口莫名其妙变了（2026-11-25 实测）。
+ * @returns {Promise<boolean>} 超时仍被占 → false
+ */
+async function waitPortFree(port, timeoutMs = PORT_FREE_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await isPortFree(port)) return true;
+    await sleep(100);
+  }
+  return isPortFree(port);
+}
+
 // ---------------------------------------------------------------------------
 // 探测
 // ---------------------------------------------------------------------------
@@ -232,23 +265,35 @@ function realish(p) {
  *
  * 结论：别的 next 服务（cwd 不在我们的目录里）不会被认成我们的，stop 依然不会误杀。
  */
-async function pidOwnedByUs(pid) {
-  if (!exec.isPidAlive(pid)) return false;
+async function checkOwner(pid) {
   const roots = [paths.LIBRETV_DIR, realish(paths.LIBRETV_DIR)];
-  const hit = (text) => roots.some((root) => String(text || '').includes(root));
+  const under = (p) => roots.some((root) => p === root || p.startsWith(root + path.sep));
 
   const r = await exec.runSafe('ps', ['-o', 'command=', '-p', String(pid)], { noMirror: true, timeoutMs: 8_000 });
-  if (r.code === 0 && hit(r.stdout)) return true;
+  if (r.code === 0 && roots.some((root) => String(r.stdout || '').includes(root))) return true;
 
   const w = await exec.runSafe('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { noMirror: true, timeoutMs: 8_000 });
   if (w.code !== 0) return false;
-  return String(w.stdout || '')
-    .split(/\r?\n/)
+  return String(w.stdout || '').split(/\r?\n/)
     .filter((line) => line.startsWith('n'))
-    .some((line) => {
-      const dir = realish(line.slice(1));
-      return roots.some((root) => dir === root || dir.startsWith(root + path.sep));
-    });
+    .some((line) => under(realish(line.slice(1))));
+}
+
+/**
+ * 归属结论的短缓存：状态页 5s 刷一次，每次都 spawn `ps` + `lsof` 两个子进程没必要。
+ * 进程存活期间归属不会变，TTL 只用来兜住「pid 被系统复用」这种小概率。
+ * 启停流程里用 forgetOwner() 主动失效，避免拿着旧结论做决定。
+ */
+let ownerCache = { pid: 0, at: 0, ours: false };
+const OWNER_TTL_MS = 10_000;
+const forgetOwner = () => { ownerCache = { pid: 0, at: 0, ours: false }; };
+
+async function pidOwnedByUs(pid) {
+  if (!exec.isPidAlive(pid)) return false;
+  if (ownerCache.pid === pid && Date.now() - ownerCache.at < OWNER_TTL_MS) return ownerCache.ours;
+  const ours = await checkOwner(pid);
+  ownerCache = { pid, at: Date.now(), ours };
+  return ours;
 }
 
 /** 轮询直到 /api/status 可达（或进程提前退出 / 超时）。 */
@@ -418,19 +463,21 @@ async function startVersion(ctx, version) {
   }
   const st = readState();
   const prevOurs = st.pid ? await pidOwnedByUs(st.pid) : false;
-  if (prevOurs && await probeStatus(st.port)) {
-    throw new AppError(ERR.SKIP, `服务已在运行（端口 ${st.port}）`);
+  const prevPort = probePort(st);
+  if (prevOurs && await probeStatus(prevPort)) {
+    throw new AppError(ERR.SKIP, `服务已在运行（端口 ${prevPort}）`);
   }
   if (prevOurs) {
     // 有 pid 但探测不到 —— 半死状态，先收掉再起，避免留下僵尸占端口
     ctx.log('warn', `发现残留进程（pid ${st.pid}）无响应，先清理`);
     exec.killPid(st.pid, 'SIGTERM');
-    await sleep(500);
+    forgetOwner();
+    await waitPortFree(prevPort);
     clearPid(st.pid);
   }
 
   const want = st.port || paths.LIBRETV_DEFAULT_PORT;
-  const port = await isPortFree(want) ? want : await pickPort(want + 1);
+  const port = (await isPortFree(want)) ? want : await pickPort(want + 1);
   if (port !== want) ctx.log('warn', `端口 ${want} 被占用，改用 ${port}`);
 
   const password = st.password || genPassword();
@@ -452,8 +499,10 @@ async function startVersion(ctx, version) {
     env: { PORT: String(port), HOSTNAME: host, PASSWORD: password, NODE_ENV: 'production' },
   });
   if (!pid) throw new AppError(ERR.CMD_FAILED, '未能拉起 LibreTV 进程', `请查看日志：${paths.LIBRETV_LOG}`);
+  forgetOwner();
 
-  writeState({ version, port, password, lan: st.lan, pid, startedAt: Date.now() });
+  // port 是配置值，livePort 是这一份实例真正监听的端口；restartPending 到这里就算消费掉了
+  writeState({ version, port, livePort: port, password, lan: st.lan, pid, startedAt: Date.now(), restartPending: false });
   ctx.log('info', `已拉起进程（pid ${pid}，v${version}），等待 http://127.0.0.1:${port} 就绪…`);
 
   const info = await waitReady(ctx, pid, port);
@@ -478,9 +527,10 @@ async function stopVersion(ctx) {
       ctx.log('warn', `记录的 pid ${pid} 已不是 LibreTV（可能被系统复用），不发任何信号，仅清理记录`);
     }
     clearPid(pid);
-    if (await probeStatus(st.port)) {
-      ctx.log('warn', `端口 ${st.port} 上仍有服务响应，但不是 MacKit 启动的，不做处理`);
-      throw new AppError(ERR.SKIP, `端口 ${st.port} 上的实例不是 MacKit 启动的`);
+    const port = probePort(st);
+    if (await probeStatus(port)) {
+      ctx.log('warn', `端口 ${port} 上仍有服务响应，但不是 MacKit 启动的，不做处理`);
+      throw new AppError(ERR.SKIP, `端口 ${port} 上的实例不是 MacKit 启动的`);
     }
     throw new AppError(ERR.SKIP, '服务未在运行');
   }
@@ -501,6 +551,7 @@ async function stopVersion(ctx) {
   if (exec.isPidAlive(pid)) {
     throw new AppError(ERR.CMD_FAILED, '停止失败：进程仍在运行', `请手动结束 pid ${pid}`);
   }
+  forgetOwner();
   clearPid(pid);
   ctx.log('ok', '服务已停止');
 }
@@ -603,7 +654,8 @@ const actions = {
             const prev = readState();
             const prevVersion = pickVersion(prev);
             const wasRunning = prev.pid ? await pidOwnedByUs(prev.pid) : false;
-            if (prevVersion && cmpVersion(slot.version, prevVersion) === 0 && versionReady(slot.version)) {
+            // <= 0：上游不比本地新就不动。用 === 0 的话，本地版本比上游新时会被「降级」过去
+            if (prevVersion && cmpVersion(slot.version, prevVersion) <= 0 && versionReady(slot.version)) {
               ctx.log('info', `已是最新版本 v${slot.version}，无需切换`);
               if (!wasRunning) {
                 ctx.log('info', '顺带启动服务');
@@ -701,9 +753,19 @@ const actions = {
           ctx.log('warn', '没有需要修改的项');
           return;
         }
-        writeState(patch);
+        // 运行中改配置：进程还跑在旧端口 / 旧密码上，打个标记让状态页如实说明，
+        // 否则界面会把「新端口、新密码」当成正在生效的值（复制过去必然登录失败）
         const running = st.pid ? await pidOwnedByUs(st.pid) : false;
-        if (running) ctx.log('warn', '改动需要重启服务才生效，请点「重启」');
+        if (running) {
+          patch.restartPending = true;
+          // 只报真正改了的项，别在只改密码时说「端口变更」
+          const changed = [];
+          if (patch.port !== undefined && patch.port !== st.port) changed.push(`端口 ${patch.port}`);
+          if (patch.password !== undefined) changed.push('访问密码');
+          if (patch.lan !== undefined) changed.push('监听地址');
+          ctx.log('warn', `${changed.join('、') || '设置'}已保存；当前实例仍在端口 ${probePort(st)} 上按旧配置运行，点「重启」后生效（几秒，播放中的页面刷新一下即可）`);
+        }
+        writeState(patch);
       },
     }],
   },
@@ -715,7 +777,7 @@ const actions = {
       id: 'open', title: '打开站点',
       run: async (ctx) => {
         const st = readState();
-        const port = st.port || paths.LIBRETV_DEFAULT_PORT;
+        const port = probePort(st);
         if (!await probeStatus(port)) {
           throw new AppError(ERR.NOT_FOUND, `服务未在运行（端口 ${port} 无响应）`, '请先点「启动」');
         }
@@ -740,8 +802,10 @@ async function collectStatus() {
   const version = pickVersion(st);
   const alive = st.pid ? exec.isPidAlive(st.pid) : false;
   const ours = alive ? await pidOwnedByUs(st.pid) : false;
-  const info = await probeStatus(st.port);
+  const info = await probeStatus(probePort(st));
   const running = !!info;
+  // 实际能访问的端口：跑着就是 livePort，没跑就是配置里的端口
+  const urlPort = running ? probePort(st) : st.port;
   return {
     installed: !!version,
     installedVersions: installed,
@@ -749,7 +813,12 @@ async function collectStatus() {
     dir: version ? versionDir(version) : null,
     /** 目录里的版本与 state 记录不一致（手工动过目录）时前端应提示重新启动 */
     versionMismatch: !!(version && st.version && version !== st.version),
+    /** 配置端口（下次启动用）；运行中改过端口时它与 livePort 不同 */
     port: st.port,
+    /** 这次实例实际监听的端口（没在跑 → 0） */
+    livePort: running ? probePort(st) : 0,
+    /** 配置改过但还没重启：界面要明确提示「重启后生效」 */
+    restartPending: running && st.restartPending,
     password: st.password,
     lan: st.lan,
     running,
@@ -761,9 +830,9 @@ async function collectStatus() {
     startedAt: ours ? st.startedAt : 0,
     serverVersion: running ? (info.version || null) : null,
     passwordRequired: running ? info.passwordRequired === true : null,
-    url: `http://127.0.0.1:${st.port}/`,
+    url: `http://127.0.0.1:${urlPort}/`,
     /** 局域网模式下的可用地址（只给本机第一个物理网卡） */
-    lanUrl: st.lan ? `http://${firstLanIp()}:${st.port}/` : null,
+    lanUrl: st.lan ? `http://${firstLanIp()}:${urlPort}/` : null,
     logFile: paths.LIBRETV_LOG,
     stateFile: paths.LIBRETV_STATE_JSON,
     defaultPort: paths.LIBRETV_DEFAULT_PORT,

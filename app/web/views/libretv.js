@@ -260,11 +260,15 @@ export default {
       else val.state.textContent = '运行中（不是 MacKit 启动的实例）';
 
       val.version.textContent = s.version ? `v${s.version}${s.versionMismatch ? '（与记录不一致，建议重启）' : ''}` : '—';
-      val.port.textContent = `${s.port}${s.port === s.defaultPort ? '（默认）' : ''}`;
+      // 运行中改过端口时，配置端口与实际端口会不一样，两个都写出来
+      val.port.textContent = s.restartPending && s.livePort
+        ? `${s.port}（待生效，当前 ${s.livePort}）`
+        : `${s.port}${s.port === s.defaultPort ? '（默认）' : ''}`;
       val.pid.textContent = s.pid ? String(s.pid) : (s.foreign ? '未知（非本应用拉起）' : '—');
       val.uptime.textContent = s.pid && s.startedAt ? fmtDuration((Date.now() - s.startedAt) / 1000) : '—';
 
-      if (s.passwordRequired === null) pwReq.textContent = '—';
+      if (s.restartPending) pwReq.textContent = '密码改动待重启生效';
+      else if (s.passwordRequired === null) pwReq.textContent = '—';
       else if (s.passwordRequired) pwReq.textContent = s.serverVersion ? `服务端要求密码（v${s.serverVersion}）` : '服务端要求密码';
       else pwReq.textContent = '服务端未启用密码';
 
@@ -297,12 +301,14 @@ export default {
       if (!st.dirty.lan) lanCheck.checked = !!s.lan;
       paintLanHint();
 
-      // 提示条：优先级「非本应用实例」>「未安装 node」>「局域网已开」
+      // 提示条：优先级「非本应用实例」>「未安装 node」>「配置待重启」>「局域网已开」
       let text = '';
       if (s.foreign) {
-        text = `端口 ${s.port} 上有服务在响应，但它不是 MacKit 启动的（没有记录的 pid）—— 本页只负责展示，不会去停它。`;
+        text = `端口 ${s.livePort || s.port} 上有服务在响应，但它不是 MacKit 启动的（没有记录的 pid）—— 本页只负责展示，不会去停它。`;
       } else if (!s.node.exists) {
         text = `未找到 node（期望路径 ${s.node.bin}）：LibreTV 是 Node 程序，装一个 node 后才能启动。`;
+      } else if (s.restartPending) {
+        text = `设置已保存但还没生效：当前实例仍运行在端口 ${s.livePort}、仍用旧密码。点「重启」后新端口 / 新密码才生效。`;
       } else if (s.running && s.lan) {
         text = `局域网访问已开启：同网段设备可用 ${s.lanUrl || `http://<本机IP>:${s.port}/`} 打开（只靠访问密码保护）。`;
       }
@@ -473,7 +479,8 @@ export default {
 
     refresh(false);
     refreshLogs(false);
-    checkLatest(false);
+    // 不在这里自动查上游：那会真的联网（走代理），一进页面就产生一次请求，
+    // 离线环境下还会白失败一次。「上游版本」一栏只在用户点「检查更新」后填。
     // 同一个视图可能被反复 mount（切走再切回）：先清掉上一轮定时器，避免叠加轮询
     if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
     pollTimer = setInterval(() => {
