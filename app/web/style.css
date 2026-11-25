@@ -289,6 +289,25 @@ p { margin: 0 0 var(--space-2); }
 .kv__k { color: var(--fg-muted); }
 .kv__v { text-align: right; word-break: break-all; }
 
+/* ------------------------------ 紧凑信息块（2026-11-25） ------------------------------
+ * 标签在上、值在下，一行排 3~6 个。
+ * 为什么不用 .kv：那是一行一条、标签在左、值被 justify-content:space-between 推到最右 ——
+ * 卡片有 600~1100px 宽时，每行中间全是空白，六条数据就撑出半个屏幕。
+ * 列宽自适应：窄卡片（.grid--3 里的）自然落到 2 列，宽卡片落到 3~6 列。 */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(var(--stat-min, 140px), var(--stat-max, 1fr)));
+  gap: var(--space-3) var(--space-4);
+  justify-content: start;   /* 限制 max 时靠左排，不把两三条信息摊到整行 */
+}
+.stat__k { color: var(--fg-muted); font-size: 11px; letter-spacing: .6px; margin-bottom: 1px; }
+/* 只在必要时断行（overflow-wrap:anywhere）：路径能断、邮箱不会在中间被拆成两截 */
+.stat__v { font-weight: 600; font-size: 14px; line-height: 1.35; word-break: normal; overflow-wrap: anywhere; }
+/* 路径 / 日志这类次要信息：小字单行一条，标签定宽，不再各占一整行的大字号 */
+.detail-lines { color: var(--fg-muted); font-size: 12px; line-height: 1.9; }
+.detail-line { display: flex; gap: var(--space-2); word-break: break-all; }
+.detail-line__k { width: 60px; flex: none; }
+
 /* ------------------------------ 状态灯 ------------------------------ */
 .light { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: none; }
 .light--ok { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }

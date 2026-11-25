@@ -51,11 +51,10 @@ export default {
 
     // ============================ ① 代理别名 ============================
     function aliasSection(al) {
-      const nodes = [el('div', { class: 'card__rows' }, [
-        ui.kv('配置文件', al.rcFile || '未识别'),
-        ui.kv('现有别名', al.present ? (al.multiline ? '存在（多行自定义写法）' : '存在') : '未检测到'),
-        ui.kv('与标准写法', al.matchesExpected ? '一致' : '不一致'),
-      ])];
+      const nodes = [ui.statGrid([
+        ['现有别名', al.present ? (al.multiline ? '存在（多行自定义写法）' : '存在') : '未检测到'],
+        ['与标准写法', al.matchesExpected ? '一致' : '不一致'],
+      ], { max: 240 }), ui.detailLines([['配置文件', al.rcFile || '未识别']])];
       if (al.present && !al.matchesExpected) {
         nodes.push(el('div', { class: 'warn-box section', text: '⚠ 现有别名与标准写法不同，已展示实际内容供你核对——不会被静默覆盖。' }));
         if (al.existing && al.existing.length) {
@@ -107,10 +106,10 @@ export default {
         // 优先回显用户草稿：done → load() → render() 会重建本卡，若只用服务端值，
         // 「已填但未点应用」的用户名/邮箱会被静默清空（上轮只堵了 set_proxy_ports 一条路径）。
         const draft = st.gitDraft.has(f.key) ? st.gitDraft.get(f.key) : cur;
-        const input = el('input', { type: 'text', value: draft, placeholder: f.placeholder || '', style: 'min-width:260px', on: { input: (e) => { st.gitDraft.set(f.key, e.target.value); refreshGitHint(); } } });
+        const input = el('input', { type: 'text', value: draft, placeholder: f.placeholder || '', style: 'flex:1; min-width:180px', on: { input: (e) => { st.gitDraft.set(f.key, e.target.value); refreshGitHint(); } } });
         st.gitInputs.set(f.key, { input, current: cur, key: f.key });
         rows.append(el('div', { class: 'field__row' }, [
-          el('span', { class: 'mono', style: 'width:160px', text: f.key }),
+          el('span', { class: 'mono nowrap', style: 'width:120px', text: f.key }),
           input,
           el('span', { class: 'muted nowrap', text: `当前: ${cur === '' ? '未设置' : cur}` }),
         ]));
@@ -180,9 +179,14 @@ export default {
       return ui.card('③ GitHub 凭据', el('div', {}, [
         el('div', { class: 'muted', text: d.tokenExists ? '状态：🟢 检测到已有凭据' : '状态：⚠ 凭据缺失' }),
         steps,
-        el('div', { class: 'field__row section' }, [
-          el('span', { class: 'muted', style: 'width:72px', text: '用户名' }), st.userInput,
-          el('span', { class: 'muted', style: 'width:64px', text: 'Token' }), st.tokenInput, btn,
+        // 三个控件排一行：原先全塞在一条 .field__row 里，窗口一窄就换行，
+        // 按钮被挤成三行竖排（「写入/钥匙/串」），输入框也各自错位。
+        el('div', {
+          style: 'display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.6fr) auto; gap:var(--space-3); align-items:end; margin-top:var(--space-3)',
+        }, [
+          el('div', { class: 'field', style: 'margin:0' }, [el('span', { class: 'muted', style: 'font-size:12px', text: '用户名' }), st.userInput]),
+          el('div', { class: 'field', style: 'margin:0' }, [el('span', { class: 'muted', style: 'font-size:12px', text: 'Token' }), st.tokenInput]),
+          btn,
         ]),
         el('div', { class: 'muted', text: '🔒 Token 仅写入 macOS 钥匙串，不落盘、不经过任何配置文件；提交后输入框立即清空。' }),
       ]), { light: d.tokenExists ? 'ok' : 'warn' });

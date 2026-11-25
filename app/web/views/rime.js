@@ -87,18 +87,24 @@ export default {
         ['主方案', !!s.mainSchemaExists, 'rime_ice'],
         ['Squirrel', !!s.squirrelDeployable, s.squirrelBin || '未找到可执行'],
       ];
-      const rows = el('div', { class: 'card__rows' }, lights.map(([k, ok, extra]) => el('div', { class: 'row row--between' }, [
-        el('span', {}, [ui.statusLight(ok ? 'ok' : 'warn'), ' ', k]),
-        el('span', { class: 'muted mono nowrap', text: extra }),
-      ])));
+      // 四件套（目录 / plum / 主方案 / Squirrel）：一格里「灯 + 名称 + 路径」，
+      // 不再用 row--between 把名称和路径拉到卡片两端
+      const lightCells = lights.map(([k, ok, extra]) => el('div', {}, [
+        el('div', { class: 'stat__k', style: 'display:flex; align-items:center; gap:6px' }, [ui.statusLight(ok ? 'ok' : 'warn'), k]),
+        el('div', { class: 'stat__v mono', style: 'font-size:12px; font-weight:400; color:var(--fg-muted)', text: extra }),
+      ]));
       const src = s.skinSource ? ui.badge('皮肤来源 ' + (SOURCE_LABEL[s.skinSource] || s.skinSource), 'muted') : null;
       const allOk = s.dirExists && s.plumExists && s.mainSchemaExists;
       const curSchema = (S.appearance && S.appearance.currentSchema) || null;
       return ui.card('🀄 状态', el('div', {}, [
-        rows,
-        el('div', { class: 'muted section', text: `当前：方案 ${curSchema || '—'} · 皮肤 ${s.currentSkin || '—'} · 布局 ${s.currentLayout || '—'} / ${s.currentOrientation || '—'}` }),
-        el('div', { class: 'muted', text: '输入方案（全拼 / 各类双拼）的日常切换直接在输入法里按 F4（或 Ctrl+`）打开方案选单即可，Rime 会记住你的选择。' }),
-        gated() ? el('div', { class: 'warn-box section', text: '未检测到主方案，语法模型相关操作已置灰——请先执行「安装 / 更新词库」。' }) : null,
+        el('div', { class: 'stat-grid', style: '--stat-min:200px' }, lightCells),
+        el('div', { class: 'stat-grid', style: '--stat-min:160px; margin-top:var(--space-3)' }, [
+          ui.stat('当前方案', curSchema || '—'),
+          ui.stat('当前皮肤', s.currentSkin || '—'),
+          ui.stat('当前布局', s.currentLayout ? `${s.currentLayout} / ${s.currentOrientation || '—'}` : '—'),
+        ]),
+        el('div', { class: 'muted', style: 'margin-top:var(--space-3)', text: '输入方案（全拼 / 各类双拼）的日常切换直接在输入法里按 F4（或 Ctrl+`）打开方案选单即可，Rime 会记住你的选择。' }),
+        gated() ? el('div', { class: 'warn-box', style: 'margin-top:8px', text: '未检测到主方案，语法模型相关操作已置灰——请先执行「安装 / 更新词库」。' }) : null,
       ]), { light: allOk ? 'ok' : 'warn', extra: src });
     }
 

@@ -68,15 +68,15 @@ export default {
      * 六条数据就撑出半屏。这里改成 3 列网格，一屏能看完。
      */
     const mkStat = (key, label) => {
-      const v = el('div', { style: 'font-weight:600; font-size:14px; line-height:1.35; word-break:break-all' });
+      const v = el('div', { class: 'stat__v' });
       val[key] = v;
       return el('div', {}, [
-        el('div', { class: 'muted', style: 'font-size:11px; letter-spacing:.6px; margin-bottom:1px', text: label }),
+        el('div', { class: 'stat__k', text: label }),
         v,
       ]);
     };
     const statGrid = el('div', {
-      style: 'display:grid; grid-template-columns:repeat(auto-fit, minmax(148px, 1fr)); gap:var(--space-3) var(--space-4); margin-top:var(--space-2)',
+      class: 'stat-grid', style: '--stat-min:148px; margin-top:var(--space-2)',
     }, [
       mkStat('state', '状态'),
       mkStat('version', '已装版本'),
@@ -116,8 +116,8 @@ export default {
     const dirText = el('span', { class: 'mono', text: '—' });
     const logText = el('span', { class: 'mono', text: '—' });
     const nodeText = el('span', { class: 'mono', text: '—' });
-    const detailLine = (label, node) => el('div', { style: 'display:flex; gap:var(--space-2); word-break:break-all' }, [
-      el('span', { class: 'muted nowrap', style: 'width:60px; flex:none', text: label }),
+    const detailLine = (label, node) => el('div', { class: 'detail-line' }, [
+      el('span', { class: 'detail-line__k', text: label }),
       node,
     ]);
 
@@ -142,7 +142,7 @@ export default {
       el('div', { style: 'height:var(--space-2)' }),
       lineRow('访问地址', [urlText, btnCopyUrl, btnOpen]),
       divider(),
-      el('div', { class: 'muted', style: 'font-size:12px; line-height:1.9' }, [
+      el('div', { class: 'detail-lines' }, [
         detailLine('程序目录', dirText),
         detailLine('日志', logText),
         detailLine('node', nodeText),

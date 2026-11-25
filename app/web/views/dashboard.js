@@ -63,8 +63,8 @@ export default {
       return el('div', { class: 'muted', text: bm.stale ? `${at}（已过期，可在 Homebrew 管家点「重查可更新项」同步）` : at });
     }
     function netRows(label, p) {
-      const rows = [ui.kv(`${label}连通`, p && p.ok ? '🟢 正常' : '🔴 不可达')];
-      if (p && p.ok) rows.push(ui.kv(`${label}出口 IP`, [p.ip || 'IP 信息获取失败', p.location ? ` · ${p.location}` : ''].join('')));
+      const rows = [[`${label}连通`, p && p.ok ? '🟢 正常' : '🔴 不可达']];
+      if (p && p.ok) rows.push([`${label}出口 IP`, [p.ip || 'IP 信息获取失败', p.location ? ` · ${p.location}` : ''].join('')]);
       return rows;
     }
 
@@ -76,70 +76,79 @@ export default {
 
       // Homebrew
       const outdated = (b.outdatedFormula || 0) + (b.outdatedCask || 0);
-      const brewRows = el('div', { class: 'card__rows' }, [
-        ui.kv('版本', b.version || '未检测到'),
-        ui.kv('路径', el('span', { class: 'mono', text: b.path || '—' })),
-        ui.kv('已安装', `formula ${b.formulaCount || 0} / cask ${b.caskCount || 0}`),
-        // 口径说明（2026-11-14）：这个数字现在与 Homebrew 管家「升级列表」同源（后端 brew 模块的
-        // 纠偏计数），不再是体检路径各算一次的近似值 —— 两处数字一致是刻意保证的。
-        ui.kv('可更新', el('span', {
-          title: b.outdatedSource === 'brew-raw'
-            ? 'brew 原始口径（brew outdated --quiet），未按应用本体版本纠偏；可能与 Homebrew 管家的升级列表略有出入。'
-            : '与 Homebrew 管家「升级列表」同一口径（已按应用本体版本纠偏）。',
-          text: outdated > 0 ? `${outdated} 项` : '0 项',
-        })),
-      ]);
-      if (outdated === 0) brewRows.append(el('div', { class: 'empty', style: 'padding:12px' }, [el('div', { class: 'empty__title', text: '🎉 所有 Homebrew 软件包均为最新' }), el('div', { class: 'muted', text: '无需更新' })]));
-      brewRows.append(metaLine());   // 「元数据同步于 X」：说明这个数字有多新
-      if (b.tapEmpty) brewRows.append(el('div', { class: 'muted', text: 'ℹ Homebrew 7 默认不再显式列出 core / cask 等内置源，属正常现象。' }));
+      const brewRows = el('div', {}, [
+        ui.statGrid([
+          ['版本', b.version || '未检测到'],
+          ['已装', `formula ${b.formulaCount || 0} / cask ${b.caskCount || 0}`],
+          // 口径说明（2026-11-14）：这个数字现在与 Homebrew 管家「升级列表」同源（后端 brew 模块的
+          // 纠偏计数），不再是体检路径各算一次的近似值 —— 两处数字一致是刻意保证的。
+          ['可更新', el('span', {
+            title: b.outdatedSource === 'brew-raw'
+              ? 'brew 原始口径（brew outdated --quiet），未按应用本体版本纠偏；可能与 Homebrew 管家的升级列表略有出入。'
+              : '与 Homebrew 管家「升级列表」同一口径（已按应用本体版本纠偏）。',
+            text: outdated > 0 ? `${outdated} 项` : '0 项',
+          })],
+        ], { min: 200 }),
+        ui.detailLines([['路径', b.path || '—']]),
+        outdated === 0 ? el('div', { class: 'empty', style: 'padding:12px; margin-top:8px' }, [el('div', { class: 'empty__title', text: '🎉 所有 Homebrew 软件包均为最新' }), el('div', { class: 'muted', text: '无需更新' })]) : null,
+        metaLine(),   // 「元数据同步于 X」：说明这个数字有多新
+        b.tapEmpty ? el('div', { class: 'muted', style: 'margin-top:4px', text: 'ℹ Homebrew 7 默认不再显式列出 core / cask 等内置源，属正常现象。' }) : null,
+      ].filter(Boolean));
       grid.append(ui.card('🍺 Homebrew', brewRows, { light: lightOf(b.status) }));
 
       // 网络
-      grid.append(ui.card('🌐 网络', el('div', { class: 'card__rows' }, [
-        ...netRows('直连', n.direct), ...netRows('代理', n.proxy),
+      grid.append(ui.card('🌐 网络', el('div', {}, [
+        ui.statGrid([...netRows('直连', n.direct), ...netRows('代理', n.proxy)], { min: 200 }),
         // 两通道用的是不同回显（国内 / 境外），IP 还相同就说明代理没把流量送出去
         n.proxy && n.proxy.sameAsDirect
-          ? el('div', { class: 'warn-box', text: '两个出口 IP 相同：这条「代理」实际没把流量送出去。常见原因：客户端没选节点、规则把该域名分流成直连、或只开了 TUN 却没接管流量。' })
+          ? el('div', { class: 'warn-box', style: 'margin-top:8px', text: '两个出口 IP 相同：这条「代理」实际没把流量送出去。常见原因：客户端没选节点、规则把该域名分流成直连、或只开了 TUN 却没接管流量。' })
           : null,
-        n.allFailed ? el('div', { class: 'err-box', text: '直连与代理均不可用，请检查网络或代理端口配置。' }) : null,
+        n.allFailed ? el('div', { class: 'err-box', style: 'margin-top:8px', text: '直连与代理均不可用，请检查网络或代理端口配置。' }) : null,
       ].filter(Boolean)), { light: lightOf(n.status) }));
 
       // Shell / 别名
       const aliasOk = sh.aliasPresent && sh.aliasMatchesExpected;
       const aliasText = !sh.aliasPresent ? '未设置' : (sh.aliasMatchesExpected ? '已配置且与期望一致' : '已有自定义别名，与期望格式不一致');
-      const shellRows = el('div', { class: 'card__rows' }, [
-        ui.kv('Shell', `${sh.kind || 'unknown'} · ${sh.rcFile || '未识别'}`),
-        ui.kv('proxy 别名', aliasOk ? '🟢 ' + aliasText : '🟡 ' + aliasText),
-      ]);
-      if (sh.aliasPresent && !sh.aliasMatchesExpected) {
-        shellRows.append(el('div', { class: 'warn-box', text: '检测到 rc 文件中已有自定义 proxy/unproxy 别名（格式与本应用期望不同）。请前往「系统初始化」查看并排 diff 后三选一处理，本应用不会盲目追加。' }));
-        shellRows.append(el('button', { class: 'btn btn--sm', type: 'button', text: '前往系统初始化 →', on: { click: () => ctx.navigate('#/sysinit') } }));
-      }
+      const shellRows = el('div', {}, [
+        ui.statGrid([
+          ['Shell', `${sh.kind || 'unknown'} · ${sh.rcFile || '未识别'}`],
+          ['proxy 别名', aliasOk ? '🟢 ' + aliasText : '🟡 ' + aliasText],
+        ], { min: 200 }),
+        sh.aliasPresent && !sh.aliasMatchesExpected
+          ? el('div', { class: 'warn-box', style: 'margin-top:8px', text: '检测到 rc 文件中已有自定义 proxy/unproxy 别名（格式与本应用期望不同）。请前往「系统初始化」查看并排 diff 后三选一处理，本应用不会盲目追加。' })
+          : null,
+        sh.aliasPresent && !sh.aliasMatchesExpected
+          ? el('button', { class: 'btn btn--sm', type: 'button', style: 'margin-top:8px', text: '前往系统初始化 →', on: { click: () => ctx.navigate('#/sysinit') } })
+          : null,
+      ].filter(Boolean));
       const shellLight = sh.kind === 'unknown' ? 'warn' : ((sh.aliasPresent && sh.aliasMatchesExpected) ? lightOf(sh.status) : 'warn');
       grid.append(ui.card('🐚 Shell', shellRows, { light: shellLight }));
 
       // Rime
-      const rimeRows = el('div', { class: 'card__rows' }, [
-        ui.kv('目录', `${rm.dir || '—'} ${rm.dirExists ? '✓' : '✗'}`),
-        ui.kv('plum / 主方案 / Squirrel', `${rm.plumExists ? '✓' : '✗'} · ${rm.mainSchemaExists ? '✓' : '✗'} · ${rm.squirrelDeployable ? '可部署 ✓' : '不可自动部署 ✗'}`),
-        ui.kv('当前皮肤', rm.currentSkin || '未知'),
-        ui.kv('当前布局', rm.currentLayout ? `${rm.currentLayout} · ${rm.currentOrientation || ''}` : '未知'),
-      ]);
-      if (!rm.mainSchemaExists) rimeRows.append(el('div', { class: 'warn-box', text: '⚠ 未检测到主方案 rime_ice.schema.yaml，请先执行「安装 / 更新词库」。' }));
-      grid.append(ui.card('🀄 Rime', rimeRows, { light: lightOf(rm.status) }));
+      grid.append(ui.card('🀄 Rime', el('div', {}, [
+        ui.statGrid([
+          ['plum / 主方案 / Squirrel', `${rm.plumExists ? '✓' : '✗'} · ${rm.mainSchemaExists ? '✓' : '✗'} · ${rm.squirrelDeployable ? '可部署 ✓' : '不可自动部署 ✗'}`],
+          ['当前皮肤', rm.currentSkin || '未知'],
+          ['当前布局', rm.currentLayout ? `${rm.currentLayout} · ${rm.currentOrientation || ''}` : '未知'],
+        ], { min: 200 }),
+        ui.detailLines([['目录', `${rm.dir || '—'} ${rm.dirExists ? '✓' : '✗'}`]]),
+        !rm.mainSchemaExists ? el('div', { class: 'warn-box', style: 'margin-top:8px', text: '⚠ 未检测到主方案 rime_ice.schema.yaml，请先执行「安装 / 更新词库」。' }) : null,
+      ].filter(Boolean)), { light: lightOf(rm.status) }));
 
       // Git
-      grid.append(ui.card('📦 Git', el('div', { class: 'card__rows' }, [
-        ui.kv('user.name', g.userName || '未设置'),
-        ui.kv('user.email', g.userEmail || '未设置'),
-        ui.kv('凭据', g.tokenExists ? '已存在' : '缺失'),
-      ]), { light: lightOf(g.status) }));
+      grid.append(ui.card('📦 Git', ui.statGrid([
+        ['user.name', g.userName || '未设置'],
+        ['user.email', g.userEmail || '未设置'],
+        ['凭据', g.tokenExists ? '已存在' : '缺失'],
+      ], { min: 200 }), { light: lightOf(g.status) }));
 
       // 镜像源 / 代理
-      grid.append(ui.card('⚙ 镜像源 / 代理', el('div', { class: 'card__rows' }, [
-        ui.kv('镜像源', m.label || m.id || '—'),
-        ui.kv('代理端口', `${pp.http || '—'} (HTTP) / ${pp.socks5 || '—'} (SOCKS5)`),
-        ui.kv('配置文件', el('span', { class: 'mono', text: pp.configPath || '—' })),
+      grid.append(ui.card('⚙ 镜像源 / 代理', el('div', {}, [
+        ui.statGrid([
+          ['镜像源', m.label || m.id || '—'],
+          ['代理端口', `${pp.http || '—'} (HTTP) / ${pp.socks5 || '—'} (SOCKS5)`],
+        ], { min: 200 }),
+        ui.detailLines([['配置文件', pp.configPath || '—']]),
       ]), { light: lightOf(m.status) }));
 
     }

@@ -59,37 +59,52 @@ export default {
     // ======================= ① 服务状态卡（结构建一次，值靠 paint 更新） =======================
     const lamp = el('span', { class: 'light light--warn', title: '读取中' });
     const val = {};
-    const mkRow = (key, label) => {
-      const v = el('span', { class: 'kv__v' });
+    /** 紧凑信息块（小标签在上、值在下）；不用 .kv，否则每条都被推到卡片最右侧 */
+    const mkStat = (key, label) => {
+      const v = el('div', { class: 'stat__v' });
       val[key] = v;
-      return el('div', { class: 'kv' }, [el('span', { class: 'kv__k', text: label }), v]);
+      return el('div', {}, [el('div', { class: 'stat__k', text: label }), v]);
     };
+    /** 次要信息（脚本 / 目录 / 日志）：12px 灰字单行 */
+    const mkDetail = (key, label) => {
+      const v = el('span', { class: 'mono' });
+      val[key] = v;
+      return el('div', { class: 'detail-line' }, [el('span', { class: 'detail-line__k', text: label }), v]);
+    };
+    /** 高码率协议：单独一行的值（不占网格格子，见状态卡里的注释） */
+    val.engine = el('span', { text: '—' });
     const btnStart = el('button', { class: 'btn btn--primary', type: 'button', text: '启动', on: { click: () => doAction('start') } });
     const btnStop = el('button', { class: 'btn', type: 'button', text: '停止', on: { click: () => doAction('stop') } });
     const btnRestart = el('button', { class: 'btn', type: 'button', text: '重启', on: { click: () => doAction('restart') } });
-    const note = el('div', { class: 'warn-box section', hidden: true });
+    const note = el('div', { class: 'warn-box', style: 'margin-top:var(--space-3)', hidden: true });
 
     const statusCard = el('div', { class: 'card section' }, [
       el('div', { class: 'card__head' }, [
         el('div', { class: 'card__title' }, [lamp, '① 服务状态']),
+        el('div', { class: 'muted', style: 'font-size:12px', text: '独立于 MacKit 运行，关界面不中断播放' }),
       ]),
-      el('div', { class: 'card__rows' }, [
-        mkRow('state', '状态'),
-        mkRow('pid', '进程'),
-        mkRow('port', '端口'),
-        mkRow('version', '版本'),
-        mkRow('channels', '频道'),
-        mkRow('engine', '高码率协议'),
-        mkRow('uptime', '已运行'),
-        mkRow('python', 'python3'),
-        mkRow('distver', '脚本版本'),
-        mkRow('script', '脚本'),
-        mkRow('data', '数据目录'),
-        mkRow('log', '日志'),
+      el('div', { class: 'stat-grid', style: 'margin-top:var(--space-2)' }, [
+        mkStat('state', '状态'),
+        mkStat('port', '端口'),
+        mkStat('uptime', '已运行'),
+        mkStat('pid', '进程'),
+        mkStat('distver', '脚本版本'),
+        mkStat('channels', '频道'),
+      ]),
+      // 高码率协议是否就绪单独一行：它是一句会变长的话（「初始化中（4K 暂回落 1080p）」），
+      // 塞进网格会把它自己挤成两三行、把整行高度拉高
+      el('div', { class: 'row', style: 'gap:var(--space-2); margin-top:var(--space-2); font-size:12px' }, [
+        el('span', { class: 'muted nowrap', text: '高码率协议' }), val.engine,
+      ]),
+      el('div', { style: 'height:1px; background:var(--border); margin:var(--space-3) 0' }),
+      el('div', { class: 'detail-lines' }, [
+        mkDetail('python', 'python3'),
+        mkDetail('script', '脚本'),
+        mkDetail('data', '数据目录'),
+        mkDetail('log', '日志'),
       ]),
       note,
-      el('div', { class: 'row section' }, [btnStart, btnStop, btnRestart]),
-      el('div', { class: 'muted', text: '直播服务独立于 MacKit 运行：关闭 / 重启 MacKit 界面不会中断正在播放的流；要停就点上面的「停止」。' }),
+      el('div', { class: 'row', style: 'margin-top:var(--space-4)' }, [btnStart, btnStop, btnRestart]),
     ]);
 
     // ======================= ② 订阅地址卡 =======================
@@ -180,7 +195,6 @@ export default {
       else val.pid.textContent = '—';
 
       val.port.textContent = String(s.port);
-      val.version.textContent = s.version || '—';
       val.channels.textContent = Number.isInteger(s.channels) ? `${s.channels} 路` : '—';
 
       if (s.deviceReady === null) val.engine.textContent = '—';
@@ -194,7 +208,9 @@ export default {
       // 目录是自动发现的（取版本号最大的那份）：把挑中的版本与「被忽略的旧版本」都摊开，
       // 免得用户放了新版目录却仍看到旧版在跑时分不清是哪一步没生效。
       const others = Array.isArray(s.otherDists) && s.otherDists.length ? `（忽略旧版：${s.otherDists.join('、')}）` : '';
-      val.distver.textContent = `${s.distVersion ? `v${s.distVersion}` : '—'}${others}`;
+      // 目录版本（挑中的那一份）与运行中实例自报的版本放同一格：两者不一致本身就是有用的信息
+      const runningVer = s.running && s.version ? ` · 运行 v${s.version}` : '';
+      val.distver.textContent = `${s.distVersion ? `v${s.distVersion}` : '—'}${runningVer}${others}`;
       val.script.textContent = s.installed ? s.script : `未找到（扫描根目录 ${s.root}）`;
       val.data.textContent = s.dataDir;
       val.log.textContent = s.logFile;

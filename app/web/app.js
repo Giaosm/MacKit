@@ -252,6 +252,36 @@ function emptyState({ icon = '·', title, text, actions = [] }) {
 
 const kv = (k, v) => el('div', { class: 'kv' }, [el('span', { class: 'kv__k', text: k }), el('span', { class: 'kv__v' }, [v && v.nodeType ? v : String(v == null ? '—' : v)])]);
 
+/**
+ * 紧凑信息块：小标签在上、值在下（**不要**再用 .kv 铺状态行，理由见 style.css 的 .stat-grid 注释）。
+ * @param {string} label
+ * @param {Node|string|number} value
+ */
+const stat = (label, value) => el('div', {}, [
+  el('div', { class: 'stat__k', text: label }),
+  el('div', { class: 'stat__v' }, [value && value.nodeType ? value : String(value == null ? '—' : value)]),
+]);
+/**
+ * 信息块网格：一行 3~6 个，列宽自适应（窄卡片自然落到 2 列）。
+ * @param {Array<[string, Node|string|number]>} items
+ * @param {{min?:number, max?:number}} [opts] min 单元格最小宽度（默认 140），max 单元格最大宽度
+ *   （只有两三条信息时给个上限，否则两条各占半屏，又变回「隔着一整个屏幕」）
+ */
+function statGrid(items, opts = {}) {
+  const node = el('div', { class: 'stat-grid' }, (items || []).map(([k, v]) => stat(k, v)));
+  if (opts.min) node.style.setProperty('--stat-min', `${opts.min}px`);
+  if (opts.max) node.style.setProperty('--stat-max', `${opts.max}px`);
+  return node;
+}
+/**
+ * 次要信息（路径 / 日志 / 命令）：12px 灰字单行一条，标签定宽。
+ * @param {Array<[string, Node|string]>} items
+ */
+const detailLines = (items) => el('div', { class: 'detail-lines' }, (items || []).map(([k, v]) => el('div', { class: 'detail-line' }, [
+  el('span', { class: 'detail-line__k', text: k }),
+  el('span', { class: 'mono' }, [v && v.nodeType ? v : String(v == null ? '—' : v)]),
+])));
+
 // ============================== 模块网络通道 ==============================
 /**
  * 模块顶部的「网络通道」小下拉，**选中即保存生效**（唯一事实源是后端 lib/netpolicy.js）。
@@ -879,7 +909,7 @@ function makeCtx(subs) {
     },
     refreshEnv: refreshEnv,
     fmtTime, fmtDateTime, fmtRel, fmtSize,
-    ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, kv, card, copy: copyText, portOk, netChannel },
+    ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, kv, card, stat, statGrid, detailLines, copy: copyText, portOk, netChannel },
   };
 }
 async function refreshEnv(force) {

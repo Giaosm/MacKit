@@ -141,24 +141,31 @@ export default {
         : (b.outdatedSource === 'brew-raw'
           ? '环境体检的 brew 原始口径（brew outdated --quiet），未按应用本体版本纠偏 —— 可能与下方「升级列表」的数字略有出入。'
           : '与下方「升级列表」同一口径（已按应用本体版本纠偏）；列表加载完成后会直接沿用它的计数。');
+      // 三张小卡并排（.grid--3，每张 ~320px）：信息块最小宽度调小到 110，自然排成 2 列
       const grid = el('div', { class: 'grid grid--3' }, [
-        ui.card('🍺 环境', el('div', { class: 'card__rows' }, [
-          ui.kv('版本', b.version || '未检测到'),
-          ui.kv('已装', `formula ${b.formulaCount || 0} / cask ${b.caskCount || 0}`),
-          ui.kv('可更新', el('span', { title: outdatedTip, text: `${outdatedTotal} 项` })),
+        ui.card('🍺 环境', el('div', {}, [
+          ui.statGrid([
+            ['版本', b.version || '未检测到'],
+            ['已装', `formula ${b.formulaCount || 0} / cask ${b.caskCount || 0}`],
+            ['可更新', el('span', { title: outdatedTip, text: `${outdatedTotal} 项` })],
+          ], { min: 110 }),
         ]), { light: b.status || 'warn', extra: chBadge }),
-        ui.card('🌐 网络', el('div', { class: 'card__rows' }, [
-          ui.kv('直连', netVal(n.direct)),
-          ui.kv('代理', netVal(n.proxy)),
+        ui.card('🌐 网络', el('div', {}, [
+          ui.statGrid([
+            ['直连', netVal(n.direct)],
+            ['代理', netVal(n.proxy)],
+          ], { min: 110 }),
           // 两个通道用的是不同回显站点（国内 ipip / 境外 ip.sb），IP 仍相同 → 代理没把流量送出去
           n.proxy && n.proxy.sameAsDirect
-            ? el('div', { class: 'warn-box', text: '两个出口 IP 相同：这条「代理」实际没把流量送出去。' })
+            ? el('div', { class: 'warn-box', style: 'margin-top:8px', text: '两个出口 IP 相同：这条「代理」实际没把流量送出去。' })
             : null,
         ].filter(Boolean)), { light: n.status || 'warn' }),
-        ui.card('⚙ 配置', el('div', { class: 'card__rows' }, [
-          ui.kv('镜像源', m.label || m.id || '—'),
-          ui.kv('代理端口', `${pp.http || '—'} / ${pp.socks5 || '—'}`),
-          ui.kv('config', el('span', { class: 'mono', text: pp.configPath || '—' })),
+        ui.card('⚙ 配置', el('div', {}, [
+          ui.statGrid([
+            ['镜像源', m.label || m.id || '—'],
+            ['代理端口', `${pp.http || '—'} / ${pp.socks5 || '—'}`],
+          ], { min: 110 }),
+          ui.detailLines([['config', pp.configPath || '—']]),
         ]), { light: m.status || 'warn' }),
       ]);
       envBox.append(grid);
