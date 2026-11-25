@@ -62,14 +62,41 @@ export default {
     // ======================= ① 服务状态卡 =======================
     const lamp = el('span', { class: 'light light--warn', title: '读取中' });
     const val = {};
-    const mkRow = (key, label) => {
-      const v = el('span', { class: 'kv__v' });
+    /**
+     * 紧凑数据块：小标签在上、值在下。
+     * 不用 `.kv`（一行一条、标签在左值在右）—— 卡片有 1100px 宽，那样每行中间全是空白，
+     * 六条数据就撑出半屏。这里改成 3 列网格，一屏能看完。
+     */
+    const mkStat = (key, label) => {
+      const v = el('div', { style: 'font-weight:600; font-size:14px; line-height:1.35; word-break:break-all' });
       val[key] = v;
-      return el('div', { class: 'kv' }, [el('span', { class: 'kv__k', text: label }), v]);
+      return el('div', {}, [
+        el('div', { class: 'muted', style: 'font-size:11px; letter-spacing:.6px; margin-bottom:1px', text: label }),
+        v,
+      ]);
     };
+    const statGrid = el('div', {
+      style: 'display:grid; grid-template-columns:repeat(auto-fit, minmax(148px, 1fr)); gap:var(--space-3) var(--space-4); margin-top:var(--space-2)',
+    }, [
+      mkStat('state', '状态'),
+      mkStat('version', '已装版本'),
+      mkStat('upstream', '上游版本'),
+      mkStat('port', '端口'),
+      mkStat('pid', '进程'),
+      mkStat('uptime', '已运行'),
+    ]);
+
+    /** 一行「标签 + 值 + 按钮」：标签定宽，左侧对齐，避免像 .kv 那样被拉到两边 */
+    const lineRow = (label, kids, extra) => el('div', { class: 'row', style: 'gap:var(--space-2)' }, [
+      el('span', { class: 'muted nowrap', style: 'width:60px; flex:none', text: label }),
+      ...kids,
+      extra || null,
+    ]);
+    const divider = () => el('div', { style: 'height:1px; background:var(--border); margin:var(--space-3) 0' });
 
     /** 访问密码（明文 + 复制） */
     const pwText = el('code', { class: 'mono', text: '—' });
+    const pwReq = el('span', { class: 'muted', style: 'font-size:12px', text: '—' });
     const btnCopyPw = el('button', {
       class: 'btn btn--sm', type: 'button', text: '复制',
       on: { click: () => ui.copy(st.data && st.data.password, '已复制访问密码') },
@@ -85,6 +112,15 @@ export default {
       on: { click: () => openSite() },
     });
 
+    /** 路径信息：12px 灰字单行一条，放在卡片底部，不占主视觉 */
+    const dirText = el('span', { class: 'mono', text: '—' });
+    const logText = el('span', { class: 'mono', text: '—' });
+    const nodeText = el('span', { class: 'mono', text: '—' });
+    const detailLine = (label, node) => el('div', { style: 'display:flex; gap:var(--space-2); word-break:break-all' }, [
+      el('span', { class: 'muted nowrap', style: 'width:60px; flex:none', text: label }),
+      node,
+    ]);
+
     const btnInstall = el('button', { class: 'btn btn--primary', type: 'button', text: '安装', on: { click: () => doAction('install') } });
     const btnStart = el('button', { class: 'btn btn--primary', type: 'button', text: '启动', on: { click: () => doAction('start') } });
     const btnStop = el('button', { class: 'btn', type: 'button', text: '停止', on: { click: () => doAction('stop') } });
@@ -93,39 +129,36 @@ export default {
     const btnUninstall = el('button', { class: 'btn btn--danger', type: 'button', text: '卸载', on: { click: () => doAction('uninstall') } });
     const btnCheck = el('button', { class: 'btn btn--sm', type: 'button', text: '检查更新', on: { click: () => checkLatest(true) } });
 
-    const note = el('div', { class: 'warn-box section', hidden: true });
+    const note = el('div', { class: 'warn-box', style: 'margin-top:var(--space-3)', hidden: true });
 
     const statusCard = el('div', { class: 'card section' }, [
       el('div', { class: 'card__head' }, [
         el('div', { class: 'card__title' }, [lamp, '① 服务状态']),
+        btnCheck,
       ]),
-      el('div', { class: 'card__rows' }, [
-        mkRow('state', '状态'),
-        mkRow('version', '已装版本'),
-        mkRow('upstream', '上游版本'),
-        mkRow('port', '端口'),
-        mkRow('pid', '进程'),
-        mkRow('uptime', '已运行'),
-        mkRow('pwreq', '密码校验'),
-        el('div', { class: 'row section' }, [
-          el('span', { class: 'muted nowrap', text: '访问密码' }), pwText, btnCopyPw,
-        ]),
-        el('div', { class: 'row' }, [
-          el('span', { class: 'muted nowrap', text: '访问地址' }), urlText, btnCopyUrl, btnOpen,
-        ]),
-        mkRow('dir', '程序目录'),
-        mkRow('log', '日志'),
-        mkRow('node', 'node'),
+      statGrid,
+      divider(),
+      lineRow('访问密码', [pwText, btnCopyPw], pwReq),
+      el('div', { style: 'height:var(--space-2)' }),
+      lineRow('访问地址', [urlText, btnCopyUrl, btnOpen]),
+      divider(),
+      el('div', { class: 'muted', style: 'font-size:12px; line-height:1.9' }, [
+        detailLine('程序目录', dirText),
+        detailLine('日志', logText),
+        detailLine('node', nodeText),
       ]),
       note,
-      el('div', { class: 'row section' }, [btnInstall, btnStart, btnStop, btnRestart, btnUpdate, btnCheck]),
-      el('div', { class: 'row' }, [btnUninstall]),
-      el('div', { class: 'muted', text: 'LibreTV 独立于 MacKit 运行：关闭 / 重启 MacKit 界面不会中断正在播放的视频；要停就点「停止」。卸载只删程序目录，浏览器里的观看记录（本地存储）不受影响。' }),
+      el('div', { class: 'row', style: 'margin-top:var(--space-4)' }, [
+        btnInstall, btnStart, btnStop, btnRestart, btnUpdate,
+        el('span', { class: 'grow' }),
+        btnUninstall,
+      ]),
+      el('div', { class: 'muted', style: 'margin-top:var(--space-3); font-size:12px', text: '独立于 MacKit 运行：关闭 / 重启界面的不会中断正在播放的视频。卸载只删程序目录，浏览器里的观看记录不受影响。' }),
     ]);
 
     // ======================= ② 访问设置卡 =======================
     const pwInput = el('input', {
-      type: 'text', placeholder: '留空则不修改；至少 6 位', style: 'min-width:240px',
+      type: 'text', placeholder: '留空则不修改；至少 6 位', style: 'flex:1; min-width:160px',
       on: {
         input: () => { st.dirty.pw = true; },
         keydown: (e) => { if (e.key === 'Enter') saveConfig(); },
@@ -147,31 +180,38 @@ export default {
       type: 'checkbox',
       on: { change: () => { st.dirty.lan = true; paintLanHint(); } },
     });
-    const lanHint = el('div', { class: 'warn-box section', hidden: true, text: '开启后 LibreTV 会监听 0.0.0.0：同网段（同一 Wi-Fi / 交换机）的任何设备都能打开它，只靠访问密码把门。在公共网络里不要开。' });
+    const lanHint = el('div', { class: 'warn-box', style: 'margin-top:var(--space-3)', hidden: true, text: '开启后 LibreTV 会监听 0.0.0.0：同网段（同一 Wi-Fi / 交换机）的任何设备都能打开它，只靠访问密码把门。在公共网络里不要开。' });
     const btnSave = el('button', { class: 'btn btn--primary', type: 'button', text: '保存设置', on: { click: () => saveConfig() } });
+
+    /** 表单项：标签在上、控件在下（比「标签左 + 控件右」省掉一整行宽度） */
+    const mkField = (label, body, hint) => el('div', { class: 'field', style: 'margin:0' }, [
+      el('span', { class: 'muted', style: 'font-size:12px', text: label }),
+      body,
+      hint ? el('span', { class: 'muted', style: 'font-size:11px', text: hint }) : null,
+    ]);
 
     const configCard = el('div', { class: 'card section' }, [
       el('div', { class: 'card__head' }, [
         el('div', { class: 'card__title', text: '② 访问设置' }),
+        el('div', { class: 'muted', style: 'font-size:12px', text: '写入 ~/.mackit/libretv/state.json' }),
       ]),
-      el('div', { class: 'card__rows' }, [
-        el('div', { class: 'field__row section' }, [
-          el('span', { class: 'muted nowrap', style: 'width:88px', text: '访问密码' }),
-          pwInput, btnRandomPw,
+      el('div', {
+        style: 'display:grid; grid-template-columns:minmax(0,1.6fr) minmax(0,1fr); gap:var(--space-4) var(--space-5); align-items:start',
+      }, [
+        mkField('访问密码', el('div', { class: 'row', style: 'gap:var(--space-2); flex-wrap:nowrap' }, [pwInput, btnRandomPw])),
+        mkField('端口', el('div', { class: 'row', style: 'gap:var(--space-2)' }, [portInput]),
+          '1024–65535；被占用时启动会自动顺延'),
+        el('div', { style: 'grid-column:1 / -1' }, [
+          el('div', { class: 'row' }, [
+            el('label', { class: 'check' }, [lanCheck, el('span', { text: '允许局域网访问' })]),
+            el('span', { class: 'muted', style: 'font-size:12px', text: '默认关闭，只监听 127.0.0.1' }),
+            el('span', { class: 'grow' }),
+            el('span', { class: 'muted', style: 'font-size:12px', text: '运行中修改后需点「重启」生效' }),
+          ]),
+          lanHint,
         ]),
-        el('div', { class: 'field__row section' }, [
-          el('span', { class: 'muted nowrap', style: 'width:88px', text: '端口' }),
-          portInput,
-          el('span', { class: 'muted', text: '1024–65535；被占用时启动会自动顺延一个可用端口' }),
-        ]),
-        el('div', { class: 'field__row section' }, [
-          el('label', { class: 'check' }, [lanCheck, el('span', { text: '允许局域网访问' })]),
-          el('span', { class: 'muted', text: '默认关闭，只监听 127.0.0.1' }),
-        ]),
-        lanHint,
       ]),
-      el('div', { class: 'row section' }, [btnSave]),
-      el('div', { class: 'muted', text: '改动写入 ~/.mackit/libretv/state.json；服务正在运行时需要点「重启」才生效。' }),
+      el('div', { class: 'row', style: 'margin-top:var(--space-4)' }, [btnSave]),
     ]);
 
     // ======================= ③ 日志卡 =======================
@@ -224,9 +264,9 @@ export default {
       val.pid.textContent = s.pid ? String(s.pid) : (s.foreign ? '未知（非本应用拉起）' : '—');
       val.uptime.textContent = s.pid && s.startedAt ? fmtDuration((Date.now() - s.startedAt) / 1000) : '—';
 
-      if (s.passwordRequired === null) val.pwreq.textContent = '—';
-      else if (s.passwordRequired) val.pwreq.textContent = s.serverVersion ? `需要密码（服务端 v${s.serverVersion}）` : '需要密码';
-      else val.pwreq.textContent = '无需密码';
+      if (s.passwordRequired === null) pwReq.textContent = '—';
+      else if (s.passwordRequired) pwReq.textContent = s.serverVersion ? `服务端要求密码（v${s.serverVersion}）` : '服务端要求密码';
+      else pwReq.textContent = '服务端未启用密码';
 
       pwText.textContent = s.password || '—';
       btnCopyPw.disabled = !s.password;
@@ -235,9 +275,9 @@ export default {
       urlText.title = s.lanUrl ? `局域网：${s.lanUrl}` : '';
       btnOpen.disabled = !s.running;
 
-      val.dir.textContent = s.dir || '未安装（点「安装」下载官方包）';
-      val.log.textContent = s.logFile;
-      val.node.textContent = s.node.exists ? s.node.bin : `${s.node.bin}（缺失）`;
+      dirText.textContent = s.dir || '未安装（点「安装」下载官方包）';
+      logText.textContent = s.logFile;
+      nodeText.textContent = s.node.exists ? s.node.bin : `${s.node.bin}（缺失）`;
 
       // 按钮
       btnInstall.disabled = st.busy;
