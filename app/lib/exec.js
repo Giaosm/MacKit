@@ -120,8 +120,13 @@ const BIN_MAP = Object.freeze({
   //   这里只认这一个**固定路径**，参数由模块侧给定（脚本路径 + 端口 + --data-dir），
   //   没有任何一段来自 HTTP 入参，攻击面等价于其它固定命令。
   python3: paths.PYTHON3_BIN,
-  // 只读查看进程命令行（ysp 模块核对 pid 归属用，见 lib/ysp.js 的 pidOwnedByUs）
+  // 只读查看进程命令行（ysp / libretv 模块核对 pid 归属用）
   ps: paths.PS_BIN,
+  // 只读读进程的 cwd（libretv 用：Next standalone 会把进程标题改成 next-server，命令行里没有路径）
+  lsof: paths.LSOF_BIN,
+  // 解压 LibreTV 官方 standalone 包（lib/libretv.js）。只认这个固定路径，
+  // 参数由模块侧给（-xzf <我们下载的文件> -C <我们建的版本目录>），无 HTTP 入参直通。
+  tar: paths.TAR_BIN,
 });
 
 /**

@@ -77,6 +77,17 @@ export const MODULES = Object.freeze([
     channel: false,
   },
   {
+    // LibreTV：托管官方 Next.js standalone 预构建包（下载 → 解压 → 常驻子进程）。
+    // 不内置任何点播 / 直播源，只把官方包体跑起来；安装 / 更新要连 GitHub，
+    // 因此开通道档位（实测直连 7KB/s，代理 1.4MB/s）。
+    id: 'libretv',
+    title: 'LibreTV',
+    icon: 'film',
+    view: './views/libretv.js',
+    backend: 'libretv.js',
+    channel: true,
+  },
+  {
     id: 'backup',          // 后端注册表键与 runTask('backup', …) 用这个
     viewId: 'backups',     // 前端路由 #/backups
     title: '备份中心',

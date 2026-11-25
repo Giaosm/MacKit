@@ -156,6 +156,24 @@ export const YSP_LOG = path.join(MACKIT_DIR, 'ysp.log');
 /** 运行态：{ pid, port, startedAt }（用于停止 / 判断是否由本应用拉起） */
 export const YSP_STATE_JSON = path.join(MACKIT_DIR, 'ysp.json');
 
+// ---------------------------------------------------------------------------
+// LibreTV（本地影视聚合站，Next.js standalone 预构建包）
+// ---------------------------------------------------------------------------
+/**
+ * ~/.mackit/libretv —— 自己下载解压，不放进仓库（避免 untracked 大文件污染 git）。
+ * 结构：`<版本号>/`（解压出来的 server.js + .next + public + node_modules）+ state.json + 日志。
+ */
+export const LIBRETV_DIR = path.join(MACKIT_DIR, 'libretv');
+/** 运行态与配置：{ version, port, password, lan, pid, startedAt }（600） */
+export const LIBRETV_STATE_JSON = path.join(LIBRETV_DIR, 'state.json');
+/** 服务日志（stdout+stderr 追加写） */
+export const LIBRETV_LOG = path.join(LIBRETV_DIR, 'libretv.log');
+/**
+ * 默认端口：刻意避开 8080（LibreTV 官方默认，最易与他人的实例/其它工具撞）、
+ * 18080（MacKit 服务）与 8767（央视频直播），选一个不常用的五位数。
+ */
+export const LIBRETV_DEFAULT_PORT = 19080;
+
 /**
  * 目录名 → 版本号。只认「ysp-live[-任意词]-vX[.Y[.Z]]」形状，取**末尾**那个 vX.Y。
  *   ysp-live-v9.5        → 9.5
@@ -374,6 +392,13 @@ export const PLUTIL_BIN = firstExisting(['/usr/bin/plutil'], '/usr/bin/plutil');
  */
 export const PS_BIN = firstExisting(['/bin/ps', '/usr/bin/ps'], '/bin/ps');
 /**
+ * lsof：只读探进程（LibreTV 模块用）。
+ * 为什么必须它：Next.js standalone 的 `server.js` 启动后会把**进程标题**改成
+ * `next-server (vX.Y.Z)`（实测 macOS 上 `ps -o command=` 只剩这串），
+ * 靠命令行认不出「这个 pid 是不是我们拉起的那份」，只能读它的 cwd（= 版本目录）。
+ */
+export const LSOF_BIN = firstExisting(['/usr/sbin/lsof', '/usr/bin/lsof'], '/usr/sbin/lsof');
+/**
  * bash 可执行文件：仅用于执行 Homebrew 官方安装脚本（install.sh 需要 bash 解释器）。
  * 以绝对路径形式登记在 exec.js 的 ABSOLUTE_ALLOWED 中，不允许其他用途。
  */
@@ -408,6 +433,12 @@ export const NPM_BIN = firstExisting(
   [`${BREW_PREFIX}/bin/npm`, '/opt/homebrew/bin/npm', '/usr/local/bin/npm'],
   firstOnPath('npm') || `${BREW_PREFIX}/bin/npm`
 );
+/**
+ * 系统 tar（bsdtar）。唯一用途：解压 LibreTV 官方 standalone 包 —— 参数由模块侧固定构造，
+ * 不存在来自 HTTP 入参的路径拼接。
+ */
+export const TAR_BIN = firstExisting(['/usr/bin/tar'], '/usr/bin/tar');
+
 /** pnpm（可能来自 brew install pnpm 或独立安装脚本） */
 export const PNPM_BIN = firstExisting(
   [`${BREW_PREFIX}/bin/pnpm`, '/opt/homebrew/bin/pnpm', '/usr/local/bin/pnpm',

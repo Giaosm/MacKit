@@ -362,6 +362,20 @@ const QUERY_ROUTES = Object.freeze([
     path: '/api/ysp/logs', module: 'ysp', query: 'logs',
     params: (url) => ({ lines: Number(url.searchParams.get('lines')) || 120 }),
   },
+  // LibreTV（本地影视聚合站：安装 / 更新走任务流，状态、上游版本与日志走只读查询）
+  {
+    path: '/api/libretv/status', module: 'libretv', query: 'status',
+    params: (url) => ({ force: url.searchParams.get('force') === '1' }),
+  },
+  {
+    // 会真的去 GitHub 查一次 release（有可见的联网副作用）→ 必须由界面发起
+    path: '/api/libretv/latest', module: 'libretv', query: 'latest',
+    guard: '查询 LibreTV 最新版本',
+  },
+  {
+    path: '/api/libretv/logs', module: 'libretv', query: 'logs',
+    params: (url) => ({ lines: Number(url.searchParams.get('lines')) || 120 }),
+  },
   // 备份中心
   { path: '/api/webdav/backups', module: 'backup', query: 'webdavList' },
 ]);
