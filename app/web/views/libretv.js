@@ -50,7 +50,7 @@ export default {
      * 本地状态：最近一次 status / 日志文本 / 上游版本 / 是否正在提交任务。
      * dirty = 用户正在编辑设置区（5s 轮询不得把输入框里的字清掉）。
      */
-    const st = { data: null, logText: '', latest: null, busy: false, checking: false, dirty: { pw: false, port: false, lan: false } };
+    const st = { data: null, logText: '', latest: null, busy: false, checking: false, dirty: { port: false, lan: false } };
 
     const head = el('div', { class: 'view-head' });
     const body = el('div');
@@ -101,13 +101,93 @@ export default {
     ]);
     const divider = () => el('div', { style: 'height:1px; background:var(--border); margin:var(--space-3) 0' });
 
-    /** 访问密码（明文 + 复制） */
+    /**
+     * 访问密码：查看态（明文 + 复制 + 更改）/ 编辑态（输入框 + 复制 + 确定）。
+     * 编辑态下 5s 轮询只改被隐藏的 pwText，绝不碰 pwEdit.value —— 否则正敲的字会被冲掉。
+     */
+    let pwEditing = false;
     const pwText = el('code', { class: 'mono', text: '—' });
-    const pwReq = el('span', { class: 'muted', style: 'font-size:12px', text: '—' });
+    const pwEdit = el('input', {
+      type: 'text', class: 'mono', style: 'flex:1; min-width:160px; display:none',
+      on: {
+        keydown: (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); commitPassword(); }
+          else if (e.key === 'Escape') { e.preventDefault(); exitPwEdit(); }
+        },
+      },
+    });
     const btnCopyPw = el('button', {
       class: 'btn btn--sm', type: 'button', text: '复制',
       on: { click: () => ui.copy(st.data && st.data.password, '已复制访问密码') },
     });
+    const btnEditPw = el('button', {
+      class: 'btn btn--sm', type: 'button', text: '更改',
+      on: { click: () => (pwEditing ? commitPassword() : enterPwEdit()) },
+    });
+    const btnRandomPw = el('button', {
+      class: 'btn btn--sm nowrap', type: 'button', text: '随机', style: 'display:none',
+      title: '填入一个 14 位随机密码，点「确定」后生效',
+      on: { click: () => { pwEdit.value = genPw(); pwEdit.focus(); } },
+    });
+
+    /** 14 位随机密码：字符集与后端 genPassword 一致（去掉 0/O/1/l/I 等易混字符） */
+    function genPw() {
+      const alphabet = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      const bytes = new Uint8Array(14);
+      crypto.getRandomValues(bytes);
+      let out = '';
+      for (let i = 0; i < 14; i += 1) out += alphabet[bytes[i] % alphabet.length];
+      return out;
+    }
+
+    function applyPwMode() {
+      pwText.style.display = pwEditing ? 'none' : '';
+      pwEdit.style.display = pwEditing ? '' : 'none';
+      btnRandomPw.style.display = pwEditing ? '' : 'none';
+      btnEditPw.textContent = pwEditing ? '确定' : '更改';
+    }
+
+    /** 进入编辑：预填当前密码，全选，直接敲就是覆盖。没有密码时不允许进入（按钮本身已禁用） */
+    function enterPwEdit() {
+      if (pwEditing || !st.data || !st.data.password) return;
+      pwEditing = true;
+      pwEdit.value = st.data.password;
+      applyPwMode();
+      pwEdit.focus();
+      pwEdit.select();
+    }
+
+    function exitPwEdit() {
+      pwEditing = false;
+      pwEdit.value = '';
+      applyPwMode();
+      if (st.data) paint(st.data);
+    }
+
+    /**
+     * 确定：校验 6 位 → 写入配置 → 运行中且是本应用拉起的实例就顺手重启。
+     * 只写 state.json 不重启等于没改（进程还拿旧密码，复制新密码去登录必然失败），所以一并重启。
+     */
+    async function commitPassword() {
+      if (st.busy || !pwEditing) return;
+      const next = pwEdit.value.trim();
+      if (next.length < 6) { ui.toast('warn', '访问密码至少 6 位'); pwEdit.focus(); return; }
+      const s = st.data || {};
+      if (next === (s.password || '')) { exitPwEdit(); ui.toast('warn', '密码未变化'); return; }
+
+      // 失败时保持编辑态：用户填的值要留着让他改
+      if (!(await submit('configure', { password: next }))) return;
+      if (s.running && s.managed) {
+        const restarted = await submit('restart', {});
+        exitPwEdit();
+        await refresh(false, true);
+        if (restarted) ui.toast('ok', '密码已更新，服务已重启生效');
+        return;
+      }
+      exitPwEdit();
+      await refresh(false, true);
+      ui.toast('ok', s.running ? '密码已保存；当前实例不是 MacKit 启动的，需手动重启才生效' : '密码已更新，下次启动生效');
+    }
     /** 访问地址（复制 / 打开） */
     const urlText = el('code', { class: 'mono', text: '—' });
     const btnCopyUrl = el('button', {
@@ -118,6 +198,13 @@ export default {
       class: 'btn btn--sm btn--primary', type: 'button', text: '在浏览器打开',
       on: { click: () => openSite() },
     });
+    /** 局域网地址：独立一行（只在开启局域网后出现），可选中 / 可复制，不靠悬停提示 */
+    const lanUrlText = el('code', { class: 'mono', text: '—' });
+    const btnCopyLan = el('button', {
+      class: 'btn btn--sm', type: 'button', text: '复制',
+      on: { click: () => ui.copy(st.data && st.data.lanUrl, '已复制局域网地址') },
+    });
+    const lanRow = el('div', { hidden: true }, [lineRow('局域网', [lanUrlText, btnCopyLan])]);
 
     /** 路径信息：12px 灰字单行一条，放在卡片底部，不占主视觉 */
     const dirText = el('span', { class: 'mono', text: '—' });
@@ -145,9 +232,10 @@ export default {
       ]),
       statGrid,
       divider(),
-      lineRow('访问密码', [pwText, btnCopyPw], pwReq),
+      lineRow('访问密码', [pwText, pwEdit, btnRandomPw, btnCopyPw, btnEditPw]),
       el('div', { style: 'height:var(--space-2)' }),
       lineRow('访问地址', [urlText, btnCopyUrl, btnOpen]),
+      lanRow,
       divider(),
       el('div', { class: 'detail-lines' }, [
         detailLine('程序目录', dirText),
@@ -163,19 +251,7 @@ export default {
       el('div', { class: 'muted', style: 'margin-top:var(--space-3); font-size:12px', text: '独立于 MacKit 运行：关闭 / 重启界面的不会中断正在播放的视频。卸载只删程序目录，浏览器里的观看记录不受影响。' }),
     ]);
 
-    // ======================= ② 访问设置卡 =======================
-    const pwInput = el('input', {
-      type: 'text', placeholder: '留空则不修改；至少 6 位', style: 'flex:1; min-width:160px',
-      on: {
-        input: () => { st.dirty.pw = true; },
-        keydown: (e) => { if (e.key === 'Enter') saveConfig(); },
-      },
-    });
-    const btnRandomPw = el('button', {
-      class: 'btn btn--sm nowrap', type: 'button', text: '随机重置',
-      title: '生成一个 14 位随机密码并清空输入框',
-      on: { click: () => resetPassword() },
-    });
+    // ======================= ② 端口与网络卡 =======================
     const portInput = el('input', {
       type: 'number', min: '1024', max: '65535', step: '1', style: 'width:120px',
       on: {
@@ -190,35 +266,16 @@ export default {
     const lanHint = el('div', { class: 'warn-box', style: 'margin-top:var(--space-3)', hidden: true, text: '开启后 LibreTV 会监听 0.0.0.0：同网段（同一 Wi-Fi / 交换机）的任何设备都能打开它，只靠访问密码把门。在公共网络里不要开。' });
     const btnSave = el('button', { class: 'btn btn--primary', type: 'button', text: '保存设置', on: { click: () => saveConfig() } });
 
-    /** 表单项：标签在上、控件在下（比「标签左 + 控件右」省掉一整行宽度） */
-    const mkField = (label, body, hint) => el('div', { class: 'field', style: 'margin:0' }, [
-      el('span', { class: 'muted', style: 'font-size:12px', text: label }),
-      body,
-      hint ? el('span', { class: 'muted', style: 'font-size:11px', text: hint }) : null,
-    ]);
-
     const configCard = el('div', { class: 'card section' }, [
-      el('div', { class: 'card__head' }, [
-        el('div', { class: 'card__title', text: '② 访问设置' }),
-        el('div', { class: 'muted', style: 'font-size:12px', text: '写入 ~/.mackit/libretv/state.json' }),
+      el('div', { class: 'card__head' }, [el('div', { class: 'card__title', text: '② 端口与网络' })]),
+      lineRow('端口', [
+        portInput,
+        el('span', { class: 'muted', style: 'font-size:12px', text: '1024–65535；被占用时启动会自动顺延' }),
+        el('span', { class: 'grow' }),
+        el('label', { class: 'check' }, [lanCheck, el('span', { text: '允许局域网访问' })]),
+        btnSave,
       ]),
-      el('div', {
-        style: 'display:grid; grid-template-columns:minmax(0,1.6fr) minmax(0,1fr); gap:var(--space-4) var(--space-5); align-items:start',
-      }, [
-        mkField('访问密码', el('div', { class: 'row', style: 'gap:var(--space-2); flex-wrap:nowrap' }, [pwInput, btnRandomPw])),
-        mkField('端口', el('div', { class: 'row', style: 'gap:var(--space-2)' }, [portInput]),
-          '1024–65535；被占用时启动会自动顺延'),
-        el('div', { style: 'grid-column:1 / -1' }, [
-          el('div', { class: 'row' }, [
-            el('label', { class: 'check' }, [lanCheck, el('span', { text: '允许局域网访问' })]),
-            el('span', { class: 'muted', style: 'font-size:12px', text: '默认关闭，只监听 127.0.0.1' }),
-            el('span', { class: 'grow' }),
-            el('span', { class: 'muted', style: 'font-size:12px', text: '运行中修改后需点「重启」生效' }),
-          ]),
-          lanHint,
-        ]),
-      ]),
-      el('div', { class: 'row', style: 'margin-top:var(--space-4)' }, [btnSave]),
+      lanHint,
     ]);
 
     // ======================= ③ 日志卡 =======================
@@ -285,17 +342,23 @@ export default {
       val.pid.textContent = s.pid ? String(s.pid) : (s.foreign ? '未知（非本应用拉起）' : '—');
       val.uptime.textContent = s.pid && s.startedAt ? fmtDuration((Date.now() - s.startedAt) / 1000) : '—';
 
-      if (s.restartPending) pwReq.textContent = '密码改动待重启生效';
-      else if (s.passwordRequired === null) pwReq.textContent = '—';
-      else if (s.passwordRequired) pwReq.textContent = s.serverVersion ? `服务端要求密码（v${s.serverVersion}）` : '服务端要求密码';
-      else pwReq.textContent = '服务端未启用密码';
-
       pwText.textContent = s.password || '—';
-      btnCopyPw.disabled = !s.password;
+      // 编辑态下「复制」仍取旧密码，没意义 → 禁用；「更改」此时是「确定」，保持可点
+      btnCopyPw.disabled = !s.password || pwEditing;
+      btnEditPw.disabled = st.busy || !s.password;
 
       urlText.textContent = s.lan ? `${s.url}（本机）` : s.url;
-      urlText.title = s.lanUrl ? `局域网：${s.lanUrl}` : '';
       btnOpen.disabled = !s.running;
+
+      // 局域网地址独立一行。取不到真实网卡时后端回落 127.0.0.1，
+      // 那种地址复制到手机 / 电视上必然打不开 —— 如实说明，并禁用复制。
+      const lanHost = (() => {
+        try { return s.lanUrl ? new URL(s.lanUrl).hostname : ''; } catch { return ''; }
+      })();
+      const lanReady = !!(s.lan && lanHost && lanHost !== '127.0.0.1' && lanHost !== 'localhost');
+      lanRow.hidden = !s.lan;
+      lanUrlText.textContent = lanReady ? s.lanUrl : '未检测到局域网 IP（Wi-Fi / 网线没连上？）';
+      btnCopyLan.disabled = !lanReady;
 
       dirText.textContent = s.dir || '未安装（点「安装」下载官方包）';
       logText.textContent = s.logFile;
@@ -319,13 +382,12 @@ export default {
       btnCheck.textContent = st.checking ? '检查中…' : '检查更新';
 
       // 设置区：只在用户没动过的字段上回填，避免 5s 轮询把正在敲的字清掉 / 把勾选弹回去
-      if (!st.dirty.pw) pwInput.value = '';
-      pwInput.placeholder = s.password ? '留空则不修改；至少 6 位' : '留空则自动生成随机密码';
       if (!st.dirty.port) portInput.value = String(s.port);
       if (!st.dirty.lan) lanCheck.checked = !!s.lan;
       paintLanHint();
 
-      // 提示条：优先级「非本应用实例」>「未安装 node」>「配置待重启」>「局域网已开」
+      // 提示条：优先级「非本应用实例」>「未安装 node」>「配置待重启」
+      // （局域网地址已单独成行，不再在这里重复一遍）
       let text = '';
       if (s.foreign) {
         text = `端口 ${s.livePort || s.port} 上有服务在响应，但它不是 MacKit 启动的（没有记录的 pid）—— 本页只负责展示，不会去停它。`;
@@ -333,8 +395,6 @@ export default {
         text = `未找到 node（期望路径 ${s.node.bin}）：LibreTV 是 Node 程序，装一个 node 后才能启动。`;
       } else if (s.restartPending) {
         text = `设置已保存但还没生效：当前实例仍运行在端口 ${s.livePort}、仍用旧密码。点「重启」后新端口 / 新密码才生效。`;
-      } else if (s.running && s.lan) {
-        text = `局域网访问已开启：同网段设备可用 ${s.lanUrl || `http://<本机IP>:${s.port}/`} 打开（只靠访问密码保护）。`;
       }
       note.hidden = !text;
       note.textContent = text;
@@ -416,11 +476,6 @@ export default {
     async function saveConfig() {
       if (st.busy) return;
       const params = {};
-      const pw = pwInput.value.trim();
-      if (pw) {
-        if (pw.length < 6) { ui.toast('warn', '访问密码至少 6 位'); return; }
-        params.password = pw;
-      }
       const portStr = portInput.value.trim();
       if (portStr && portStr !== String(st.data ? st.data.port : '')) {
         if (!ui.portOk(portStr) || Number(portStr) < 1024) { ui.toast('warn', '端口需为 1024–65535 的整数'); return; }
@@ -442,20 +497,6 @@ export default {
         if (!go) return;
       }
       await submit('configure', params);
-    }
-
-    async function resetPassword() {
-      if (st.busy) return;
-      const ok = await ui.confirmDialog({
-        title: '生成新的访问密码？',
-        body: el('div', {}, [
-          el('p', { text: '会立刻换成一个新的 14 位随机密码，已登录的浏览器需要重新输入。' }),
-          el('p', { class: 'muted', text: '服务正在运行时，改动要重启后才生效。' }),
-        ]),
-        confirmLabel: '重置',
-      });
-      if (!ok) return;
-      await submit('configure', { password: '' });
     }
 
     // ======================= 动作 =======================
@@ -482,16 +523,22 @@ export default {
       await submit(action, {});
     }
 
-    /** 提交任务并维护本地忙碌态（任务结束由 'done' 订阅刷新） */
+    /** 提交任务并维护本地忙碌态（任务结束由 'done' 订阅刷新）；返回是否成功，供多步流程判断 */
     async function submit(action, params) {
       st.busy = true;
       if (st.data) paint(st.data);
       try {
         const t = await ctx.runTask('libretv', action, params, { confirm: action === 'uninstall' });
         // 成功才清掉「正在编辑」标记：失败时用户填的值要留着让他改
-        if (t && t.status === 'ok') { st.dirty.pw = false; st.dirty.port = false; st.dirty.lan = false; }
-      } catch { /* runTask 内部已 toast */ }
-      finally {
+        if (t && t.status === 'ok') {
+          st.dirty.port = false; st.dirty.lan = false;
+          return true;
+        }
+        return false;
+      } catch {
+        // runTask 内部已 toast
+        return false;
+      } finally {
         st.busy = false;
         if (st.data) paint(st.data);
       }
