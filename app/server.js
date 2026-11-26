@@ -44,8 +44,7 @@ function log(...args) { console.log('[MacKit]', ...args); } // 被启动器重�
 // ------------------------------ 功能模块注册表（动态接入） ------------------------------
 /**
  * 要加载哪些模块、各自对应哪个文件 —— **由模块清单派生**（web/modules.js 是唯一事实源）。
- * 此前这里是手写的一份、前端 NAV 又一份、store 的 CHANNEL_KEYS 再一份：三处漏一处就出问题
- * （要么模块不加载、要么界面有入口而服务端不认、要么配置键收不到值）。
+ * 此前这里是手写的一份、前端 NAV 又一份：漏一处就出现「界面有入口而服务端不认」。
  */
 const MODULE_FILES = Object.freeze(Object.fromEntries(BACKEND_MODULES.map((m) => [m.id, m.backend])));
 const registry = new Map();
@@ -425,17 +424,12 @@ async function handleApi(req, res, url) {
         mirror: typeof body.mirror === 'string' ? body.mirror : undefined,
       });
     }
-    // 每模块网络通道档位：把 body 里出现的 <module>Channel 透传（白名单与非法值处理都在 store 侧），
-    // 这样以后新增一个有通道档位的模块，不必回来改这里。
-    const channelPatch = {};
-    for (const key of store.CHANNEL_KEYS) {
-      if (body[key] !== undefined) channelPatch[key] = body[key];
-    }
+    // 全局网络通道（取值校验在 store 侧；非法值忽略并保持原值）
     if (body.autoFallback !== undefined || body.autoCleanup !== undefined
       || body.lastCheckedAt !== undefined || body.brewAutoRefreshMeta !== undefined
-      || Object.keys(channelPatch).length > 0) {
+      || body.channel !== undefined) {
       store.writeMackit({
-        ...channelPatch,
+        channel: body.channel,
         autoFallback: body.autoFallback, autoCleanup: body.autoCleanup,
         lastCheckedAt: body.lastCheckedAt, brewAutoRefreshMeta: body.brewAutoRefreshMeta,
       });

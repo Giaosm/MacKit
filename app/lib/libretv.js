@@ -328,7 +328,7 @@ async function waitReady(ctx, pid, port) {
  */
 const netPolicy = (p) => {
   const explicit = { direct: 'direct_first', proxy: 'proxy_first' }[String((p && p.channel) || '')];
-  return explicit || resolvePolicy('libretv', 'proxy_first');
+  return explicit || resolvePolicy('proxy_first');
 };
 
 async function runNet(ctx, desc, args, extra = {}) {

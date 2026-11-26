@@ -172,6 +172,11 @@ p { margin: 0 0 var(--space-2); }
 .topbar__sub { color: var(--fg-muted); font-size: 12px; letter-spacing: .2px; }
 .topbar__right { display: flex; align-items: center; gap: var(--space-3); }
 
+/* 顶栏的全局通道下拉（2026-11-26）：全局一个，所有模块共用，所以落在顶栏而不是各模块页头。
+   全局 select 是 width:100%，这里必须收窄，否则会把顶栏撑开。 */
+.net-channel-wrap { display: inline-flex; align-items: center; gap: var(--space-2); font-size: 12px; white-space: nowrap; }
+.net-channel-wrap > .net-channel { width: auto; padding: 4px 8px; font-size: 12px; border-radius: 8px; }
+
 .service-status { display: inline-flex; align-items: center; gap: var(--space-2); font-size: 12px; }
 .service-status__dot {
   width: 8px; height: 8px; border-radius: 50%;

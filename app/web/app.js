@@ -40,9 +40,8 @@ const ICON = {
 /**
  * 侧边栏导航 / 视图注册表 —— **都由模块清单派生**（`web/modules.js`，前后端共用）。
  *
- * 为什么不再手写两份：此前「加一个模块」要在 `NAV`、`VIEW_MODULES`、后端 `MODULE_FILES`、
- * `store.CHANNEL_KEYS` 四处各改一次，漏一处就出现「有入口但服务端不认」或「设置了不生效」。
- * 现在清单里加一条即可（视图文件仍要自己写）。
+ * 为什么不再手写两份：此前「加一个模块」要在 `NAV`、`VIEW_MODULES`、后端 `MODULE_FILES`
+ * 三处各改一次，漏一处就出现「有入口但服务端不认」。现在清单里加一条即可（视图文件仍要自己写）。
  */
 /** 前端侧的路由 id：缺省 = 后端 id，只有备份中心不同（见清单注释）。 */
 const viewIdOf = (m) => m.viewId || m.id;
@@ -57,6 +56,7 @@ const VIEW_MODULES = Object.fromEntries(
 const $ = (id) => document.getElementById(id);
 const dom = {
   nav: $('nav'), main: $('main'),
+  channelSel: $('globalChannel'),
   serviceStatus: $('serviceStatus'), serviceText: $('serviceText'),
   btnShutdown: $('btnShutdown'),
   historyList: $('historyList'), btnHistoryRefresh: $('btnHistoryRefresh'),
@@ -285,9 +285,10 @@ const detailLines = (items) => el('div', { class: 'detail-lines' }, (items || []
   el('span', { class: 'mono' }, [asText(v)]),
 ])));
 
-// ============================== 模块网络通道 ==============================
+// ============================== 全局网络通道 ==============================
 /**
- * 模块顶部的「网络通道」小下拉，**选中即保存生效**（唯一事实源是后端 lib/netpolicy.js）。
+ * 顶部栏的「通道」下拉：**全局一个**，所有模块共用（2026-11-26 由「每模块一个」收敛而来 ——
+ * 同一个开关在多个页面各调一遍没有意义，还容易漏配成死设置）。选中即保存生效。
  *
  * 档位语义（浏览器端无法 import node 模块，**下拉文案只在这一处**；语义的完整说明在后端
  * lib/netpolicy.js 的文件头。若那边档位取值有变，这里要跟着改）：
@@ -295,8 +296,6 @@ const detailLines = (items) => el('div', { class: 'detail-lines' }, (items || []
  *   proxy_first  → 优先代理（走不通自动降级直连）
  *   direct_first → 优先直连（走不通自动降级代理）
  *
- * ★ 只挂在**真联网**的模块上（brew / rime / selfupdate）；应用隔离、系统初始化不联网，
- *   不给开关 —— 避免又造出一个「设置了却不生效」的死设置。
  * ★ Homebrew 的**逐项升级 / 安装**仍严格按用户在每一项上点的「代理 / 直连」按钮执行，不受本开关影响。
  */
 const CHANNEL_OPTIONS = Object.freeze([
@@ -304,27 +303,16 @@ const CHANNEL_OPTIONS = Object.freeze([
   ['proxy_first', '优先代理'],
   ['direct_first', '优先直连'],
 ]);
+const CHANNEL_HINT = '所有模块联网时优先走哪条通道（选中即保存）；首选走不通会自动换另一条。';
 
-/**
- * @param {'brew'|'rime'|'selfupdate'} moduleId 模块 id（存储键 = `<id>Channel`）
- * @param {string} [label] 前缀文案（默认「通道」；总览页用「自更新通道」避免与体检探测混淆）
- * @param {string} [hint] 悬浮说明
- * @returns {HTMLElement}
- */
-function netChannel(moduleId, label = '通道', hint = '') {
-  const key = `${moduleId}Channel`;
-  const sel = el('select', {
-    class: 'net-channel',
-    title: hint || '该模块联网时优先走哪条通道；走不通会自动换另一条',
-  }, CHANNEL_OPTIONS.map(([v, t]) => el('option', { value: v, text: t })));
-  const wrap = el('label', {
-    class: 'net-channel-wrap',
-    style: 'display:inline-flex; align-items:center; gap:6px; font-size:12px; white-space:nowrap',
-  }, [el('span', { class: 'muted', text: label }), sel]);
+function initGlobalChannel() {
+  const sel = dom.channelSel;
+  if (!sel) return;
+  sel.title = CHANNEL_HINT;
+  for (const [v, t] of CHANNEL_OPTIONS) sel.append(el('option', { value: v, text: t }));
 
-  // 自己读初值（GET /api/config 很轻），各视图不必为它额外加载一次配置
   api('GET', '/api/config').then((cfg) => {
-    const v = (cfg && cfg.mackit && cfg.mackit[key]) || 'auto';
+    const v = (cfg && cfg.mackit && cfg.mackit.channel) || 'auto';
     sel.value = CHANNEL_OPTIONS.some(([x]) => x === v) ? v : 'auto';
   }).catch(() => { /* 读不到就保持 auto，不打断页面 */ });
 
@@ -333,17 +321,12 @@ function netChannel(moduleId, label = '通道', hint = '') {
     const text = (CHANNEL_OPTIONS.find(([x]) => x === v) || [])[1] || v;
     sel.disabled = true;
     try {
-      await api('PUT', '/api/config', { [key]: v });
-      toast('ok', `网络通道已设为「${text}」`);
-      // ★ 广播给视图（2026-09-25 新增）：有些模块的界面要按当前档位决定显示什么
-      //   （如音乐页的「代理设置」子区只在优先代理时出现），而它们读的是自己缓存的配置。
-      //   不发这个事件的话，用户改了通道必须切走视图再切回才看得到变化。
-      emit('channel', { moduleId, value: v, label: text });
+      await api('PUT', '/api/config', { channel: v });
+      toast('ok', `网络通道已设为「${text}」（所有模块生效）`);
     } catch (err) {
       toast('warn', `通道保存失败：${(err && err.message) || err}`);
     } finally { sel.disabled = false; }
   });
-  return wrap;
 }
 
 function card(title, content, { light = null, extra = null } = {}) {
@@ -912,7 +895,7 @@ function makeCtx(subs) {
     },
     refreshEnv: refreshEnv,
     fmtTime, fmtDateTime, fmtRel, fmtSize,
-    ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, kv, card, stat, statGrid, detailLines, copy: copyText, portOk, netChannel },
+    ui: { toast, modal, confirmDialog, diffView, dataTable, statusLight, badge, empty: emptyState, kv, card, stat, statGrid, detailLines, copy: copyText, portOk },
   };
 }
 async function refreshEnv(force) {
@@ -941,6 +924,7 @@ async function recoverTasks() {
 
 function boot() {
   buildNav();
+  initGlobalChannel();
   dom.btnLogToggle.addEventListener('click', () => {
     const collapsed = dom.logDrawer.classList.toggle('logdrawer--collapsed');
     dom.btnLogToggle.setAttribute('aria-expanded', String(!collapsed));

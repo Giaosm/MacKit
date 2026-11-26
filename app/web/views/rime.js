@@ -14,7 +14,9 @@
  *   - GET /api/rime/upstream    → { localVersion, localSyncedAt, upstreamLatest:{date,title}, upToDate, remoteError, checkedAt }
  *   - GET /api/rime/grammar-upstream → 万象模型是否有新版 { installed, localSize, localMtime,
  *                                 remoteSize, remoteUpdatedAt, upToDate, remoteError, checkedAt }
- *     （判等看文件大小；进页面自动查一次，与「检查词库更新」同款交互）
+ *     （判等看文件大小）
+ *   - 两者同一套交互（2026-11-26 与 LibreTV 对齐）：进页面即查、结果缓存 5 分钟（切页不重复联网）、
+ *     结论行常驻展示；「更新」按钮只在上游明确有新版本时可点，未安装时是「安装」。
  *   - 色值一律用服务端归一化的 {hex, alpha}；前端**只做 rgba() 合成**，不重复解析 AARRGGBB。
  *   - hasColors=false（native）→ colors=null → 中性色兜底，不报错、不丢卡。
  *   - 输入方案无切换入口（2026-09-16 删除，F4 选单由 Rime 记住选择）；当前方案在状态卡只读展示。联网固定代理优先。
@@ -24,6 +26,21 @@
 // 自动档下的策略是「代理优先」（Rime 的联网目标基本都在 GitHub）。失败会自动降级到另一条通道。
 const SOURCE_LABEL = { squirrel: 'squirrel.yaml', build: 'build/squirrel.yaml', degraded: '降级（仅名称）' };
 
+/**
+ * 上游结论的 5 分钟缓存（跨 mount 复用）。
+ * 词库 / 模型的「有没有新版」进页面就要看得到，但每次切页都联网没必要；
+ * 点「检查…更新」或任务结束后会强制重查并覆盖缓存。与 LibreTV 模块同一套口径。
+ */
+let vocabUpstreamCache = { at: 0, value: null };
+let grammarUpstreamCache = { at: 0, value: null };
+const UPSTREAM_TTL_MS = 5 * 60_000;
+const cacheFresh = (c) => !!(c.value && Date.now() - c.at < UPSTREAM_TTL_MS);
+
+/** 日期 → `2026/11/25`（词库与模型两处结论行共用，原先各写了一份）。 */
+const fmtDay = (ms) => (ms
+  ? new Date(ms).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' })
+  : '未知');
+
 export default {
   id: 'rime',
   title: 'Rime 输入法',
@@ -32,10 +49,15 @@ export default {
     const { el, ui, api } = ctx;
     const S = {
       status: null, skins: null, appearance: null, skin: null, layoutIdx: null, grammarScheme: 'rime_ice',
-      upstream: null, checkingUpstream: false,
+      // 上游结论：有 5 分钟内缓存就直接用，省掉切页时的一次联网
+      upstream: cacheFresh(vocabUpstreamCache) ? vocabUpstreamCache.value : null,
+      checkingUpstream: false,
       // 万象模型版本检测（2026-11-23 新增）：与词库检测同款，但判等看的是文件大小
-      grammarUpstream: null, checkingGrammar: false,
+      grammarUpstream: cacheFresh(grammarUpstreamCache) ? grammarUpstreamCache.value : null,
+      checkingGrammar: false,
     };
+    /** 上游是否明确「有新版」：只有这种情况才允许点更新（与 LibreTV 一致）。 */
+    const hasNew = (u) => !!(u && !u.remoteError && u.upToDate === false);
     const head = el('div', { class: 'view-head' });
     const body = el('div');
     root.append(head, body);
@@ -53,9 +75,10 @@ export default {
         if (S.skin == null && status.currentSkin) S.skin = status.currentSkin;
         if (S.layoutIdx == null) S.layoutIdx = layoutIndexOf(appearance.layouts, status.currentLayout, status.currentOrientation);
         render();
-        // 进页面就静默查一次模型版本（用户诉求：「有新版本我都不知道」）。
-        // 不 await、不阻塞渲染；已在检查中或已有结论时不重复发请求。
-        if (!S.grammarUpstream && !S.checkingGrammar) checkGrammarUpstream();
+        // 进页面就把「词库 / 模型有没有新版」查出来（用户诉求：「有新版本我都不知道」）。
+        // 不 await、不阻塞渲染；5 分钟内有结论就不重复发请求。
+        if (!S.upstream && !S.checkingUpstream) checkUpstream(false);
+        if (!S.grammarUpstream && !S.checkingGrammar) checkGrammarUpstream(false);
       } catch (err) {
         body.innerHTML = '';
         body.append(el('div', { class: 'err-box', text: `读取失败：${err.message || err}` }));
@@ -69,9 +92,7 @@ export default {
       head.append(
         el('div', {}, [el('h1', { text: 'Rime 输入法' }), el('div', { class: 'muted', text: '词库 · 方案 · 语法模型 · 外观' })]),
         el('div', { class: 'row' }, [
-          // 模块级通道（2026-09-22 恢复选择权）：Rime 的联网目标（plum / 语法模型 / 皮肤）基本都在 GitHub，
-          // 所以自动档下的策略是「代理优先」。此前这里写死 proxy_first、前端不给选择。
-          ui.netChannel('rime', '通道', 'Rime 联网动作（拉取 plum / 语法模型 / 皮肤）的通道；目标基本在 GitHub，自动档 = 代理优先'),
+          // 通道已统一到顶栏（全局一个）；本模块的目标基本在 GitHub，auto 档下自然是代理优先。
           el('button', { class: 'btn', type: 'button', text: '⟳ 重新检测', on: { click: load } }),
         ]),
       );
@@ -110,32 +131,55 @@ export default {
 
     function vocabCard() {
       const installed = !!(S.status && S.status.mainSchemaExists);
+      const upd = hasNew(S.upstream);
+      const u = S.upstream;
+      const btnTitle = !installed
+        ? '按默认配置完整安装雾凇拼音（词库 + 方案 + 皮肤）'
+        : upd
+          ? `上游有新词库${u.upstreamLatest ? `（${fmtDay(Date.parse(u.upstreamLatest.date))}）` : ''}，点击更新并重新部署`
+          : u && u.remoteError
+            ? '上游检查失败，无法判断是否有新版：可点「检查词库更新」重试'
+            : u ? '词库已是最新，无需更新' : '正在检查上游词库…';
+      const installBtn = el('button', {
+        class: 'btn' + ((!installed || upd) ? ' btn--primary' : ''),
+        type: 'button',
+        text: !installed ? '⬇ 安装词库' : (upd ? '⬆ 更新词库' : '更新词库'),
+        disabled: installed && !upd,   // 装好且没新版就不让点（与 LibreTV 一致）
+        title: btnTitle,
+        on: { click: () => { ctx.runTask('rime', 'install_or_update', {}).catch(() => {}); } },
+      });
       const checkBtn = el('button', {
         class: 'btn', type: 'button',
         text: S.checkingUpstream ? '⏳ 检查中…' : '⟳ 检查词库更新',
         disabled: S.checkingUpstream,
-        on: { click: checkUpstream },
+        on: { click: () => checkUpstream(true) },
       });
       return ui.card('📚 词库', el('div', {}, [
         el('div', { class: 'row' }, [
-          el('button', { class: 'btn btn--primary', type: 'button', text: '安装 / 更新词库', on: { click: () => { ctx.runTask('rime', 'install_or_update', {}).catch(() => {}); } } }),
-          checkBtn,
-          el('span', { class: 'muted', text: installed
-            ? '已检测到本地安装：点击将更新词库并重新部署（官方同一条命令）。'
-            : '未检测到本地安装：点击将按默认配置完整安装雾凇拼音。' }),
-        ]),
-        S.upstream ? upstreamLine() : null,
+          installBtn, checkBtn,
+          !installed ? el('span', { class: 'muted', text: '未检测到本地安装：将按默认配置完整安装雾凇拼音。' }) : null,
+        ].filter(Boolean)),
+        upstreamLine(),
       ]));
     }
 
-    /** 检查上游词库是否有新版本（对比本地与 GitHub main 的 dict version）。 */
-    async function checkUpstream() {
+    /**
+     * 检查上游词库是否有新版本（对比本地与 GitHub main 的 dict version）。
+     * @param {boolean} [showToast] 手动点「检查词库更新」时为 true；进页面自动查时静默
+     */
+    async function checkUpstream(showToast) {
       S.checkingUpstream = true;
       render();
       try {
         S.upstream = await api('GET', '/api/rime/upstream');
+        vocabUpstreamCache = { at: Date.now(), value: S.upstream };
+        if (showToast) {
+          if (S.upstream.remoteError) ui.toast('warn', `检查词库更新失败：${S.upstream.remoteError}`);
+          else if (S.upstream.upToDate) ui.toast('ok', '词库已是最新');
+          else ui.toast('warn', '上游词库有新更新，可点「⬆ 更新词库」');
+        }
       } catch (err) {
-        ui.toast('warn', `检查词库更新失败：${err.message || err}`);
+        if (showToast) ui.toast('warn', `检查词库更新失败：${err.message || err}`);
       }
       S.checkingUpstream = false;
       render();
@@ -146,67 +190,86 @@ export default {
      * 判等依据是**文件大小**：.gram 每次重打包大小都会变，大小相同基本就是同一份
      * （详见 lib/rime.js 的 queryGrammarUpstream 注释）。
      */
-    async function checkGrammarUpstream() {
+    async function checkGrammarUpstream(showToast) {
       S.checkingGrammar = true;
       render();
       try {
         S.grammarUpstream = await api('GET', '/api/rime/grammar-upstream');
+        grammarUpstreamCache = { at: Date.now(), value: S.grammarUpstream };
+        if (showToast) {
+          const g = S.grammarUpstream;
+          if (g.remoteError) ui.toast('warn', `检查模型更新失败：${g.remoteError}`);
+          else if (!g.installed) ui.toast('warn', '尚未安装万象模型');
+          else if (g.upToDate) ui.toast('ok', '万象模型已是最新');
+          else ui.toast('warn', '万象模型有新版本，可点「⬆ 更新万象模型」');
+        }
       } catch (err) {
-        ui.toast('warn', `检查模型更新失败：${err.message || err}`);
+        if (showToast) ui.toast('warn', `检查模型更新失败：${err.message || err}`);
       }
       S.checkingGrammar = false;
       render();
     }
 
-    /** 万象模型版本检测结果行。 */
+    /** 万象模型版本检测结果行（null = 还在查）。 */
     function grammarUpstreamLine() {
       const g = S.grammarUpstream;
-      const day = (ms) => (ms ? new Date(ms).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }) : '未知');
+      if (!g) return el('div', { class: 'muted', style: 'margin-top:var(--space-2)', text: '⟳ 正在检查上游模型版本…' });
       if (g.remoteError) {
-        return el('div', { class: 'warn-box section', text: `模型版本检查失败：${g.remoteError}（可稍后重试）` });
+        return el('div', { class: 'warn-box', style: 'margin-top:var(--space-2)', text: `模型版本检查失败：${g.remoteError}（可点「检查模型更新」重试）` });
       }
-      if (!g.installed) return el('div', { class: 'muted section', text: '尚未安装万象模型，点上方「安装万象模型」即可。' });
-      const upDay = g.remoteUpdatedAt ? day(Date.parse(g.remoteUpdatedAt)) : '未知';
+      if (!g.installed) return el('div', { class: 'muted', style: 'margin-top:var(--space-2)', text: '尚未安装万象模型，点上方的「⬇ 安装万象模型」即可。' });
+      const upDay = g.remoteUpdatedAt ? fmtDay(Date.parse(g.remoteUpdatedAt)) : '未知';
       if (g.upToDate === false) {
         return el('div', {
-          class: 'warn-box section',
-          text: `⬆ 万象模型有新版本：上游 ${upDay}（${ctx.fmtSize(g.remoteSize)}），本地 ${day(g.localMtime)}（${ctx.fmtSize(g.localSize)}）—— 点「⟳ 更新万象模型」即可下载覆盖。`,
+          class: 'warn-box', style: 'margin-top:var(--space-2)',
+          text: `⬆ 万象模型有新版本：上游 ${upDay}（${ctx.fmtSize(g.remoteSize)}），本地 ${fmtDay(g.localMtime)}（${ctx.fmtSize(g.localSize)}）—— 点「⬆ 更新万象模型」下载覆盖。`,
         });
       }
       if (g.upToDate === true) {
-        return el('div', { class: 'muted section', text: `万象模型已是最新（${ctx.fmtSize(g.localSize)}，本地 ${day(g.localMtime)} · 上游 ${upDay}）` });
+        return el('div', { class: 'muted', style: 'margin-top:var(--space-2)', text: `✓ 万象模型已是最新（${ctx.fmtSize(g.localSize)}，本地 ${fmtDay(g.localMtime)} · 上游 ${upDay}）` });
       }
-      return el('div', { class: 'muted section', text: `本地 ${day(g.localMtime)}（${ctx.fmtSize(g.localSize)}）· 上游大小未知` });
+      return el('div', { class: 'muted', style: 'margin-top:var(--space-2)', text: `本地 ${fmtDay(g.localMtime)}（${ctx.fmtSize(g.localSize)}）· 上游大小未知` });
     }
 
     /** 上游词库更新检测结果展示行（按词库文件同步时间 vs 上游 cn_dicts 最近提交对比）。 */
     function upstreamLine() {
       const u = S.upstream;
+      if (!u) return el('div', { class: 'muted', style: 'margin-top:var(--space-2)', text: '⟳ 正在检查上游词库…' });
       if (u.remoteError && !u.upstreamLatest) {
-        return el('div', { class: 'warn-box section', text: `上游检查失败：${u.remoteError}（可稍后重试）` });
+        return el('div', { class: 'warn-box', style: 'margin-top:var(--space-2)', text: `上游检查失败：${u.remoteError}（可点「检查词库更新」重试）` });
       }
-      const day = (ms) => (ms ? new Date(ms).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }) : '未知');
-      const upDay = u.upstreamLatest ? day(Date.parse(u.upstreamLatest.date)) : '未知';
+      const upDay = u.upstreamLatest ? fmtDay(Date.parse(u.upstreamLatest.date)) : '未知';
       if (u.upToDate === true) {
-        return el('div', { class: 'muted section', text: `✓ 词库已是最新：本地同步于 ${day(u.localSyncedAt)}，晚于上游最近一次词库更新（${upDay}）。` });
+        return el('div', { class: 'muted', style: 'margin-top:var(--space-2)', text: `✓ 词库已是最新：本地同步于 ${fmtDay(u.localSyncedAt)}，晚于上游最近一次词库更新（${upDay}）。` });
       }
       if (u.upToDate === false) {
-        return el('div', { class: 'warn-box section', text: `⬆ 上游词库有新更新：${upDay}「${u.upstreamLatest.title}」，你的词库同步于 ${day(u.localSyncedAt)}——点「安装 / 更新词库」即可更新。` });
+        return el('div', { class: 'warn-box', style: 'margin-top:var(--space-2)', text: `⬆ 上游词库有新更新：${upDay}「${u.upstreamLatest.title}」，你的词库同步于 ${fmtDay(u.localSyncedAt)}——点「⬆ 更新词库」即可更新。` });
       }
-      return el('div', { class: 'muted section', text: `本地词库同步于 ${day(u.localSyncedAt)} · 上游词库最近更新 ${upDay}` });
+      return el('div', { class: 'muted', style: 'margin-top:var(--space-2)', text: `本地词库同步于 ${fmtDay(u.localSyncedAt)} · 上游词库最近更新 ${upDay}` });
     }
 
     function grammarCard() {
       const models = (S.appearance && S.appearance.grammarModels) || [];
       const applied = (S.appearance && S.appearance.grammarApplied) || [];
       const wanxiang = models.find((m) => m.name === 'wanxiang-lts-zh-hans.gram');
+      const mdlUpd = hasNew(S.grammarUpstream);
+      const g = S.grammarUpstream;
       const modelBtn = el('button', {
-        class: 'btn btn--primary', type: 'button',
-        text: wanxiang ? '⟳ 更新万象模型' : '⬇ 安装万象模型',
+        class: 'btn' + ((!wanxiang || mdlUpd) ? ' btn--primary' : ''),
+        type: 'button',
+        text: !wanxiang ? '⬇ 安装万象模型' : (mdlUpd ? '⬆ 更新万象模型' : '更新万象模型'),
+        disabled: !!wanxiang && !mdlUpd,   // 已装且上游没新版 → 不让点
+        title: !wanxiang
+          ? '下载万象 LTS 模型（约 400MB，代理优先），所有方案共享'
+          : mdlUpd
+            ? `上游有新模型${g && g.remoteUpdatedAt ? `（${fmtDay(Date.parse(g.remoteUpdatedAt))}）` : ''}，点击下载覆盖`
+            : g && g.remoteError
+              ? '模型版本检查失败，无法判断是否有新版：可点「检查模型更新」重试'
+              : g ? '已是最新版本，无需更新' : '正在检查上游模型版本…',
         on: { click: () => { ctx.runTask('rime', 'install_grammar', {}).catch(() => {}); } },
       });
       const modelLine = wanxiang
-        ? el('span', { class: 'muted', text: `已安装 ${wanxiang.name}（${ctx.fmtSize(wanxiang.size)}）——点击将重新下载最新版覆盖（约 400MB，代理优先）。` })
+        ? el('span', { class: 'muted', text: `已安装 ${wanxiang.name}（${ctx.fmtSize(wanxiang.size)}）` })
         : el('span', { class: 'muted', text: '未安装。模型是独立共享文件，下载一次即可供所有方案启用。' });
 
       const sel = el('select', { style: 'max-width:220px', on: { change: (e) => { S.grammarScheme = e.target.value; render(); } } },
@@ -228,12 +291,12 @@ export default {
         class: 'btn', type: 'button',
         text: S.checkingGrammar ? '⏳ 检测中…' : '⟳ 检查模型更新',
         disabled: S.checkingGrammar,
-        on: { click: () => checkGrammarUpstream() },
+        on: { click: () => checkGrammarUpstream(true) },
       });
 
       return ui.card('🧠 语法模型（万象）', el('div', {}, [
         el('div', { class: 'row' }, [modelBtn, checkBtn, modelLine]),
-        S.grammarUpstream ? grammarUpstreamLine() : null,
+        grammarUpstreamLine(),
         el('div', { class: 'row section' }, [
           el('span', { class: 'muted', text: '应用到方案' }), sel, applyBtn, removeBtn,
         ]),
@@ -396,14 +459,12 @@ export default {
     //   （离线）也不会把旧结论留在页面上。
     ctx.on('done', async (t) => {
       if (!t || t.module !== 'rime') return;
-      const justUpdated = t.action === 'install_or_update' && t.status === 'ok';
-      // 模型下载完成后也要作废结论：否则「⬆ 有新版本」会一直挂着，刚下完还提示去更新。
-      // load() 内部会对 grammarUpstream 为空的情况自动复检，这里不需要再手动调。
-      const modelUpdated = t.action === 'install_grammar' && t.status === 'ok';
-      if (justUpdated) S.upstream = null;
-      if (modelUpdated) S.grammarUpstream = null;
+      const vocabChanged = t.action === 'install_or_update' && t.status === 'ok';
+      const modelChanged = t.action === 'install_grammar' && t.status === 'ok';
+      // 结论和缓存一起作废，load() 会自动复检（否则刚更新完还挂着「有新版本」）
+      if (vocabChanged) { S.upstream = null; vocabUpstreamCache = { at: 0, value: null }; }
+      if (modelChanged) { S.grammarUpstream = null; grammarUpstreamCache = { at: 0, value: null }; }
       await load();
-      if (justUpdated) checkUpstream();
     });
 
     load();

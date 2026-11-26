@@ -7,7 +7,7 @@
  * 从远程列出 / 下载 / 删除。`applyPayloadSteps` 是「把信封应用到本机」的唯一实现。
  *
  * 备份内容（全部小体量文本；词库 / 模型等大文件不打包，导入后按需重新下载）：
- *   - mackit  : MacKit 设置（autoFallback / autoCleanup）
+ *   - mackit  : MacKit 设置（channel 全局通道 / autoFallback / autoCleanup）
  *   - brewgo  : ~/.brewgo_config（HTTP / SOCKS5 代理端口、镜像源）
  *   - git     : Git 全局配置（sysinit 白名单 6 键，仅记录非空值）
  *   - github  : 钥匙串 GitHub 凭据（**明文 Token**，用户已确认打入；绝不写日志）
@@ -159,10 +159,9 @@ async function collectData(ctx) {
   // 用户词典要跑 rime_dict_manager（子进程），放在最后收集，失败只降级不中断备份
   const userDicts = await collectUserDicts(ctx);
   return {
-    // 每模块网络通道档位一并备份（2026-09-22）：换电脑/重装后不用重新一个个设。
+    // 全局网络通道档位一并备份（2026-11-26 起就一个键）：换电脑 / 重装后不用重设。
     mackit: {
-      brewChannel: mackit.brewChannel,
-      rimeChannel: mackit.rimeChannel, selfupdateChannel: mackit.selfupdateChannel,
+      channel: mackit.channel,
       autoFallback: mackit.autoFallback, autoCleanup: mackit.autoCleanup,
     },
     // mirrorRaw 一并备份：自定义镜像（枚举外的自建源 / URL）只存在原始行里，

@@ -173,7 +173,7 @@ async function computeRemote() {
   let fetchOk = false;
   let fetchError = null;
   try {
-    await exec.runWithChannel(resolvePolicy('selfupdate', 'proxy_first'), '检查 MacKit 更新', 'git', ['fetch', '--prune', 'origin'], {
+    await exec.runWithChannel(resolvePolicy('proxy_first'), '检查 MacKit 更新', 'git', ['fetch', '--prune', 'origin'], {
       cwd: paths.REPO_DIR, noMirror: true, timeoutMs: CHECK_FETCH_TIMEOUT_MS,
     });
     fetchOk = true;
@@ -274,7 +274,7 @@ function updateStep() {
       };
 
       ctx.log('info', '执行：git fetch --prune origin');
-      await ctx.exec.runWithChannel(resolvePolicy('selfupdate', 'proxy_first'), '拉取远端信息', 'git', ['fetch', '--prune', 'origin'], {
+      await ctx.exec.runWithChannel(resolvePolicy('proxy_first'), '拉取远端信息', 'git', ['fetch', '--prune', 'origin'], {
         cwd: paths.REPO_DIR, noMirror: true, timeoutMs: UPDATE_FETCH_TIMEOUT_MS, onLine,
       });
 
@@ -307,7 +307,7 @@ function updateStep() {
 
       ctx.log('info', '执行：git pull --ff-only');
       try {
-        await ctx.exec.runWithChannel(resolvePolicy('selfupdate', 'proxy_first'), '更新 MacKit', 'git', ['pull', '--ff-only'], {
+        await ctx.exec.runWithChannel(resolvePolicy('proxy_first'), '更新 MacKit', 'git', ['pull', '--ff-only'], {
           cwd: paths.REPO_DIR, noMirror: true, timeoutMs: PULL_TIMEOUT_MS, onLine,
         });
       } catch (err) {

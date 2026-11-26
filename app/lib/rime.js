@@ -411,7 +411,7 @@ function parseDictVersion(text) {
  */
 const netPolicy = (p) => {
   const explicit = { direct: 'direct_first', proxy: 'proxy_first' }[String((p && p.channel) || '')];
-  return explicit || resolvePolicy('rime', 'proxy_first');
+  return explicit || resolvePolicy('proxy_first');
 };
 /** 走网络通道执行（通道由 netPolicy 决定；失败自动降级另一条）。 */
 async function runNet(ctx, desc, bin, args, extra = {}) {

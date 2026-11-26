@@ -15,16 +15,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as paths from './paths.js';
-// 模块清单在 web/ 下（浏览器也要读它，详见该文件头部说明）：这里只取"哪些模块有通道档位"。
-import { CHANNEL_MODULES } from '../web/modules.js';
-
-
 // ★ 本对象是**唯一**默认值事实源：readMackit 的每一处回落都必须引用它，不得写字面量。
 const MACKIT_DEFAULTS = Object.freeze({
-  // ★ 2026-09-22：通道从「全局一个」改为「每个模块一个档位」（见 lib/netpolicy.js）：
-  //   auto（默认，按目标主机自动）/ proxy_first / direct_first，界面上是各模块顶部的小下拉。
-  //   原先的全局 defaultChannel 已删除（它是死设置：存/校验/回显/备份都有，却无人读取）。
-  brewChannel: 'auto', rimeChannel: 'auto', selfupdateChannel: 'auto',
+  // ★ 2026-11-26：通道回到「全局一个」（见 lib/netpolicy.js），顶部一个下拉管所有模块。
+  //   此前是「每个模块一个档位」（brewChannel / rimeChannel / selfupdateChannel），
+  //   实际用起来同一个开关要在多个页面各调一遍，且新增模块很容易漏；统一成一个键。
+  channel: 'auto',
   autoFallback: true, autoCleanup: true, lastCheckedAt: null, version: 1,
   // Homebrew 元数据自动同步（2026-09-21）：启动后若元数据过期就自动跑一次 `brew update`（实测 1.7~3.2s），
   // 让「可更新 N 项」重开项目即为真值，而不是等用户自己点按钮。可关（计量网络 / 公司代理场景）。
@@ -33,18 +29,11 @@ const MACKIT_DEFAULTS = Object.freeze({
   brewMetaRefreshedAt: null,
 });
 /**
- * 每模块网络通道档位（**唯一值域事实源**，lib/netpolicy.js 从这里取）：
+ * 全局网络通道档位（**唯一值域事实源**，lib/netpolicy.js 从这里取）：
  *   auto（默认，按目标主机）/ proxy_first（优先代理）/ direct_first（优先直连）。
- * 存储键 = `<module>Channel`，有开关的模块见下方 CHANNEL_KEYS（界面只给真联网的模块开关，
- * 避免出现「设置了却不生效」的死设置）。
+ * 存储键只有一个：`mackit.channel`（顶部下拉）。
  */
 export const CHANNEL_VALUES = Object.freeze(['auto', 'proxy_first', 'direct_first']);
-/**
- * 有通道档位的配置键（界面为 brew / rime / selfupdate 各给一个下拉）。
- * ★ 由模块清单（web/modules.js）派生：只有 `channel: true` 的模块才生成配置键 ——
- *   既不会"加了模块忘了加键"，也不会反过来多出一个没人读的死设置。
- */
-export const CHANNEL_KEYS = Object.freeze(CHANNEL_MODULES.map((m) => `${m.id}Channel`));
 
 /**
  * 归一化一个通道档位值。
@@ -256,10 +245,9 @@ export function writeBrewgo(v) {
 export function readMackit() {
   const raw = readJsonSafe(paths.CONFIG_JSON, {}) || {};
   return {
-    // 每模块网络通道档位（缺失/非法 → 默认 auto）。
-    brewChannel: normChannel(raw.brewChannel) || MACKIT_DEFAULTS.brewChannel,
-    rimeChannel: normChannel(raw.rimeChannel) || MACKIT_DEFAULTS.rimeChannel,
-    selfupdateChannel: normChannel(raw.selfupdateChannel) || MACKIT_DEFAULTS.selfupdateChannel,
+    // 全局网络通道档位（缺失/非法 → 默认 auto）。
+    // 旧的 <module>Channel 键不再读取；下次写入配置时自然被丢弃。
+    channel: normChannel(raw.channel) || MACKIT_DEFAULTS.channel,
     autoFallback: typeof raw.autoFallback === 'boolean' ? raw.autoFallback : MACKIT_DEFAULTS.autoFallback,
     // 升级完成后是否自动清理缓存：默认 true（对齐用户要求「默认开」）
     autoCleanup: typeof raw.autoCleanup === 'boolean' ? raw.autoCleanup : MACKIT_DEFAULTS.autoCleanup,
@@ -289,11 +277,10 @@ export function writeMackit(patch = {}) {
   if (patch.lastCheckedAt !== undefined) next.lastCheckedAt = typeof patch.lastCheckedAt === 'number' ? patch.lastCheckedAt : null;
   if (patch.brewAutoRefreshMeta !== undefined) next.brewAutoRefreshMeta = !!patch.brewAutoRefreshMeta;
   if (patch.brewMetaRefreshedAt !== undefined) next.brewMetaRefreshedAt = typeof patch.brewMetaRefreshedAt === 'number' ? patch.brewMetaRefreshedAt : null;
-  // 每模块网络通道：非法值一律忽略（保持原值），与其它枚举字段同口径。
-  for (const key of CHANNEL_KEYS) {
-    if (patch[key] === undefined) continue;
-    const v = normChannel(patch[key]);
-    if (v) next[key] = v;
+  // 全局网络通道：非法值忽略（保持原值），与其它枚举字段同口径。
+  if (patch.channel !== undefined) {
+    const v = normChannel(patch.channel);
+    if (v) next.channel = v;
   }
   next.version = 1;
 

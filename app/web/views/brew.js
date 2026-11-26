@@ -11,8 +11,10 @@
  *       · 底部「▶ 开始逐项升级」→ upgrade_one_by_one（items: [{name,kind,mode}]，mode∈proxy|direct|skip）
  *   - 卸载管理：Formula / Cask（多选 + 二次确认 + brew info 前 5 行）/ Tap（核心源加强警告 + 空态解释）
  *   - 软件下载：Formula / Cask 双类别，本地全量索引搜索（brew info --json=v2 补详情），结果逐项「代理/直连」直接安装
- *   - 设置（端口 / 镜像 5 卡 / 自动降级 / 缓存清理；改端口后仅提示，不自动改 Git）
- *     注：通道不再手选 —— 由后端按目标主机自动决定（走 GitHub 代理优先，其余直连优先）。
+ *   - 设置（镜像 5 卡 / 自动降级 / 缓存清理 / 元数据同步）
+ *     注 1：通道档位已统一到顶部栏（全局一个，所有模块共用），本页不再有通道下拉。
+ *     注 2：代理端口不再提供表单 —— 它是 `~/.brewgo_config` 的事实（默认 7897），
+ *           需要改就直接编辑该文件；备份恢复也会写它。
  *
  * 已移除：原「更新中心」标签与 6 步完整更新前端入口、「更新策略」单选、已装统计入口。
  *         原「历史」标签（升级/卸载历史表）—— 任务历史统一由侧边栏「任务历史」承载，避免两处重复。
@@ -84,9 +86,7 @@ export default {
     root.append(el('div', { class: 'view-head' }, [
       el('div', {}, [el('h1', { text: 'Homebrew 管家' }), el('div', { class: 'muted', text: '升级 · 卸载 · 设置' })]),
       el('div', { class: 'row' }, [
-        // 模块级通道：只管**索引下载 / brew update / 元数据同步**。
-        // 逐项升级与安装仍按用户在每一项上点的「代理 / 直连」按钮执行（用户明确要求）。
-        ui.netChannel('brew', '通道', '影响索引下载与 brew update；逐项升级 / 安装仍按你点的「代理 / 直连」按钮执行'),
+        // 通道已统一到顶栏（全局一个）；本页逐项升级 / 安装仍按用户点的「代理 / 直连」按钮执行。
         metaSync, envMeta, envBtn,
       ]),
     ]), envBox, tabsBox, panelBox);
@@ -696,21 +696,10 @@ export default {
     // ================= 面板：设置 =================
     function panelSettings(box) {
       const host = el('div', { class: 'section' });
-      const hintBox = el('div');
       function draw() {
         host.innerHTML = '';
         if (!config) { host.append(el('div', { class: 'view-loading', text: '读取配置…' })); return; }
         const bg = config.brewgo || {}, mk = config.mackit || {};
-
-        // 代理端口
-        const httpI = el('input', { type: 'number', value: String(bg.httpPort || ''), style: 'max-width:140px' });
-        const socksI = el('input', { type: 'number', value: String(bg.socksPort || ''), style: 'max-width:140px' });
-        const portCard = ui.card('🔌 代理端口', el('div', {}, [
-          el('div', { class: 'row' }, [el('span', { class: 'muted', style: 'width:120px', text: 'HTTP 端口' }), httpI]),
-          el('div', { class: 'row section' }, [el('span', { class: 'muted', style: 'width:120px', text: 'SOCKS5 端口' }), socksI]),
-          el('div', { class: 'muted', text: '非纯数字或超范围（1–65535）的输入将被忽略并保持原值。' }),
-          el('div', { class: 'row section' }, [el('button', { class: 'btn btn--primary', type: 'button', text: '保存端口', on: { click: () => savePorts(httpI, socksI) } })]),
-        ]));
 
         // 镜像源
         const mirrorCard = ui.card('🪞 镜像源', el('div', { class: 'grid grid--3' }, MIRRORS.map((m) => el('button', {
@@ -718,12 +707,11 @@ export default {
           on: { click: () => saveConfig({ mirror: m.id }, `镜像源已切换为「${m.label}」`) },
         }))));
 
-        // 通道由目标主机自动决定（无需手动选）+ 自动降级开关
+        // 网络：通道本身在顶栏（全局一个），这里只留「自动降级」这一项行为开关
         const chk = el('input', { type: 'checkbox', checked: mk.autoFallback !== false, on: { change: (e) => saveConfig({ autoFallback: e.target.checked }, e.target.checked ? '已开启自动降级' : '已关闭自动降级（失败即终止）') } });
-        const chCard = ui.card('🎚 网络通道', el('div', { class: 'card__rows' }, [
-          // 2026-09-22：原先这里是「默认通道」下拉（自动/直连优先/代理优先）—— 那个设置从未被读取，
-          // 是死设置；通道现在按目标主机自动选，不再需要手选。
-          el('div', { class: 'muted', text: '通道按目标自动选择：走 GitHub 的一律代理优先（含 brew 官方源 formulae.brew.sh，它是 GitHub Pages），其余直连优先。换国内镜像源后对应地址自动走直连。' }),
+        const chCard = ui.card('🎚 网络', el('div', { class: 'card__rows' }, [
+          el('div', { class: 'muted', text: '通道档位在顶部栏统一设置（所有模块共用）：自动档下走 GitHub 的一律代理优先（含 brew 官方源 formulae.brew.sh），其余直连优先。' }),
+          el('div', { class: 'muted', text: '代理端口读取自 ~/.brewgo_config（默认 7897）、由备份恢复写入；需要改端口请直接编辑该文件。' }),
           el('label', { class: 'check section' }, [chk, el('span', { text: '自动降级（首选通道失败时尝试另一通道）' })]),
         ]));
 
@@ -743,31 +731,10 @@ export default {
           el('div', { class: 'muted', text: '元数据是「可更新 N 项」的判定依据，只由 brew update 刷新。开启后重开项目约 2 秒即为真值；关闭后该数字仅反映本机已有元数据，需手动点「重查可更新项」或「一键更新本体并刷新索引」。' }),
         ]));
 
-        host.append(el('div', { class: 'grid grid--2' }, [portCard, chCard]), mirrorCard, cleanCard, metaCard, hintBox);
+        host.append(el('div', { class: 'grid grid--2' }, [chCard, cleanCard]), mirrorCard, metaCard);
       }
       async function saveConfig(patch, msg) {
         try { config = await api('PUT', '/api/config', patch); ui.toast('ok', msg || '已保存'); draw(); } catch (err) { ui.toast('err', err.message || '保存失败'); }
-      }
-      async function savePorts(httpI, socksI) {
-        const cur = config.brewgo || {};
-        const ok = ui.portOk;
-        const httpText = httpI.value.trim(), socksText = socksI.value.trim();
-        // 非法或未变化一律 return，不提交：原先只 toast「已保持原值」，却仍无条件写入并再弹「端口已保存」。
-        if (!ok(httpText) || !ok(socksText) || (Number(httpText) === cur.httpPort && Number(socksText) === cur.socksPort)) {
-          ui.toast('warn', '端口未变化或输入非法，已保持原值');
-          return;
-        }
-        const http = Number(httpText), socks = Number(socksText);
-        await saveConfig({ proxy: { httpPort: http, socksPort: socks } }, `端口已保存：HTTP=${http} / SOCKS5=${socks}`);
-        // 改端口后展示提示，不自动改 Git 代理
-        hintBox.innerHTML = '';
-        try {
-          const e = await ctx.refreshEnv(true);
-          const gp = e.git && e.git.httpProxy;
-          const want = `http://127.0.0.1:${http}`;
-          if (gp && gp !== want) hintBox.append(el('div', { class: 'warn-box section', text: `Git 全局代理仍为 ${gp}，如需同步请在系统初始化模块修改。` }));
-          else if (!gp) hintBox.append(el('div', { class: 'warn-box section', text: `Git 全局代理未设置；如需使用请在系统初始化模块设为 ${want}。` }));
-        } catch { /* 体检失败忽略 */ }
       }
       // 此处原先有 onPanel('config', draw)：全仓没有任何 emit('config')，该订阅永不触发（已删）。
       box.append(host); draw();

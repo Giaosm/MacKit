@@ -22,7 +22,7 @@ import { compare, samePrefix, sameVersion, segments } from './version.js';
  */
 export function defaultPolicy(target) {
   const auto = typeof target === 'string' && /[:/]/.test(target) ? policyForUrl(target) : policyForHost(target);
-  return resolvePolicy('brew', auto);
+  return resolvePolicy(auto);
 }
 
 /** 上游版本探测的缓存 TTL：成功 6h。 */

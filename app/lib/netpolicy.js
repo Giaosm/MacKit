@@ -1,13 +1,14 @@
 /**
- * MacKit · 网络通道策略（**唯一事实源**，2026-09-22 新增）
+ * MacKit · 网络通道策略（**唯一事实源**）
  *
- * 设计：**每个模块一个通道档位**（在模块顶部的小下拉里选，选中即生效），该模块下所有联网行为
- * 都走这个档位。档位取值与存储见 store.CHANNEL_VALUES / CHANNEL_KEYS。
+ * 设计：**全局一个通道档位**（顶部栏的下拉，选中即生效，所有模块共用）。
+ * 2026-11-26 由「每个模块一个档位」收敛而来 —— 同一个开关在多个页面各调一遍没有意义，
+ * 还会让新增模块漏配一个"死设置"。档位取值见 store.CHANNEL_VALUES。
  *
  * 优先级（高 → 低）：
  *   1. 调用方**显式指定**的通道 —— 例如 Homebrew 逐项升级 / 安装时用户点的「代理 / 直连」按钮，
- *      必须严格按用户点的执行，**不受模块档位影响**（用户明确要求）。
- *   2. 模块档位 `<module>Channel`：proxy_first（优先代理）/ direct_first（优先直连）。
+ *      必须严格按用户点的执行，**不受全局档位影响**（用户明确要求）。
+ *   2. 全局档位 `mackit.channel`：proxy_first（优先代理）/ direct_first（优先直连）。
  *   3. 档位为 auto 时 → **按目标主机自动**：走 GitHub 的代理优先，其余直连优先。
  *
  * ★ auto 为什么按主机判、而不是二选一：同一次操作里不同目标的快慢能差 100 倍 ——
@@ -62,39 +63,36 @@ export function policyForUrl(url) {
 }
 
 /**
- * 从**已读到的** MacKit 配置对象里取某模块的通道档位（非法/缺失一律回落 auto）。
+ * 从**已读到的** MacKit 配置里取全局通道档位（非法/缺失一律回落 auto）。
  * @param {object|undefined} modCfg store.readMackit() 的结果
- * @param {string} moduleId
  * @returns {'auto'|'proxy_first'|'direct_first'}
  */
-function channelFromConfig(modCfg, moduleId) {
-  const v = modCfg && modCfg[`${moduleId}Channel`];
+function channelFromConfig(modCfg) {
+  const v = modCfg && modCfg.channel;
   return CHANNEL_VALUES.includes(v) ? v : 'auto';
 }
 
 /**
- * 最终通道策略：模块档位优先，档位为 auto 时用调用方给出的「按目标自动」策略。
+ * 最终通道策略：全局档位优先，档位为 auto 时用调用方给出的「按目标自动」策略。
  * @param {object|undefined} modCfg 已读到的配置（避免为一个档位再读一次磁盘）
- * @param {string} moduleId brew|rime|selfupdate
- * @param {'auto'|'proxy_first'|'direct_first'} autoPolicy 该模块在 auto 档下应采用的策略
+ * @param {'proxy_first'|'direct_first'} autoPolicy auto 档下应采用策略
  * @returns {'proxy_first'|'direct_first'}
  */
-export function resolvePolicyFrom(modCfg, moduleId, autoPolicy) {
-  const set = channelFromConfig(modCfg, moduleId);
+export function resolvePolicyFrom(modCfg, autoPolicy) {
+  const set = channelFromConfig(modCfg);
   if (set === 'proxy_first' || set === 'direct_first') return set;
   return autoPolicy === 'proxy_first' ? 'proxy_first' : 'direct_first';
 }
 
 /**
  * 同 {@link resolvePolicyFrom}，但自己读配置（调用方手上没有配置对象时用）。
- * @param {string} moduleId
- * @param {'auto'|'proxy_first'|'direct_first'} autoPolicy
+ * @param {'proxy_first'|'direct_first'} autoPolicy
  * @returns {'proxy_first'|'direct_first'}
  */
-export function resolvePolicy(moduleId, autoPolicy) {
+export function resolvePolicy(autoPolicy) {
   let cfg = null;
   try { cfg = store.readMackit(); } catch { /* 读不到 → 按 auto 处理 */ }
-  return resolvePolicyFrom(cfg, moduleId, autoPolicy);
+  return resolvePolicyFrom(cfg, autoPolicy);
 }
 
 /**

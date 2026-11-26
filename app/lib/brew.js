@@ -89,7 +89,7 @@ function brewAutoPolicy(target) {
  * @returns {'proxy_first'|'direct_first'}
  */
 function brewPolicy(target) {
-  return resolvePolicy('brew', brewAutoPolicy(target));
+  return resolvePolicy(brewAutoPolicy(target));
 }
 
 /**
@@ -104,7 +104,7 @@ function policyForMirror() {
   const auto = (raw && raw !== 'official')
     ? policyForUrl(exec.MIRROR_REMOTES[raw] || raw)
     : 'proxy_first'; // 官方：brew 远端 = github.com
-  return resolvePolicy('brew', auto);
+  return resolvePolicy(auto);
 }
 
 /**
