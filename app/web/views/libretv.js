@@ -129,6 +129,11 @@ export default {
       title: '填入一个 14 位随机密码，点「确定」后生效',
       on: { click: () => { pwEdit.value = genPw(); pwEdit.focus(); } },
     });
+    const btnCancelPw = el('button', {
+      class: 'btn btn--sm', type: 'button', text: '取消', style: 'display:none',
+      title: '放弃这次修改（Esc）',
+      on: { click: () => exitPwEdit() },
+    });
 
     /** 14 位随机密码：字符集与后端 genPassword 一致（去掉 0/O/1/l/I 等易混字符） */
     function genPw() {
@@ -144,6 +149,7 @@ export default {
       pwText.style.display = pwEditing ? 'none' : '';
       pwEdit.style.display = pwEditing ? '' : 'none';
       btnRandomPw.style.display = pwEditing ? '' : 'none';
+      btnCancelPw.style.display = pwEditing ? '' : 'none';
       btnEditPw.textContent = pwEditing ? '确定' : '更改';
     }
 
@@ -204,7 +210,7 @@ export default {
       class: 'btn btn--sm', type: 'button', text: '复制',
       on: { click: () => ui.copy(st.data && st.data.lanUrl, '已复制局域网地址') },
     });
-    const lanRow = el('div', { hidden: true }, [lineRow('局域网', [lanUrlText, btnCopyLan])]);
+    const lanRow = el('div', { hidden: true, style: 'margin-top:var(--space-2)' }, [lineRow('局域网', [lanUrlText, btnCopyLan])]);
 
     /** 路径信息：12px 灰字单行一条，放在卡片底部，不占主视觉 */
     const dirText = el('span', { class: 'mono', text: '—' });
@@ -232,7 +238,7 @@ export default {
       ]),
       statGrid,
       divider(),
-      lineRow('访问密码', [pwText, pwEdit, btnRandomPw, btnCopyPw, btnEditPw]),
+      lineRow('访问密码', [pwText, pwEdit, btnRandomPw, btnCopyPw, btnCancelPw, btnEditPw]),
       el('div', { style: 'height:var(--space-2)' }),
       lineRow('访问地址', [urlText, btnCopyUrl, btnOpen]),
       lanRow,
@@ -345,6 +351,7 @@ export default {
       pwText.textContent = s.password || '—';
       // 编辑态下「复制」仍取旧密码，没意义 → 禁用；「更改」此时是「确定」，保持可点
       btnCopyPw.disabled = !s.password || pwEditing;
+      btnCancelPw.disabled = st.busy;
       btnEditPw.disabled = st.busy || !s.password;
 
       urlText.textContent = s.lan ? `${s.url}（本机）` : s.url;
