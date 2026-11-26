@@ -711,7 +711,6 @@ export default {
         const chk = el('input', { type: 'checkbox', checked: mk.autoFallback !== false, on: { change: (e) => saveConfig({ autoFallback: e.target.checked }, e.target.checked ? '已开启自动降级' : '已关闭自动降级（失败即终止）') } });
         const chCard = ui.card('🎚 网络', el('div', { class: 'card__rows' }, [
           el('div', { class: 'muted', text: '通道档位在顶部栏统一设置（所有模块共用）：自动档下走 GitHub 的一律代理优先（含 brew 官方源 formulae.brew.sh），其余直连优先。' }),
-          el('div', { class: 'muted', text: '代理端口读取自 ~/.brewgo_config（默认 7897）、由备份恢复写入；需要改端口请直接编辑该文件。' }),
           el('label', { class: 'check section' }, [chk, el('span', { text: '自动降级（首选通道失败时尝试另一通道）' })]),
         ]));
 

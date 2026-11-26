@@ -108,7 +108,7 @@ export default {
     ]);
 
     // ======================= ② 订阅地址卡 =======================
-    /** 当前订阅地址（paint 里更新）——复制 / 打开都读它，不从 DOM 文本反读（那里可能是占位的 '—'） */
+    /** 当前订阅地址（paint 里更新）——复制读它，不从 DOM 文本反读（那里可能是占位的 '—'） */
     let playlistUrl = '';
     /** 局域网订阅地址（手机 / 电视用），与服务是否运行无关 */
     let lanUrl = '';
@@ -116,7 +116,6 @@ export default {
     const lanText = el('code', { class: 'mono', text: '—' });
     const btnCopyLan = el('button', { class: 'btn btn--sm', type: 'button', text: '复制', on: { click: () => ui.copy(lanUrl, '已复制局域网订阅地址') } });
     const btnCopy = el('button', { class: 'btn btn--sm btn--primary', type: 'button', text: '复制', on: { click: () => ui.copy(playlistUrl, '已复制订阅地址') } });
-    const btnOpenPlaylist = el('button', { class: 'btn btn--sm', type: 'button', text: '在浏览器打开', on: { click: () => openUrl(playlistUrl) } });
     // 健康检查 / 诊断页是**脚本**提供的：服务没起来时点开只会是连接被拒，所以按钮跟着 running 禁用
     const btnHealth = el('button', { class: 'btn btn--sm', type: 'button', text: '健康检查', on: { click: () => openUrl((st.data && st.data.urls && st.data.urls.health) || '') } });
     const btnDiag = el('button', { class: 'btn btn--sm', type: 'button', text: '诊断日志', on: { click: () => openUrl((st.data && st.data.urls && st.data.urls.diag) || '') } });
@@ -126,7 +125,7 @@ export default {
         el('div', { class: 'row' }, [
           el('span', { class: 'muted nowrap', text: '本机订阅' }),
           playlistText,
-          btnCopy, btnOpenPlaylist,
+          btnCopy,
         ]),
         el('div', { class: 'row' }, [
           el('span', { class: 'muted nowrap', text: '局域网订阅' }),
@@ -215,21 +214,19 @@ export default {
       val.data.textContent = s.dataDir;
       val.log.textContent = s.logFile;
 
-      // 订阅地址：真实地址存进 playlistUrl（复制 / 打开都读它），界面上的 '—' 只是占位
+      // 订阅地址：真实地址存进 playlistUrl（复制读它），界面上的 '—' 只是占位
       playlistUrl = (s.urls && s.urls.playlist) || '';
       playlistText.textContent = playlistUrl || '—';
-      // 地址本身与运行态无关（先复制存进播放器也合理），但「打开」只对跑着的实例有意义
+      // 地址本身与运行态无关（先复制存进播放器也合理）；复制按钮拿到地址即可用
       btnCopy.disabled = !playlistUrl;
-      btnOpenPlaylist.disabled = !s.running;
       btnHealth.disabled = !s.running;
       btnDiag.disabled = !s.running;
 
       // 局域网订阅：后端已按网卡优先级排好序，第一个就是最可能能用的那个
       lanUrl = (s.urls && s.urls.playlistLan) || '';
-      const lan0 = Array.isArray(s.lanIps) && s.lanIps.length ? s.lanIps[0] : null;
       const restLan = Array.isArray(s.lanIps) ? s.lanIps.slice(1) : [];
       if (lanUrl) {
-        lanText.textContent = lan0 ? `${lanUrl}（${lan0.iface}）` : lanUrl;
+        lanText.textContent = lanUrl;
         lanText.title = restLan.length
           ? `其他网卡：${restLan.map((x) => `${x.iface} ${x.address}`).join('，')}`
           : '';
