@@ -2,7 +2,7 @@
  * MacKit · 执行层（唯一子进程出口）
  *
  *   - 一律 spawn(bin, argsArray, { shell:false })：绝不启用 shell 选项、绝不拼接命令行字符串
- *   - 命令白名单：brew / git / xattr / security / osascript / curl / node / npm / pnpm / python3 / ps
+ *   - 命令白名单：brew / git / xattr / security / osascript / curl / node / npm / pnpm / ps / lsof / tar
  *     （+ 绝对路径的 Squirrel）
  *   - 环境变量注入：代理（channel）与 Homebrew 镜像源；PATH 完全固定（不继承宿主）
  *   - 流式 stdout/stderr 逐行回调、超时、AbortSignal 取消（SIGTERM→3s→SIGKILL）
@@ -115,12 +115,7 @@ const BIN_MAP = Object.freeze({
   node: paths.NODE_BIN,
   npm: paths.NPM_BIN,
   pnpm: paths.PNPM_BIN,
-  // ★ 2026-10-23 重新引入：央视频直播（lib/ysp.js）要跑第三方 Python 脚本。
-  //   与当初为「音乐下载」放开的 `~/.mackit/py/**` 前缀 / 解释器文件名两条放宽不同：
-  //   这里只认这一个**固定路径**，参数由模块侧给定（脚本路径 + 端口 + --data-dir），
-  //   没有任何一段来自 HTTP 入参，攻击面等价于其它固定命令。
-  python3: paths.PYTHON3_BIN,
-  // 只读查看进程命令行（ysp / libretv 模块核对 pid 归属用）
+  // 只读查看进程命令行（libretv 模块核对 pid 归属用）
   ps: paths.PS_BIN,
   // 只读读进程的 cwd（libretv 用：Next standalone 会把进程标题改成 next-server，命令行里没有路径）
   lsof: paths.LSOF_BIN,
@@ -264,7 +259,6 @@ export function killPid(pid, signal = 'SIGTERM') {
  *   ② 解释器文件名放行（`python3` / `python3.12` 只要落在受信任目录内即可）。
  *   现在全项目的可执行只可能是 BIN_MAP 的键或 ABSOLUTE_ALLOWED 里的绝对路径，
  *   没有任何一条来自 HTTP 入参 / 配置 / 任务 params —— 攻击面比之前更小。
- * ★ 2026-10-23：python3 以**固定路径**回到 BIN_MAP（央视频直播模块），上面两条放宽层仍然没有恢复。
  *
  * @param {string} name 逻辑名（brew/git/...）或允许的绝对路径
  * @returns {string} 实际可执行文件路径

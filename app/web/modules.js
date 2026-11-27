@@ -59,16 +59,6 @@ export const MODULES = Object.freeze([
     backend: 'unseal.js',
   },
   {
-    // 央视频直播：托管第三方脚本 ysp-live-vX.Y（Python，版本由 paths.findYspDist 自动挑），
-    // 自身不联网、无通道档位 ——
-    // 联网行为全部发生在那个常驻服务里，MacKit 只负责起停与展示。
-    id: 'ysp',
-    title: '央视频直播',
-    icon: 'tv',
-    view: './views/ysp.js',
-    backend: 'ysp.js',
-  },
-  {
     // LibreTV：托管官方 Next.js standalone 预构建包（下载 → 解压 → 常驻子进程）。
     // 不内置任何点播 / 直播源，只把官方包体跑起来；安装 / 更新要连 GitHub，
     // 因此开通道档位（实测直连 7KB/s，代理 1.4MB/s）。
