@@ -117,7 +117,7 @@ export default {
       const src = s.skinSource ? ui.badge('皮肤来源 ' + (SOURCE_LABEL[s.skinSource] || s.skinSource), 'muted') : null;
       const allOk = s.dirExists && s.plumExists && s.mainSchemaExists;
       const curSchema = (S.appearance && S.appearance.currentSchema) || null;
-      return ui.card('🀄 状态', el('div', {}, [
+      return ui.card('状态', el('div', {}, [
         el('div', { class: 'stat-grid', style: '--stat-min:200px' }, lightCells),
         el('div', { class: 'stat-grid', style: '--stat-min:160px; margin-top:var(--space-3)' }, [
           ui.stat('当前方案', curSchema || '—'),
@@ -154,7 +154,7 @@ export default {
         disabled: S.checkingUpstream,
         on: { click: () => checkUpstream(true) },
       });
-      return ui.card('📚 词库', el('div', {}, [
+      return ui.card('词库', el('div', {}, [
         el('div', { class: 'row' }, [
           installBtn, checkBtn,
           !installed ? el('span', { class: 'muted', text: '未检测到本地安装：将按默认配置完整安装雾凇拼音。' }) : null,
@@ -294,7 +294,7 @@ export default {
         on: { click: () => checkGrammarUpstream(true) },
       });
 
-      return ui.card('🧠 语法模型（万象）', el('div', {}, [
+      return ui.card('语法模型（万象）', el('div', {}, [
         el('div', { class: 'row' }, [modelBtn, checkBtn, modelLine]),
         grammarUpstreamLine(),
         el('div', { class: 'row section' }, [
@@ -342,7 +342,7 @@ export default {
     function skinGrid() {
       const grid = el('div', { class: 'grid grid--4' });
       for (const sk of (S.skins && S.skins.schemes) || []) grid.append(skinCard(sk));
-      return ui.card('🎨 外观 · 皮肤（22 款，色块预览）', el('div', {}, [
+      return ui.card('外观 · 皮肤（22 款，色块预览）', el('div', {}, [
         el('div', { class: 'muted', text: '色块按后端归一化的 {hex, alpha} 以 rgba() 合成（叠在中性底上）：候选窗底色 / 文字色 / 高亮背景 / 高亮文字 / 注释色。' }),
         grid,
       ]));
@@ -397,7 +397,7 @@ export default {
           active ? ui.badge('当前', 'ok') : null,
         ]));
       }
-      return ui.card('🖌 外观 · 布局（4 种）', el('div', {}, [
+      return ui.card('外观 · 布局（4 种）', el('div', {}, [
         el('div', { class: 'muted', text: '布局映射：1→竖向/水平、2→横向/水平、3→竖向/垂直、4→横向/垂直（与后端完全一致）。' }),
         grid,
         el('div', { class: 'row section' }, [

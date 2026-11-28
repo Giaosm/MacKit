@@ -93,10 +93,10 @@ export default {
         metaLine(),   // 「元数据同步于 X」：说明这个数字有多新
         b.tapEmpty ? el('div', { class: 'muted', style: 'margin-top:4px', text: 'ℹ Homebrew 7 默认不再显式列出 core / cask 等内置源，属正常现象。' }) : null,
       ].filter(Boolean));
-      grid.append(ui.card('🍺 Homebrew', brewRows, { light: lightOf(b.status) }));
+      grid.append(ui.card('Homebrew', brewRows, { light: lightOf(b.status) }));
 
       // 网络
-      grid.append(ui.card('🌐 网络', el('div', {}, [
+      grid.append(ui.card('网络', el('div', {}, [
         ui.statGrid([...netRows('直连', n.direct), ...netRows('代理', n.proxy)], { min: 200 }),
         // 两通道用的是不同回显（国内 / 境外），IP 还相同就说明代理没把流量送出去
         n.proxy && n.proxy.sameAsDirect
@@ -121,10 +121,10 @@ export default {
           : null,
       ].filter(Boolean));
       const shellLight = sh.kind === 'unknown' ? 'warn' : ((sh.aliasPresent && sh.aliasMatchesExpected) ? lightOf(sh.status) : 'warn');
-      grid.append(ui.card('🐚 Shell', shellRows, { light: shellLight }));
+      grid.append(ui.card('Shell', shellRows, { light: shellLight }));
 
       // Rime
-      grid.append(ui.card('🀄 Rime', el('div', {}, [
+      grid.append(ui.card('Rime', el('div', {}, [
         ui.statGrid([
           ['plum / 主方案 / Squirrel', `${rm.plumExists ? '✓' : '✗'} · ${rm.mainSchemaExists ? '✓' : '✗'} · ${rm.squirrelDeployable ? '可部署 ✓' : '不可自动部署 ✗'}`],
           ['当前皮肤', rm.currentSkin || '未知'],
@@ -135,14 +135,14 @@ export default {
       ].filter(Boolean)), { light: lightOf(rm.status) }));
 
       // Git
-      grid.append(ui.card('📦 Git', ui.statGrid([
+      grid.append(ui.card('Git', ui.statGrid([
         ['user.name', g.userName || '未设置'],
         ['user.email', g.userEmail || '未设置'],
         ['凭据', g.tokenExists ? '已存在' : '缺失'],
       ], { min: 200 }), { light: lightOf(g.status) }));
 
       // 镜像源 / 代理
-      grid.append(ui.card('⚙ 镜像源 / 代理', el('div', {}, [
+      grid.append(ui.card('镜像源 / 代理', el('div', {}, [
         ui.statGrid([
           ['镜像源', m.label || m.id || '—'],
           ['代理端口', `${pp.http || '—'} (HTTP) / ${pp.socks5 || '—'} (SOCKS5)`],

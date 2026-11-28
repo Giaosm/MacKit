@@ -40,7 +40,7 @@ export function buildWebdavSection(ctx) {
   recordsBtn.addEventListener('click', () => openRecordsModal(ctx));
   configBtn.addEventListener('click', () => openSettingsModal(ctx));
 
-  return ui.card('☁ WebDAV 备份', el('div', {}, [
+  return ui.card('WebDAV 备份', el('div', {}, [
     el('div', { class: 'muted', text: '把本机配置备份到你的 WebDAV 服务器（NAS）—— 含 Rime 个人词频 / 自造词，换机后可直接恢复' }),
     el('div', { class: 'row row--between section' }, [
       el('div', { class: 'row' }, [backupBtn, recordsBtn]),

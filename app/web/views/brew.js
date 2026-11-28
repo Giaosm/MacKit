@@ -143,14 +143,14 @@ export default {
           : '与下方「升级列表」同一口径（已按应用本体版本纠偏）；列表加载完成后会直接沿用它的计数。');
       // 三张小卡并排（.grid--3，每张 ~320px）：信息块最小宽度调小到 110，自然排成 2 列
       const grid = el('div', { class: 'grid grid--3' }, [
-        ui.card('🍺 环境', el('div', {}, [
+        ui.card('环境', el('div', {}, [
           ui.statGrid([
             ['版本', b.version || '未检测到'],
             ['已装', `formula ${b.formulaCount || 0} / cask ${b.caskCount || 0}`],
             ['可更新', el('span', { title: outdatedTip, text: `${outdatedTotal} 项` })],
           ], { min: 110 }),
         ]), { light: b.status || 'warn', extra: chBadge }),
-        ui.card('🌐 网络', el('div', {}, [
+        ui.card('网络', el('div', {}, [
           ui.statGrid([
             ['直连', netVal(n.direct)],
             ['代理', netVal(n.proxy)],
@@ -160,7 +160,7 @@ export default {
             ? el('div', { class: 'warn-box', style: 'margin-top:8px', text: '两个出口 IP 相同：这条「代理」实际没把流量送出去。' })
             : null,
         ].filter(Boolean)), { light: n.status || 'warn' }),
-        ui.card('⚙ 配置', el('div', {}, [
+        ui.card('配置', el('div', {}, [
           ui.statGrid([
             ['镜像源', m.label || m.id || '—'],
             ['代理端口', `${pp.http || '—'} / ${pp.socks5 || '—'}`],
@@ -192,7 +192,7 @@ export default {
           loadEnv(true);
         }
       });
-      return ui.card('🍺 未检测到 Homebrew', el('div', { class: 'card__rows' }, [
+      return ui.card('未检测到 Homebrew', el('div', { class: 'card__rows' }, [
         el('div', { class: 'muted', text: '本机未安装 Homebrew。点击下方按钮可用官方脚本一键安装（默认走代理），安装完成后会自动配置好终端环境变量。' }),
         el('div', { class: 'row section' }, [btn]),
       ]), { light: 'error' });
@@ -219,7 +219,7 @@ export default {
           loadEnv(true);
         }
       });
-      return ui.card('⚙ Homebrew 终端环境未配置', el('div', { class: 'card__rows' }, [
+      return ui.card('Homebrew 终端环境未配置', el('div', { class: 'card__rows' }, [
         el('div', { class: 'muted', text: 'Homebrew 已安装，但终端里可能还用不了 brew 命令（新开终端提示 command not found）。点下方按钮自动写入配置，之后新开终端即可直接使用。' }),
         el('div', { class: 'row section' }, [btn]),
       ]), { light: 'warn' });
@@ -702,21 +702,21 @@ export default {
         const bg = config.brewgo || {}, mk = config.mackit || {};
 
         // 镜像源
-        const mirrorCard = ui.card('🪞 镜像源', el('div', { class: 'grid grid--3' }, MIRRORS.map((m) => el('button', {
+        const mirrorCard = ui.card('镜像源', el('div', { class: 'grid grid--3' }, MIRRORS.map((m) => el('button', {
           class: `btn${bg.mirror === m.id ? ' btn--primary' : ''}`, type: 'button', text: m.label,
           on: { click: () => saveConfig({ mirror: m.id }, `镜像源已切换为「${m.label}」`) },
         }))));
 
         // 网络：通道本身在顶栏（全局一个），这里只留「自动降级」这一项行为开关
         const chk = el('input', { type: 'checkbox', checked: mk.autoFallback !== false, on: { change: (e) => saveConfig({ autoFallback: e.target.checked }, e.target.checked ? '已开启自动降级' : '已关闭自动降级（失败即终止）') } });
-        const chCard = ui.card('🎚 网络', el('div', { class: 'card__rows' }, [
+        const chCard = ui.card('网络', el('div', { class: 'card__rows' }, [
           el('div', { class: 'muted', text: '通道档位在顶部栏统一设置（所有模块共用）：自动档下走 GitHub 的一律代理优先（含 brew 官方源 formulae.brew.sh），其余直连优先。' }),
           el('label', { class: 'check section' }, [chk, el('span', { text: '自动降级（首选通道失败时尝试另一通道）' })]),
         ]));
 
         // 缓存清理（自动清理开关默认开）
         const autoChk = el('input', { type: 'checkbox', checked: mk.autoCleanup !== false, on: { change: (e) => saveConfig({ autoCleanup: e.target.checked }, e.target.checked ? '已开启升级后自动清理缓存' : '已关闭升级后自动清理缓存') } });
-        const cleanCard = ui.card('🧹 缓存清理', el('div', { class: 'card__rows' }, [
+        const cleanCard = ui.card('缓存清理', el('div', { class: 'card__rows' }, [
           el('label', { class: 'check' }, [autoChk, el('span', { text: '升级完成后自动清理缓存（brew cleanup --prune=all）' })]),
           el('div', { class: 'muted', text: '开启后，逐项升级任务结束时会自动执行一次清理（失败仅记日志，不影响升级结果）；关闭后需手动点击下方按钮。' }),
           el('div', { class: 'row section' }, [el('button', { class: 'btn', type: 'button', text: '🧹 立即清理缓存', on: { click: () => { ctx.runTask('brew', 'cleanup').catch(() => {}); } } })]),
@@ -725,7 +725,7 @@ export default {
         // Homebrew 元数据自动同步（默认开）：启动后若元数据过期就自动 `brew update`（≈2s），
         // 让「可更新」重开即为真值；关掉后需手动点「重查可更新项」或「一键更新本体」。
         const metaChk = el('input', { type: 'checkbox', checked: mk.brewAutoRefreshMeta !== false, on: { change: (e) => saveConfig({ brewAutoRefreshMeta: e.target.checked }, e.target.checked ? '已开启启动时自动同步元数据' : '已关闭启动时自动同步元数据') } });
-        const metaCard = ui.card('🔄 元数据同步', el('div', { class: 'card__rows' }, [
+        const metaCard = ui.card('元数据同步', el('div', { class: 'card__rows' }, [
           el('label', { class: 'check' }, [metaChk, el('span', { text: '启动时自动同步 Homebrew 元数据（brew update，实测 1.7~3.2 秒）' })]),
           el('div', { class: 'muted', text: '元数据是「可更新 N 项」的判定依据，只由 brew update 刷新。开启后重开项目约 2 秒即为真值；关闭后该数字仅反映本机已有元数据，需手动点「重查可更新项」或「一键更新本体并刷新索引」。' }),
         ]));
